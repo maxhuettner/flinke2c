@@ -1,6 +1,6 @@
 # FlinkE2C Artifact (EDBT 2026)
 
-This repository bundles all software artifacts accompanying the EDBT 2026 submission on FlinkE2C. Each subproject keeps its own build instructions and documentation—start with the individual READMEs referenced below.
+This repository bundles all software artifacts accompanying the EDBT 2026 submission on FlinkE2C and CEPless. Each subproject keeps its own build instructions and documentation—start with the individual READMEs referenced below.
 
 ## Repository Layout
 
@@ -16,4 +16,9 @@ This repository bundles all software artifacts accompanying the EDBT 2026 submis
 2. Use `experiments/exps.ipynb` to explore the consolidated results and regenerate plots.
 3. Consult the harness README if you need to replay workloads or capture additional event-level metrics.
 
-For questions about artifact usage or reproduction steps, refer to the individual project documentation within this repository.
+## Acknowledgements
+
+This artifact builds upon the following open-source systems:
+
+- [Apache Flink](https://github.com/apache/flink) – the upstream stream processing engine extended by the FlinkE2C prototypes.
+- [CEPless](https://github.com/luthramanisha/CEPless) – the serverless CEP middleware integrated for heterogeneous deployments.
