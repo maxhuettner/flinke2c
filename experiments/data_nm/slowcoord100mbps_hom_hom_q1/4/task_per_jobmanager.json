@@ -1,0 +1,47 @@
+[
+    {
+        "id": "10.10.2.185:37509-6e83bf",
+        "name": "10.10.2.185",
+        "port": "46649",
+        "tasks": [
+            {
+                "id": "bc764cd8ddf7a0cff126f51c16239658",
+                "name": "Source: datagen[1]"
+            },
+            {
+                "id": "ea632d67b7d595e5b851708ae9ad79d6",
+                "name": "WatermarkAssigner[3]"
+            }
+        ]
+    },
+    {
+        "id": "10.10.2.182:42235-798990",
+        "name": "10.10.2.182",
+        "port": "45105",
+        "tasks": [
+            {
+                "id": "0a448493b4782967b150582570326227",
+                "name": "Calc[2]"
+            },
+            {
+                "id": "6d2677a0ecc3fd8df0b72ec675edf8f4",
+                "name": "MiniBatchAssigner[4]"
+            }
+        ]
+    },
+    {
+        "id": "10.10.2.183:44159-4e3ed4",
+        "name": "10.10.2.183",
+        "port": "45239",
+        "tasks": [
+            {
+                "id": "ddb598ad156ed281023ba4eebbe487e3",
+                "name": "Calc[5]"
+            },
+            {
+                "id": "46f8730428df9ecd6d7318a02bdc405e",
+                "name": "Sink: nexmark_q1[6]"
+            }
+        ]
+    }
+]

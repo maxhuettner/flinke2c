@@ -1,0 +1,132 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+
+import org.apache.flink.api.common.functions.FlatMapFunction;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.streaming.api.TimeCharacteristic;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.util.Collector;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.FileReader;
+import java.lang.management.ManagementFactory;
+import java.lang.management.OperatingSystemMXBean;
+import java.util.Properties;
+
+/**
+ * Flink example query using CEPless
+ */
+public class Main {
+
+	// *************************************************************************
+	// PROGRAM
+	// *************************************************************************
+	public static void main(String[] args) throws Exception {
+
+		// Checking input parameters
+		final ParameterTool params = ParameterTool.fromArgs(args);
+
+		// set up the execution environment
+		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+		env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);
+		// make parameters available in the web interface
+		env.getConfig().setGlobalJobParameters(params);
+
+		// Load properties from CLI params
+		System.out.println("Using input " + params.get("input"));
+		boolean serverless = params.getBoolean("serverless");
+		Properties props = new Properties();
+		// props.setProperty("bootstrap.servers", "host.docker.internal:9092");
+		props.setProperty("bootstrap.servers", params.get("kafka.server"));
+
+		/**
+		 * Topic op-test is used for fetching events from Kafka
+		 */
+		// CHANGE BY MATHEUS: SWITCH TOPIC FROM "op-test" TO THE PARAMETER "customOperator"
+		DataStream<String> source = env.addSource(new SimpleKafkaSource(params.get("customOperator"), props));
+
+		/**
+		 * Append timestamp (nanoseconds) to event when received from kafka for processing time measurement
+		 */
+		DataStream<String> query = source.map(new MapFunction<String, String>() {
+			transient int i = 0;
+			@Override
+			public String map(String s) throws Exception {
+				s = s.replaceAll("\\s+","");
+				String c = new StringBuilder(s).toString();
+				String d = "," + String.valueOf(System.nanoTime());
+				String a = new StringBuilder(c).append(d).toString();
+				return a;
+			}
+		});
+
+		DataStream<String> result;
+		int recordDelay = params.getInt("sim.recordDelay");
+		if (serverless) {
+			BenchmarkMapFunction benchmarkBefore = new BenchmarkMapFunction(recordDelay, "/mnt/labstore/mhuttner/logs/benchmark-prev.csv");
+			BenchmarkMapFunction benchmark = new BenchmarkMapFunction(recordDelay, "/mnt/labstore/mhuttner/logs/benchmark.csv");
+			// CHANGE BY MATHEUS: SWITCH OPERATOR FROM "op-test" TO THE PARAMETER "customOperator"
+			result = query.map(benchmarkBefore).serverless(params.get("customOperator")).map(benchmark);
+		} else {
+			BenchmarkMapFunction benchmark = new BenchmarkMapFunction(recordDelay, "/mnt/labstore/mhuttner/logs/benchmark.csv");
+			result = query.map(benchmark);
+		}
+
+		// emit result
+		if (params.has("output")) {
+			// result.writeAsText(params.get("output"));
+		} else {
+			//System.out.println("Printing result to stdout. Use --output to specify output path.");
+			//result.print();
+		}
+
+		// execute program
+		env.execute("Streaming CEPLess query");
+	}
+
+	// *************************************************************************
+	// USER FUNCTIONS
+	// *************************************************************************
+
+	/**
+	 * Implements the string tokenizer that splits sentences into words as a
+	 * user-defined FlatMapFunction. The function takes a line (String) and
+	 * splits it into multiple pairs in the form of "(word,1)" ({@code Tuple2<String,
+	 * Integer>}).
+	 */
+	public static final class Tokenizer implements FlatMapFunction<String, Tuple2<String, Integer>> {
+
+		@Override
+		public void flatMap(String value, Collector<Tuple2<String, Integer>> out) {
+			// normalize and split the line
+			String[] tokens = value.toLowerCase().split("\\W+");
+
+			// emit the pairs
+			for (String token : tokens) {
+				if (token.length() > 0) {
+					out.collect(new Tuple2<>(token, 1));
+				}
+			}
+		}
+	}
+}

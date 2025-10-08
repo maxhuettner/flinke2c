@@ -1,0 +1,31 @@
+# You can set the hostname of docker host by using this command `sudo hostname <name>`
+version: "3"
+services:
+  redis:
+    image: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - main
+      - node-manager-net
+
+  nodeManager:
+    image: maxhue/node-manager
+    environment:
+      - EXECUTION=flink
+      - HOST_LOG_PATH=$HOME/logs
+      - OPERATOR_UPDATE_NAME=test-updated
+      - OPERATOR_UPDATE_TIMEOUT=20
+    ports:
+      - 25003:25003
+    networks:
+      - main
+      - node-manager-net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./../operators:/app/operators
+
+networks:
+  main:
+  node-manager-net:
+    external: true

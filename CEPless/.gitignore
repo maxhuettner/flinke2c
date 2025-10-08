@@ -1,0 +1,20 @@
+# Temporary files
+*.tmp
+*.temp
+*~
+*.swp
+*.swo
+*.swn
+
+# Temporary directories
+.tmp/
+tmp/
+Temp/
+temp/
+
+target
+.gradle
+*.class
+kafka_2.12-2.4.0/
+
+flink-new

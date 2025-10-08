@@ -1,0 +1,11 @@
+x,ecdf,key,label
+472032.0,0.0,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)
+472032.0,0.2,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)
+479294.0,0.2,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)
+479294.0,0.4,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)
+497092.0,0.4,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)
+497092.0,0.6,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)
+498777.0,0.6,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)
+498777.0,0.8,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)
+509450.0,0.8,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)
+509450.0,1.0,slowcoord100mbps_hom_hom_q1,Slow coordinator - 100MBit/s\\(Hom. nodes | Hom. topology)

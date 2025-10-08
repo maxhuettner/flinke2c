@@ -1,0 +1,39 @@
+\begin{tikzpicture}
+% Define colors
+\definecolor{color1}{RGB}{31,119,180}
+\definecolor{color2}{RGB}{255,127,14}
+\definecolor{color3}{RGB}{44,160,44}
+\definecolor{color4}{RGB}{214,39,40}
+\definecolor{color5}{RGB}{148,103,189}
+\definecolor{color6}{RGB}{140,86,75}
+\definecolor{color7}{RGB}{227,119,194}
+\definecolor{color8}{RGB}{127,127,127}
+\definecolor{color9}{RGB}{188,189,34}
+\definecolor{color10}{RGB}{23,190,207}
+
+\begin{axis}[
+    width=\linewidth,
+    height=0.6\linewidth,
+    xlabel={Relative Throughput},
+    ylabel={Cumulative Probability},
+    xmin=0,
+    ymin=0.0,
+    ymax=1.0,
+    ymajorgrids=true,
+    xmajorgrids=true,
+    legend pos=north west,
+    legend style={nodes={scale=0.5, transform shape}, legend cell align=left},
+    every axis plot/.append style={very thick},
+    tick label style={/pgf/number format/fixed},
+    x tick label style={/pgf/number format/1000 sep=,},
+    scaled x ticks=false
+]
+
+\addplot[mark=none, color=color1, solid] table[x=x, y=ecdf, col sep=comma] {plot_data/flink_limitations_q4_hom_hom_ecdf.csv};
+\addlegendentry{Cloud}
+\addplot[mark=none, color=color2, dashed] table[x=x, y=ecdf, col sep=comma] {plot_data/flink_limitations_q4_hom_het_ecdf.csv};
+\addlegendentry{Mixed}
+\addplot[mark=none, color=color3, dotted] table[x=x, y=ecdf, col sep=comma] {plot_data/flink_limitations_q4_het_het_ecdf.csv};
+\addlegendentry{Edge-to-Cloud}
+\end{axis}
+\end{tikzpicture}

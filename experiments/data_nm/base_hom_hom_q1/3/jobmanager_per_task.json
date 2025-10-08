@@ -1,0 +1,68 @@
+[
+    {
+        "id": "bc764cd8ddf7a0cff126f51c16239658",
+        "name": "Source: datagen[1]",
+        "taskmanagers": [
+            {
+                "id": "10.10.2.187:39647-1929dc",
+                "name": "10.10.2.187",
+                "port": "42359"
+            }
+        ]
+    },
+    {
+        "id": "0a448493b4782967b150582570326227",
+        "name": "Calc[2]",
+        "taskmanagers": [
+            {
+                "id": "10.10.2.187:39647-1929dc",
+                "name": "10.10.2.187",
+                "port": "42359"
+            }
+        ]
+    },
+    {
+        "id": "ea632d67b7d595e5b851708ae9ad79d6",
+        "name": "WatermarkAssigner[3]",
+        "taskmanagers": [
+            {
+                "id": "10.10.2.183:34845-8c380a",
+                "name": "10.10.2.183",
+                "port": "45727"
+            }
+        ]
+    },
+    {
+        "id": "6d2677a0ecc3fd8df0b72ec675edf8f4",
+        "name": "MiniBatchAssigner[4]",
+        "taskmanagers": [
+            {
+                "id": "10.10.2.183:34845-8c380a",
+                "name": "10.10.2.183",
+                "port": "45727"
+            }
+        ]
+    },
+    {
+        "id": "ddb598ad156ed281023ba4eebbe487e3",
+        "name": "Calc[5]",
+        "taskmanagers": [
+            {
+                "id": "10.10.2.182:36961-f155e0",
+                "name": "10.10.2.182",
+                "port": "43019"
+            }
+        ]
+    },
+    {
+        "id": "46f8730428df9ecd6d7318a02bdc405e",
+        "name": "Sink: nexmark_q1[6]",
+        "taskmanagers": [
+            {
+                "id": "10.10.2.182:36961-f155e0",
+                "name": "10.10.2.182",
+                "port": "43019"
+            }
+        ]
+    }
+]

@@ -1,0 +1,11 @@
+x,ecdf,key,label
+865800.0,0.0,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
+865800.0,0.2,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
+889838.0,0.2,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
+889838.0,0.4,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
+890709.0,0.4,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
+890709.0,0.6,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
+901713.0,0.6,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
+901713.0,0.8,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
+905551.0,0.8,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
+905551.0,1.0,base_tcp_ss,Baseline\\(Hom. nodes | Hom. topology)
