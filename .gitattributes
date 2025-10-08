@@ -1,0 +1,4 @@
+CEPless/flink-test/libs/flink-dist-1.18-SNAPSHOT.jar filter=lfs diff=lfs merge=lfs -text
+CEPless/flink-test/libs/my-flink-udfs.jar filter=lfs diff=lfs merge=lfs -text
+CEPless/creditcard.csv filter=lfs diff=lfs merge=lfs -text
+CEPless/kafka_2.12-2.4.0.tgz filter=lfs diff=lfs merge=lfs -text
