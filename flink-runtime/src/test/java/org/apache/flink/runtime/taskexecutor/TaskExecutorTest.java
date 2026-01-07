@@ -633,7 +633,7 @@ class TaskExecutorTest {
         rpc.registerGateway(rmAddress, rmGateway);
 
         final SlotID slotId = buildSlotID(0);
-        final ResourceProfile resourceProfile = ResourceProfile.fromResources(1.0, 1);
+        final ResourceProfile resourceProfile = ResourceProfile.fromResources(1.0, 1, "");
         final SlotReport slotReport1 = new SlotReport(new SlotStatus(slotId, resourceProfile));
         final SlotReport slotReport2 =
                 new SlotReport(
@@ -1999,7 +1999,7 @@ class TaskExecutorTest {
                     .eventuallySucceeds()
                     .isEqualTo(
                             TaskExecutorResourceUtils.generateDefaultSlotResourceProfile(
-                                    TM_RESOURCE_SPEC, numberOfSlots));
+                                    TM_RESOURCE_SPEC, numberOfSlots, ""));
         } finally {
             RpcUtils.terminateRpcEndpoint(taskExecutor);
         }

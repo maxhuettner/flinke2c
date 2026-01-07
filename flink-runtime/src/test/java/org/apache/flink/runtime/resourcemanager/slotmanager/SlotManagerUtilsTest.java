@@ -60,7 +60,7 @@ class SlotManagerUtilsTest {
 
         assertThat(
                         SlotManagerUtils.generateDefaultSlotResourceProfile(
-                                workerResourceSpec, numSlots))
+                                workerResourceSpec, numSlots, ""))
                 .isEqualTo(resourceProfile);
     }
 
@@ -88,7 +88,7 @@ class SlotManagerUtilsTest {
 
         assertThat(
                         SlotManagerUtils.generateDefaultSlotResourceProfile(
-                                totalResourceProfile, numSlots))
+                                totalResourceProfile, numSlots, ""))
                 .isEqualTo(resourceProfile);
     }
 
@@ -107,21 +107,21 @@ class SlotManagerUtilsTest {
 
         final ResourceProfile resourceProfileFromTaskExecutorResourceUtils =
                 TaskExecutorResourceUtils.generateDefaultSlotResourceProfile(
-                        taskExecutorResourceSpec, numSlots);
+                        taskExecutorResourceSpec, numSlots, "");
 
         final ResourceProfile totalResourceProfile =
                 TaskExecutorResourceUtils.generateTotalAvailableResourceProfile(
-                        taskExecutorResourceSpec);
+                        taskExecutorResourceSpec, "");
         final WorkerResourceSpec workerResourceSpec =
                 WorkerResourceSpec.fromTotalResourceProfile(totalResourceProfile, numSlots);
 
         assertThat(
                         SlotManagerUtils.generateDefaultSlotResourceProfile(
-                                totalResourceProfile, numSlots))
+                                totalResourceProfile, numSlots, ""))
                 .isEqualTo(resourceProfileFromTaskExecutorResourceUtils);
         assertThat(
                         SlotManagerUtils.generateDefaultSlotResourceProfile(
-                                workerResourceSpec, numSlots))
+                                workerResourceSpec, numSlots, ""))
                 .isEqualTo(resourceProfileFromTaskExecutorResourceUtils);
     }
 
@@ -155,15 +155,15 @@ class SlotManagerUtilsTest {
         assertThatThrownBy(
                         () ->
                                 SlotManagerUtils.calculateDefaultNumSlots(
-                                        ResourceProfile.fromResources(1.0, 1),
+                                        ResourceProfile.fromResources(1.0, 1, ""),
                                         ResourceProfile.ZERO))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
     void testGetEffectiveResourceProfile() {
-        final ResourceProfile defaultProfile = ResourceProfile.fromResources(5, 10);
-        final ResourceProfile concreteRequirement = ResourceProfile.fromResources(1, 20);
+        final ResourceProfile defaultProfile = ResourceProfile.fromResources(5, 10, "");
+        final ResourceProfile concreteRequirement = ResourceProfile.fromResources(1, 20, "");
 
         assertThat(
                         SlotManagerUtils.getEffectiveResourceProfile(
@@ -196,7 +196,7 @@ class SlotManagerUtilsTest {
                         .setExtendedResource(new ExternalResource(EXTERNAL_RESOURCE_NAME, 1))
                         .build();
 
-        assertThat(SlotManagerUtils.generateTaskManagerTotalResourceProfile(workerResourceSpec))
+        assertThat(SlotManagerUtils.generateTaskManagerTotalResourceProfile(workerResourceSpec, ""))
                 .isEqualTo(resourceProfile);
     }
 }

@@ -73,7 +73,7 @@ class LocationPreferenceSlotSelectionStrategyTest extends SlotSelectionStrategyT
         ResourceProfile evenBiggerResourceProfile =
                 ResourceProfile.fromResources(
                         biggerResourceProfile.getCpuCores().getValue().doubleValue() + 1.0,
-                        resourceProfile.getTaskHeapMemory().getMebiBytes());
+                        resourceProfile.getTaskHeapMemory().getMebiBytes(), "");
         final SlotProfile slotProfileNotMatching =
                 SlotProfile.priorAllocation(
                         resourceProfile,

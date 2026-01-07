@@ -75,10 +75,10 @@ abstract class FineGrainedSlotManagerTestBase {
                     .build();
     static final int DEFAULT_NUM_SLOTS_PER_WORKER = 2;
     static final ResourceProfile DEFAULT_TOTAL_RESOURCE_PROFILE =
-            SlotManagerUtils.generateTaskManagerTotalResourceProfile(DEFAULT_WORKER_RESOURCE_SPEC);
+            SlotManagerUtils.generateTaskManagerTotalResourceProfile(DEFAULT_WORKER_RESOURCE_SPEC, "");
     static final ResourceProfile DEFAULT_SLOT_RESOURCE_PROFILE =
             SlotManagerUtils.generateDefaultSlotResourceProfile(
-                    DEFAULT_WORKER_RESOURCE_SPEC, DEFAULT_NUM_SLOTS_PER_WORKER);
+                    DEFAULT_WORKER_RESOURCE_SPEC, DEFAULT_NUM_SLOTS_PER_WORKER, "");
 
     protected abstract Optional<ResourceAllocationStrategy> getResourceAllocationStrategy(
             SlotManagerConfiguration slotManagerConfiguration);

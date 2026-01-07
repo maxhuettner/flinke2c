@@ -21,6 +21,9 @@ package org.apache.flink.runtime.jobmaster.slotpool;
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.scheduler.loading.LoadingWeight;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
@@ -34,6 +37,8 @@ import java.util.Map;
 public enum SimpleRequestSlotMatchingStrategy implements RequestSlotMatchingStrategy {
     INSTANCE;
 
+    private static final Logger log = LoggerFactory.getLogger(SimpleRequestSlotMatchingStrategy.class);
+
     @Override
     public Collection<RequestSlotMatch> matchRequestsAndSlots(
             Collection<? extends PhysicalSlot> slots,
@@ -41,23 +46,62 @@ public enum SimpleRequestSlotMatchingStrategy implements RequestSlotMatchingStra
             Map<ResourceID, LoadingWeight> taskExecutorsLoadingWeight) {
         final Collection<RequestSlotMatch> resultingMatches = new ArrayList<>();
 
-        // if pendingRequests has a special order, then let's preserve it
-        final LinkedList<PendingRequest> pendingRequestsIndex = new LinkedList<>(pendingRequests);
+        final Collection<PhysicalSlot> availableSlots = new ArrayList<>(slots);
 
-        for (PhysicalSlot slot : slots) {
-            final Iterator<PendingRequest> pendingRequestIterator = pendingRequestsIndex.iterator();
+        final LinkedList<PendingRequest> prioritizedRequests = new LinkedList<>();
+        final LinkedList<PendingRequest> generalRequests = new LinkedList<>();
 
-            while (pendingRequestIterator.hasNext()) {
-                final PendingRequest pendingRequest = pendingRequestIterator.next();
+        for (PendingRequest pendingRequest : pendingRequests) {
+            if (pendingRequest.getResourceProfile().getTaskManagerAddress() != null) {
+                prioritizedRequests.add(pendingRequest);
+            } else {
+                generalRequests.add(pendingRequest);
+            }
+        }
+
+        log.info("Matching pending requests {} with available slots {}", pendingRequests, slots);
+
+        matchRequests(prioritizedRequests, availableSlots, resultingMatches, true);
+
+        matchRequests(generalRequests, availableSlots, resultingMatches, false);
+
+        return resultingMatches;
+    }
+
+    private void matchRequests(
+            LinkedList<PendingRequest> pendingRequests,
+            Collection<PhysicalSlot> availableSlots,
+            Collection<RequestSlotMatch> resultingMatches,
+            boolean prioritizeByAddress) {
+        final Iterator<PendingRequest> pendingRequestIterator = pendingRequests.iterator();
+
+        while (pendingRequestIterator.hasNext()) {
+            final PendingRequest pendingRequest = pendingRequestIterator.next();
+            final String taskManagerAddress = pendingRequest.getResourceProfile().getTaskManagerAddress();
+
+            for (Iterator<PhysicalSlot> slotIterator = availableSlots.iterator(); slotIterator.hasNext(); ) {
+                PhysicalSlot slot = slotIterator.next();
+                final String slotAddress = slot.getTaskManagerLocation().getHostname();
+
+                if (prioritizeByAddress && (taskManagerAddress == null || !slotAddress.contains(taskManagerAddress))) {
+                    log.debug(
+                            "Skipping slot {} because it does not match the task manager address {}",
+                            slot,
+                            taskManagerAddress);
+                    continue;
+                }
+
+                log.debug("Trying to match slot {} with request {}", slot, pendingRequest);
+
                 if (slot.getResourceProfile().isMatching(pendingRequest.getResourceProfile())) {
+                    log.debug("Matched slot {} with request {}", slot, pendingRequest);
                     resultingMatches.add(RequestSlotMatch.createFor(pendingRequest, slot));
                     pendingRequestIterator.remove();
+                    slotIterator.remove();
                     break;
                 }
             }
         }
-
-        return resultingMatches;
     }
 
     @Override

@@ -114,7 +114,7 @@ public class TaskExecutorResourceUtils {
      */
     @VisibleForTesting
     public static ResourceProfile generateDefaultSlotResourceProfile(
-            TaskExecutorResourceSpec taskExecutorResourceSpec, int numberOfSlots) {
+            TaskExecutorResourceSpec taskExecutorResourceSpec, int numberOfSlots, String taskManagerAddress) {
         final ResourceProfile.Builder resourceProfileBuilder =
                 ResourceProfile.newBuilder()
                         .setCpuCores(taskExecutorResourceSpec.getCpuCores().divide(numberOfSlots))
@@ -127,7 +127,8 @@ public class TaskExecutorResourceUtils {
                                         .getManagedMemorySize()
                                         .divide(numberOfSlots))
                         .setNetworkMemory(
-                                taskExecutorResourceSpec.getNetworkMemSize().divide(numberOfSlots));
+                                taskExecutorResourceSpec.getNetworkMemSize().divide(numberOfSlots))
+                        .setTaskManagerAddress(taskManagerAddress);
         taskExecutorResourceSpec
                 .getExtendedResources()
                 .forEach(
@@ -139,7 +140,7 @@ public class TaskExecutorResourceUtils {
 
     @VisibleForTesting
     public static ResourceProfile generateTotalAvailableResourceProfile(
-            TaskExecutorResourceSpec taskExecutorResourceSpec) {
+            TaskExecutorResourceSpec taskExecutorResourceSpec, String taskManagerAddress) {
         return ResourceProfile.newBuilder()
                 .setCpuCores(taskExecutorResourceSpec.getCpuCores())
                 .setTaskHeapMemory(taskExecutorResourceSpec.getTaskHeapSize())
@@ -147,6 +148,7 @@ public class TaskExecutorResourceUtils {
                 .setManagedMemory(taskExecutorResourceSpec.getManagedMemorySize())
                 .setNetworkMemory(taskExecutorResourceSpec.getNetworkMemSize())
                 .setExtendedResources(taskExecutorResourceSpec.getExtendedResources().values())
+                .setTaskManagerAddress(taskManagerAddress)
                 .build();
     }
 

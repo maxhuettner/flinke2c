@@ -724,9 +724,9 @@ class ResourceManagerTest {
         assertThat(overview.getNumberBlockedTaskManagers()).isEqualTo(0);
         assertThat(overview.getNumberBlockedFreeSlots()).isEqualTo(0);
         assertThat(overview.getTotalResource())
-                .isEqualTo(ResourceProfile.fromResources(1, 1024).multiply(8));
+                .isEqualTo(ResourceProfile.fromResources(1, 1024, "").multiply(8));
         assertThat(overview.getFreeResource())
-                .isEqualTo(ResourceProfile.fromResources(1, 1024).multiply(8));
+                .isEqualTo(ResourceProfile.fromResources(1, 1024, "").multiply(8));
 
         resourceManagerGateway.notifyNewBlockedNodes(
                 Collections.singleton(
@@ -743,9 +743,9 @@ class ResourceManagerTest {
         assertThat(overviewBlocked.getNumberBlockedTaskManagers()).isEqualTo(1);
         assertThat(overviewBlocked.getNumberBlockedFreeSlots()).isEqualTo(5);
         assertThat(overviewBlocked.getTotalResource())
-                .isEqualTo(ResourceProfile.fromResources(1, 1024).multiply(8));
+                .isEqualTo(ResourceProfile.fromResources(1, 1024, "").multiply(8));
         assertThat(overviewBlocked.getFreeResource())
-                .isEqualTo(ResourceProfile.fromResources(1, 1024).multiply(3));
+                .isEqualTo(ResourceProfile.fromResources(1, 1024, "").multiply(3));
     }
 
     private void registerTaskExecutorAndSlot(
@@ -765,8 +765,8 @@ class ResourceManagerTest {
                         hardwareDescription,
                         new TaskExecutorMemoryConfiguration(
                                 1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L),
-                        ResourceProfile.fromResources(1, 1024),
-                        ResourceProfile.fromResources(1, 1024).multiply(slotCount),
+                        ResourceProfile.fromResources(1, 1024, ""),
+                        ResourceProfile.fromResources(1, 1024, "").multiply(slotCount),
                         taskExecutorGateway.getAddress());
         RegistrationResponse registrationResult =
                 resourceManagerGateway
@@ -779,7 +779,7 @@ class ResourceManagerTest {
         for (int i = 0; i < slotCount; i++) {
             slots.add(
                     new SlotStatus(
-                            new SlotID(taskManagerId, i), ResourceProfile.fromResources(1, 1024)));
+                            new SlotID(taskManagerId, i), ResourceProfile.fromResources(1, 1024, "")));
         }
         resourceManagerGateway.sendSlotReport(
                 taskManagerId, instanceID, new SlotReport(slots), Duration.ofSeconds(5));

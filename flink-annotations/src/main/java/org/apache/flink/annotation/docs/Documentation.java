@@ -101,6 +101,10 @@ public final class Documentation {
         public static final String EXPERT_CLUSTER = "expert_cluster";
         public static final String EXPERT_JOB_MANAGER = "expert_jobmanager";
 
+        public static final String EXECUTION_SLOT_ALLOCATOR_TYPE = "execution_slot_allocator_type";
+
+        public static final String PLACEMENT_METHOD = "placement_method";
+
         public static final String ALL_JOB_MANAGER = "all_jobmanager";
         public static final String ALL_TASK_MANAGER = "all_taskmanager";
         public static final String ALL_TASK_MANAGER_NETWORK = "all_taskmanager_network";

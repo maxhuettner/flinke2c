@@ -57,10 +57,11 @@ public class ResourceManagerRuntimeServices {
             ResourceManagerRuntimeServicesConfiguration configuration,
             HighAvailabilityServices highAvailabilityServices,
             ScheduledExecutor scheduledExecutor,
-            SlotManagerMetricGroup slotManagerMetricGroup) {
+            SlotManagerMetricGroup slotManagerMetricGroup,
+            String taskManagerAddress) {
 
         final SlotManager slotManager =
-                createSlotManager(configuration, scheduledExecutor, slotManagerMetricGroup);
+                createSlotManager(configuration, scheduledExecutor, slotManagerMetricGroup, taskManagerAddress);
 
         final JobLeaderIdService jobLeaderIdService =
                 new DefaultJobLeaderIdService(
@@ -72,7 +73,7 @@ public class ResourceManagerRuntimeServices {
     private static SlotManager createSlotManager(
             ResourceManagerRuntimeServicesConfiguration configuration,
             ScheduledExecutor scheduledExecutor,
-            SlotManagerMetricGroup slotManagerMetricGroup) {
+            SlotManagerMetricGroup slotManagerMetricGroup, String taskManagerAddress) {
         final SlotManagerConfiguration slotManagerConfiguration =
                 configuration.getSlotManagerConfiguration();
         return new FineGrainedSlotManager(
@@ -85,7 +86,7 @@ public class ResourceManagerRuntimeServices {
                         slotManagerConfiguration.getTaskManagerRequestTimeout()),
                 new DefaultResourceAllocationStrategy(
                         SlotManagerUtils.generateTaskManagerTotalResourceProfile(
-                                slotManagerConfiguration.getDefaultWorkerResourceSpec()),
+                                slotManagerConfiguration.getDefaultWorkerResourceSpec(), taskManagerAddress),
                         slotManagerConfiguration.getNumSlotsPerWorker(),
                         slotManagerConfiguration.getTaskManagerLoadBalanceMode(),
                         slotManagerConfiguration.getTaskManagerTimeout(),

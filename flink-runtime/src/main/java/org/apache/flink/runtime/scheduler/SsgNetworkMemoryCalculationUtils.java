@@ -86,6 +86,7 @@ public class SsgNetworkMemoryCalculationUtils {
                         .setManagedMemory(original.getManagedMemory())
                         .setNetworkMemory(networkMemory)
                         .setExtendedResources(original.getExtendedResources().values())
+                        .setTaskManagerAddress(original.getTaskManagerAddress())
                         .build();
         ssg.setResourceProfile(enriched);
     }

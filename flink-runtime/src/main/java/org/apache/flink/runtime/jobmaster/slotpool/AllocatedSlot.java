@@ -72,6 +72,7 @@ class AllocatedSlot implements PhysicalSlot {
         this.taskManagerLocation = checkNotNull(location);
         this.physicalSlotNumber = physicalSlotNumber;
         this.resourceProfile = checkNotNull(resourceProfile);
+        this.resourceProfile.setTaskManagerAddress(taskManagerLocation.getHostname());
         this.taskManagerGateway = checkNotNull(taskManagerGateway);
 
         payloadReference = new AtomicReference<>(null);

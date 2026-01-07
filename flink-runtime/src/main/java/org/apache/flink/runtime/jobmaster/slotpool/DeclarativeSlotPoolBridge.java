@@ -316,11 +316,13 @@ public class DeclarativeSlotPoolBridge extends DeclarativeSlotPoolService implem
 
     private void reserveAndFulfillMatchedFreeSlots(
             Collection<RequestSlotMatchingStrategy.RequestSlotMatch> requestSlotMatches) {
+        log.info("Matched slots: {}", requestSlotMatches);
+
         for (RequestSlotMatchingStrategy.RequestSlotMatch match : requestSlotMatches) {
             final PendingRequest pendingRequest = match.getPendingRequest();
             final PhysicalSlot slot = match.getSlot();
 
-            log.debug("Matched pending request {} with slot {}.", pendingRequest, slot);
+            log.info("Matched pending request {} with slot {}.", pendingRequest, slot);
 
             Preconditions.checkNotNull(
                     pendingRequests.remove(pendingRequest.getSlotRequestId()),
@@ -395,7 +397,7 @@ public class DeclarativeSlotPoolBridge extends DeclarativeSlotPoolService implem
             PhysicalSlotRequest physicalSlotRequest, @Nullable Duration timeout) {
         assertRunningInMainThread();
 
-        log.debug(
+        log.info(
                 "Request new allocated slot with slot request id {} and resource profile {}",
                 physicalSlotRequest.getSlotRequestId(),
                 physicalSlotRequest.getPhysicalSlotResourceProfile());

@@ -133,6 +133,30 @@ public class ClusterOptions {
                                     UncaughtExceptionHandleMode.LOG.name(),
                                     UncaughtExceptionHandleMode.FAIL.name()));
 
+    @Documentation.Section(Documentation.Sections.PLACEMENT_METHOD)
+    public static final ConfigOption<PlacementMethod> PLACEMENT_METHOD =
+            ConfigOptions.key("cluster.placement-method")
+                    .enumType(PlacementMethod.class)
+                    .defaultValue(PlacementMethod.DEFAULT)
+                    .withDescription(
+                            String.format(
+                                    "Defines which placement method should be used  (%s, %s, %s or %s)",
+                                    PlacementMethod.DEFAULT.name(),
+                                    PlacementMethod.TOP_DOWN.name(),
+                                    PlacementMethod.BOTTOM_UP.name(),
+                                    PlacementMethod.TOPOLOGY.name()));
+
+    @Documentation.Section(Documentation.Sections.EXECUTION_SLOT_ALLOCATOR_TYPE)
+    public static final ConfigOption<ExecutionSlotAllocatorType> EXECUTION_SLOT_ALLOCATOR_TYPE =
+            ConfigOptions.key("cluster.execution-slot-allocator-type")
+                    .enumType(ExecutionSlotAllocatorType.class)
+                    .defaultValue(ExecutionSlotAllocatorType.SIMPLE)
+                    .withDescription(
+                            String.format(
+                                    "Defines which execution slot allocator should be used  (%s or %s)",
+                                    ExecutionSlotAllocatorType.SLOT_SHARING.name(),
+                                    ExecutionSlotAllocatorType.SIMPLE.name()));
+
     @Documentation.OverrideDefault("io.tmp.dirs")
     @Documentation.Section(Documentation.Sections.EXPERT_CLUSTER)
     public static final ConfigOption<String> PROCESS_WORKING_DIR_BASE =
@@ -220,5 +244,18 @@ public class ClusterOptions {
     public enum UncaughtExceptionHandleMode {
         LOG,
         FAIL
+    }
+
+    /** @see ClusterOptions#EXECUTION_SLOT_ALLOCATOR_TYPE */
+    public enum ExecutionSlotAllocatorType {
+        SLOT_SHARING,
+        SIMPLE
+    }
+    /** @see ClusterOptions#PLACEMENT_METHOD */
+    public enum PlacementMethod {
+        DEFAULT,
+        TOP_DOWN,
+        BOTTOM_UP,
+        TOPOLOGY
     }
 }

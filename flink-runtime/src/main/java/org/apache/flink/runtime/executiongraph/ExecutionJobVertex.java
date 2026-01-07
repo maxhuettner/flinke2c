@@ -155,7 +155,7 @@ public class ExecutionJobVertex
         }
 
         this.resourceProfile =
-                ResourceProfile.fromResourceSpec(jobVertex.getMinResources(), MemorySize.ZERO);
+                ResourceProfile.fromResourceSpec(jobVertex.getMinResources(), MemorySize.ZERO, null);
 
         // take the sharing group
         this.slotSharingGroup = checkNotNull(jobVertex.getSlotSharingGroup());

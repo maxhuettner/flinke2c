@@ -52,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Tests for batch slot requests. */
 class SlotPoolBatchSlotRequestTest {
 
-    private static final ResourceProfile resourceProfile = ResourceProfile.fromResources(1.0, 1024);
+    private static final ResourceProfile resourceProfile = ResourceProfile.fromResources(1.0, 1024, "");
     public static final CompletableFuture[] COMPLETABLE_FUTURES_EMPTY_ARRAY =
             new CompletableFuture[0];
     private static ScheduledExecutorService singleThreadScheduledExecutorService;
