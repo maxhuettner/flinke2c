@@ -150,13 +150,9 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         }
         totalResourceRequirements = totalResourceRequirements.add(increment);
 
-<<<<<<< HEAD
-        doDeclareResourceRequirements(false);
-=======
         log.debug("Total resource requirements increased to {}.", totalResourceRequirements);
 
-        declareResourceRequirements();
->>>>>>> 289d9920af4 (initial)
+        doDeclareResourceRequirements(false);
     }
 
     @Override

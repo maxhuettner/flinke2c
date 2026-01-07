@@ -26,13 +26,10 @@ import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.util.Preconditions;
 
-<<<<<<< HEAD
-import java.time.Duration;
-=======
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
->>>>>>> 289d9920af4 (initial)
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -103,8 +100,7 @@ public class DefaultResourceAllocationStrategy implements ResourceAllocationStra
         this.numSlotsPerWorker = numSlotsPerWorker;
         this.defaultSlotResourceProfile =
                 SlotManagerUtils.generateDefaultSlotResourceProfile(
-<<<<<<< HEAD
-                        totalResourceProfile, numSlotsPerWorker);
+                        totalResourceProfile, numSlotsPerWorker, totalResourceProfile.getTaskManagerAddress());
         switch (taskManagerLoadBalanceMode) {
             case SLOTS:
                 this.availableResourceMatchingStrategy =
@@ -119,13 +115,6 @@ public class DefaultResourceAllocationStrategy implements ResourceAllocationStra
                         AnyMatchingResourceMatchingStrategy.INSTANCE;
         }
 
-=======
-                        totalResourceProfile, numSlotsPerWorker, totalResourceProfile.getTaskManagerAddress());
-        this.availableResourceMatchingStrategy =
-                evenlySpreadOutSlots
-                        ? LeastUtilizationResourceMatchingStrategy.INSTANCE
-                        : AnyMatchingResourceMatchingStrategy.INSTANCE;
->>>>>>> 289d9920af4 (initial)
         this.taskManagerTimeout = taskManagerTimeout;
         this.redundantTaskManagerNum = redundantTaskManagerNum;
         this.minTotalCPU = minTotalCPU;

@@ -172,32 +172,11 @@ public class StreamExecutionEnvironment implements AutoCloseable {
 
     private final Map<AbstractID, CacheTransformation<?>> cachedTransformations = new HashMap<>();
 
-<<<<<<< HEAD:flink-runtime/src/main/java/org/apache/flink/streaming/api/environment/StreamExecutionEnvironment.java
     /**
      * Now we could not migrate this field to configuration. Because this object field remains
      * directly accessible and modifiable as it is exposed through a getter to users, allowing
      * external modifications.
      */
-=======
-    private long bufferTimeout = ExecutionOptions.BUFFER_TIMEOUT.defaultValue().toMillis();
-
-    private boolean isChainingEnabled = false; // TODO(MH): this should be true by default
-
-    private boolean isChainingOfOperatorsWithDifferentMaxParallelismEnabled = true;
-
-    /** The state backend used for storing k/v state and state snapshots. */
-    private StateBackend defaultStateBackend;
-
-    /** Whether to enable ChangelogStateBackend, default value is unset. */
-    private TernaryBoolean changelogStateBackendEnabled = TernaryBoolean.UNDEFINED;
-
-    /** The default savepoint directory used by the job. */
-    private Path defaultSavepointDirectory;
-
-    /** The time characteristic used by the data streams. */
-    private TimeCharacteristic timeCharacteristic = DEFAULT_TIME_CHARACTERISTIC;
-
->>>>>>> 289d9920af4 (initial):flink-streaming-java/src/main/java/org/apache/flink/streaming/api/environment/StreamExecutionEnvironment.java
     protected final List<Tuple2<String, DistributedCache.DistributedCacheEntry>> cacheFile =
             new ArrayList<>();
 
@@ -383,13 +362,7 @@ public class StreamExecutionEnvironment implements AutoCloseable {
         if (!resourceSpec.equals(ResourceSpec.UNKNOWN)) {
             this.slotSharingGroupResources.put(
                     slotSharingGroup.getName(),
-<<<<<<< HEAD:flink-runtime/src/main/java/org/apache/flink/streaming/api/environment/StreamExecutionEnvironment.java
-                    ResourceProfile.fromResourceSpec(resourceSpec, MemorySize.ZERO));
-=======
-                    ResourceProfile.fromResourceSpec(
-                            SlotSharingGroupUtils.extractResourceSpec(slotSharingGroup),
-                            MemorySize.ZERO, taskManagerAddress));
->>>>>>> 289d9920af4 (initial):flink-streaming-java/src/main/java/org/apache/flink/streaming/api/environment/StreamExecutionEnvironment.java
+                    ResourceProfile.fromResourceSpec(resourceSpec, MemorySize.ZERO, taskManagerAddress));
         }
         return this;
     }
@@ -475,7 +448,7 @@ public class StreamExecutionEnvironment implements AutoCloseable {
      */
     @PublicEvolving
     public boolean isChainingEnabled() {
-        return this.configuration.get(PipelineOptions.OPERATOR_CHAINING);
+        return this.configuration.get(PipelineOptions.OPERATOR_CHAINING); // TODO(MH): IMPORTANT Check what the config param is and disable in configuration
     }
 
     @PublicEvolving

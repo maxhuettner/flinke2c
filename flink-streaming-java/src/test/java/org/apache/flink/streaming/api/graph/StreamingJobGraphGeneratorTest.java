@@ -54,8 +54,6 @@ class StreamingJobGraphGeneratorTest extends JobGraphGeneratorTestBase {
         final StreamConfig map3Config = new StreamConfig(vertex3.getConfiguration());
         verifyFractions(map3Config, 1.0, 0.0, 0.0, taskManagerConfig);
     }
-<<<<<<< HEAD
-=======
 
     private JobGraph createJobGraphForManagedMemoryFractionTest(
             final List<ResourceSpec> resourceSpecs,
@@ -1334,5 +1332,4 @@ class StreamingJobGraphGeneratorTest extends JobGraphGeneratorTestBase {
             return new HashSet<>(completedClusterDatasetIds);
         }
     }
->>>>>>> 289d9920af4 (initial)
 }
