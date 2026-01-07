@@ -22,7 +22,9 @@ import org.apache.flink.runtime.jobmaster.SlotContext;
 import org.apache.flink.runtime.jobmaster.slotpool.PreviousAllocationSlotSelectionStrategy;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
 
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.Set;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -35,7 +37,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * task slot. A matcher can be generated to filter out candidate slots by matching their {@link
  * SlotContext} against the slot profile and, potentially, further requirements.
  */
-public class SlotProfile {
+public class SlotProfile implements Cloneable {
     /** This specifies the desired resource profile for the task slot. */
     private final ResourceProfile taskResourceProfile;
 
@@ -102,10 +104,11 @@ public class SlotProfile {
      *
      * @param taskResourceProfile specifying the required resources for the task slot
      * @param physicalSlotResourceProfile specifying the required resources for the physical slot to
-     *     host this task slot
+     *         host this task slot
      * @param preferredLocations specifying the preferred locations
      * @param priorAllocations specifying the prior allocations
      * @param reservedAllocations specifying all reserved allocations
+     *
      * @return Slot profile with all the given information
      */
     public static SlotProfile priorAllocation(
@@ -137,5 +140,16 @@ public class SlotProfile {
                 + ", reservedAllocations="
                 + reservedAllocations
                 + '}';
+    }
+
+    @Override
+    public SlotProfile clone() {
+        return new SlotProfile(
+                taskResourceProfile.clone(), // Clone the task resource profile
+                physicalSlotResourceProfile.clone(), // Clone the physical slot resource profile
+                new ArrayList<>(preferredLocations), // Deep copy the preferred locations
+                new ArrayList<>(preferredAllocations), // Deep copy the preferred allocations
+                new HashSet<>(reservedAllocations) // Deep copy the reserved allocations
+        );
     }
 }

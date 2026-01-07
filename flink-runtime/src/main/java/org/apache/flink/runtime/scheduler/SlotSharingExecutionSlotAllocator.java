@@ -38,6 +38,9 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -119,6 +122,8 @@ class SlotSharingExecutionSlotAllocator implements ExecutionSlotAllocator {
                         .map(ExecutionAttemptID::getExecutionVertexId)
                         .collect(Collectors.toList());
 
+        LOG.info("Allocating slots for {}", vertexIds);
+
         return allocateSlotsForVertices(vertexIds).stream()
                 .collect(
                         Collectors.toMap(
@@ -169,6 +174,9 @@ class SlotSharingExecutionSlotAllocator implements ExecutionSlotAllocator {
         Map<ExecutionSlotSharingGroup, SharedSlot> slots = new HashMap<>(executionsByGroup.size());
         Set<ExecutionSlotSharingGroup> groupsToAssign = new HashSet<>(executionsByGroup.keySet());
 
+        LOG.info("Number of execution by groups: {}", executionsByGroup.size());
+        LOG.info("Groups to assign: {}", groupsToAssign);
+
         Map<ExecutionSlotSharingGroup, SharedSlot> assignedSlots =
                 tryAssignExistingSharedSlots(groupsToAssign);
         slots.putAll(assignedSlots);
@@ -217,9 +225,9 @@ class SlotSharingExecutionSlotAllocator implements ExecutionSlotAllocator {
     }
 
     private static Map<ExecutionVertexID, SlotExecutionVertexAssignment>
-            allocateLogicalSlotsFromSharedSlots(
-                    Map<ExecutionSlotSharingGroup, SharedSlot> slots,
-                    Map<ExecutionSlotSharingGroup, List<ExecutionVertexID>> executionsByGroup) {
+    allocateLogicalSlotsFromSharedSlots(
+            Map<ExecutionSlotSharingGroup, SharedSlot> slots,
+            Map<ExecutionSlotSharingGroup, List<ExecutionVertexID>> executionsByGroup) {
 
         Map<ExecutionVertexID, SlotExecutionVertexAssignment> assignments = new HashMap<>();
 
@@ -236,6 +244,8 @@ class SlotSharingExecutionSlotAllocator implements ExecutionSlotAllocator {
                 assignments.put(executionId, assignment);
             }
         }
+
+        LOG.info("Assignments: {}", assignments);
 
         return assignments;
     }
@@ -277,6 +287,16 @@ class SlotSharingExecutionSlotAllocator implements ExecutionSlotAllocator {
             slotRequests.add(request);
             requestToGroup.put(physicalSlotRequestId, group);
             requestToPhysicalResources.put(physicalSlotRequestId, physicalSlotResourceProfile);
+        }
+
+        for (PhysicalSlotRequest slotRequest : slotRequests) {
+            LOG.debug(
+                    "Slot request: {}, profile: {}",
+                    slotRequest,
+                    slotRequest
+                            .getSlotProfile()
+                            .getPhysicalSlotResourceProfile()
+                            .getTaskManagerAddress());
         }
 
         Map<SlotRequestId, CompletableFuture<PhysicalSlotRequest.Result>> allocateResult =

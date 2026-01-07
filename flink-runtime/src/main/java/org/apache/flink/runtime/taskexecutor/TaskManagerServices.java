@@ -377,7 +377,8 @@ public class TaskManagerServices {
                         taskManagerServicesConfiguration.getTaskExecutorResourceSpec(),
                         taskManagerServicesConfiguration.getTimerServiceShutdownTimeout(),
                         taskManagerServicesConfiguration.getPageSize(),
-                        ioExecutor);
+                        ioExecutor,
+                        taskManagerServicesConfiguration.getExternalAddress());
 
         final JobTable jobTable = DefaultJobTable.create();
 
@@ -470,16 +471,16 @@ public class TaskManagerServices {
             final TaskExecutorResourceSpec taskExecutorResourceSpec,
             final long timerServiceShutdownTimeout,
             final int pageSize,
-            final Executor memoryVerificationExecutor) {
+            final Executor memoryVerificationExecutor, String taskManagerAddress) {
         final TimerService<AllocationID> timerService =
                 new DefaultTimerService<>(
                         new ScheduledThreadPoolExecutor(1), timerServiceShutdownTimeout);
         return new TaskSlotTableImpl<>(
                 numberOfSlots,
                 TaskExecutorResourceUtils.generateTotalAvailableResourceProfile(
-                        taskExecutorResourceSpec),
+                        taskExecutorResourceSpec, taskManagerAddress),
                 TaskExecutorResourceUtils.generateDefaultSlotResourceProfile(
-                        taskExecutorResourceSpec, numberOfSlots),
+                        taskExecutorResourceSpec, numberOfSlots, taskManagerAddress),
                 pageSize,
                 timerService,
                 memoryVerificationExecutor);

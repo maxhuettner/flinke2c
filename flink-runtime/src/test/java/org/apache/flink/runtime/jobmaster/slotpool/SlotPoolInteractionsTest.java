@@ -25,7 +25,11 @@ import org.apache.flink.runtime.testutils.CommonTestUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+<<<<<<< HEAD
 import java.time.Duration;
+=======
+import java.util.Collections;
+>>>>>>> 289d9920af4 (initial)
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -57,8 +61,14 @@ class SlotPoolInteractionsTest {
                     testMainThreadExecutor.execute(
                             () ->
                                     pool.requestNewAllocatedSlot(
+<<<<<<< HEAD
                                             PhysicalSlotRequestUtils.normalRequest(
                                                     ResourceProfile.UNKNOWN),
+=======
+                                            new SlotRequestId(),
+                                            ResourceProfile.UNKNOWN,
+                                            Collections.emptyList(),
+>>>>>>> 289d9920af4 (initial)
                                             fastTimeout));
 
             assertThatThrownBy(future::get)
@@ -77,8 +87,14 @@ class SlotPoolInteractionsTest {
                     testMainThreadExecutor.execute(
                             () ->
                                     pool.requestNewAllocatedSlot(
+<<<<<<< HEAD
                                             PhysicalSlotRequestUtils.normalRequest(
                                                     ResourceProfile.UNKNOWN),
+=======
+                                            new SlotRequestId(),
+                                            ResourceProfile.UNKNOWN,
+                                            Collections.emptyList(),
+>>>>>>> 289d9920af4 (initial)
                                             fastTimeout));
 
             assertThatThrownBy(future::get)
@@ -100,8 +116,14 @@ class SlotPoolInteractionsTest {
                     testMainThreadExecutor.execute(
                             () ->
                                     pool.requestNewAllocatedSlot(
+<<<<<<< HEAD
                                             PhysicalSlotRequestUtils.normalRequest(
                                                     ResourceProfile.UNKNOWN),
+=======
+                                            new SlotRequestId(),
+                                            ResourceProfile.UNKNOWN,
+                                            Collections.emptyList(),
+>>>>>>> 289d9920af4 (initial)
                                             fastTimeout));
 
             assertThatThrownBy(future::get)

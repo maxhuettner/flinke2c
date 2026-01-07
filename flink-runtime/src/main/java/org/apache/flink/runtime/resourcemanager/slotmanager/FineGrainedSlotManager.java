@@ -671,6 +671,9 @@ public class FineGrainedSlotManager implements SlotManager {
         allocateSlotsAccordingTo(result.getAllocationsOnRegisteredResources());
 
         final Set<PendingTaskManagerId> failAllocations;
+
+        LOG.info("Resource allocation result: {}", result.getPendingTaskManagersToAllocate());
+
         if (resourceAllocator.isSupported()) {
             // Allocate task managers according to the result
             failAllocations =
@@ -744,6 +747,11 @@ public class FineGrainedSlotManager implements SlotManager {
             final JobID jobID = jobEntry.getKey();
             for (Map.Entry<InstanceID, ResourceCounter> tmEntry : jobEntry.getValue().entrySet()) {
                 final InstanceID instanceID = tmEntry.getKey();
+                LOG.info(
+                        "Allocating {} slots for job {} on task manager {}.",
+                        tmEntry.getValue(),
+                        jobID,
+                        instanceID);
                 for (Map.Entry<ResourceProfile, Integer> slotEntry :
                         tmEntry.getValue().getResourcesWithCount()) {
                     for (int i = 0; i < slotEntry.getValue(); ++i) {

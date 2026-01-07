@@ -18,6 +18,11 @@
 
 package org.apache.flink.runtime.scheduler;
 
+<<<<<<< HEAD
+=======
+import org.apache.flink.api.common.time.Time;
+import org.apache.flink.configuration.ClusterOptions;
+>>>>>>> 289d9920af4 (initial)
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.blob.BlobWriter;
 import org.apache.flink.runtime.checkpoint.CheckpointCoordinator;
@@ -39,20 +44,30 @@ import org.apache.flink.runtime.jobgraph.SavepointRestoreSettings;
 import org.apache.flink.runtime.jobmaster.ExecutionDeploymentTracker;
 import org.apache.flink.runtime.jobmaster.ExecutionDeploymentTrackerDeploymentListenerAdapter;
 import org.apache.flink.runtime.metrics.groups.JobManagerJobMetricGroup;
+<<<<<<< HEAD
 import org.apache.flink.runtime.scheduler.adaptivebatch.ExecutionPlanSchedulingContext;
+=======
+import org.apache.flink.runtime.scheduler.adapter.DefaultExecutionGraphPlacement;
+import org.apache.flink.runtime.scheduler.adapter.TopDownBottomUpExecutionGraphPlacement;
+import org.apache.flink.runtime.scheduler.adapter.TopologyExecutionGraphPlacement;
+import org.apache.flink.runtime.scheduler.strategy.ExecutionGraphPlacement;
+>>>>>>> 289d9920af4 (initial)
 import org.apache.flink.runtime.shuffle.ShuffleMaster;
 
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.HashSet;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 
+import static org.apache.flink.configuration.ClusterOptions.PLACEMENT_METHOD;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /** Default {@link ExecutionGraphFactory} implementation. */
 public class DefaultExecutionGraphFactory implements ExecutionGraphFactory {
+    private static final Logger LOG = LoggerFactory.getLogger(DefaultExecutionGraphFactory.class);
 
     private final Configuration configuration;
     private final ClassLoader userCodeClassLoader;
@@ -151,6 +166,24 @@ public class DefaultExecutionGraphFactory implements ExecutionGraphFactory {
                     }
                 };
 
+        ClusterOptions.PlacementMethod placementMethod = configuration.get(PLACEMENT_METHOD);
+        LOG.debug("Placement method {}", placementMethod);
+        String graphMlPath = configuration.getString("topology.graphml.path", "/topology.graphml");
+
+        ExecutionGraphPlacement executionGraphPlacement = null;
+        switch (placementMethod) {
+            case TOP_DOWN:
+            case BOTTOM_UP:
+                executionGraphPlacement = new TopDownBottomUpExecutionGraphPlacement(placementMethod, graphMlPath);
+                break;
+            case TOPOLOGY:
+                executionGraphPlacement = new TopologyExecutionGraphPlacement();
+                break;
+            default:
+                executionGraphPlacement = new DefaultExecutionGraphPlacement();
+                break;
+        }
+
         final ExecutionGraph newExecutionGraph =
                 DefaultExecutionGraphBuilder.buildGraph(
                         jobGraph,
@@ -178,7 +211,11 @@ public class DefaultExecutionGraphFactory implements ExecutionGraphFactory {
                         markPartitionFinishedStrategy,
                         nonFinishedHybridPartitionShouldBeUnknown,
                         jobManagerJobMetricGroup,
+<<<<<<< HEAD
                         executionPlanSchedulingContext);
+=======
+                        executionGraphPlacement);
+>>>>>>> 289d9920af4 (initial)
 
         final CheckpointCoordinator checkpointCoordinator =
                 newExecutionGraph.getCheckpointCoordinator();

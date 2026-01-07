@@ -67,7 +67,7 @@ class SsgNetworkMemoryCalculationUtilsTest {
 
     private static final TestShuffleMaster SHUFFLE_MASTER = new TestShuffleMaster();
 
-    private static final ResourceProfile DEFAULT_RESOURCE = ResourceProfile.fromResources(1.0, 100);
+    private static final ResourceProfile DEFAULT_RESOURCE = ResourceProfile.fromResources(1.0, 100, "");
 
     @Test
     void testGenerateEnrichedResourceProfile() throws Exception {

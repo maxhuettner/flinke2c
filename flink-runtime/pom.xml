@@ -72,6 +72,13 @@ under the License.
 		</dependency>
 
 		<dependency>
+			<groupId>org.jgrapht</groupId>
+			<artifactId>jgrapht-core</artifactId>
+			<version>1.5.2</version>
+		</dependency>
+
+
+		<dependency>
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-rpc-core</artifactId>
 			<version>${project.version}</version>

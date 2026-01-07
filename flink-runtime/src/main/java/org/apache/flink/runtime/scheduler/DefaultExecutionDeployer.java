@@ -36,6 +36,7 @@ import javax.annotation.Nullable;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -91,6 +92,8 @@ public class DefaultExecutionDeployer implements ExecutionDeployer {
             final List<Execution> executionsToDeploy,
             final Map<ExecutionVertexID, ExecutionVertexVersion> requiredVersionByVertex) {
         validateExecutionStates(executionsToDeploy);
+
+        log.info("Allocating and deploying {} tasks.", executionsToDeploy.size());
 
         transitionToScheduled(executionsToDeploy);
 

@@ -97,11 +97,15 @@ class DeclarativeSlotPoolBridgeTest extends AbstractDeclarativeSlotPoolBridgeTes
 
             CompletableFuture<PhysicalSlot> slotAllocationFuture =
                     declarativeSlotPoolBridge.requestNewAllocatedSlot(
+<<<<<<< HEAD
                             PhysicalSlotRequestUtils.normalRequest(
                                     slotRequestId, ResourceProfile.UNKNOWN),
                             null);
 
             requirementListener.tryWaitSlotRequestIsDone();
+=======
+                            slotRequestId, ResourceProfile.UNKNOWN, Collections.emptyList(), null);
+>>>>>>> 289d9920af4 (initial)
 
             declarativeSlotPoolBridge.newSlotsAreAvailable(Collections.singleton(allocatedSlot));
 
@@ -124,10 +128,18 @@ class DeclarativeSlotPoolBridgeTest extends AbstractDeclarativeSlotPoolBridgeTes
                     CompletableFuture.supplyAsync(
                                     () ->
                                             declarativeSlotPoolBridge.requestNewAllocatedSlot(
+<<<<<<< HEAD
                                                     PhysicalSlotRequestUtils.normalRequest(
                                                             slotRequestId, ResourceProfile.UNKNOWN),
                                                     Duration.ofMinutes(5)),
                                     componentMainThreadExecutor)
+=======
+                                                    slotRequestId,
+                                                    ResourceProfile.UNKNOWN,
+                                                    Collections.emptyList(),
+                                                    Time.minutes(5)),
+                                    mainThreadExecutor)
+>>>>>>> 289d9920af4 (initial)
                             .get();
 
             tryWaitSlotRequestIsDone(declarativeSlotPoolBridge);
@@ -197,10 +209,17 @@ class DeclarativeSlotPoolBridgeTest extends AbstractDeclarativeSlotPoolBridgeTes
                                     slotRequestId -> {
                                         final CompletableFuture<PhysicalSlot> slotFuture =
                                                 declarativeSlotPoolBridge.requestNewAllocatedSlot(
+<<<<<<< HEAD
                                                         PhysicalSlotRequestUtils.normalRequest(
                                                                 slotRequestId,
                                                                 ResourceProfile.UNKNOWN),
                                                         RPC_TIMEOUT);
+=======
+                                                        slotRequestId,
+                                                        ResourceProfile.UNKNOWN,
+                                                        Collections.emptyList(),
+                                                        rpcTimeout);
+>>>>>>> 289d9920af4 (initial)
                                         slotFuture.whenComplete(
                                                 (physicalSlot, throwable) -> {
                                                     if (throwable != null) {
@@ -231,10 +250,14 @@ class DeclarativeSlotPoolBridgeTest extends AbstractDeclarativeSlotPoolBridgeTes
 
             final CompletableFuture<PhysicalSlot> slotFuture =
                     declarativeSlotPoolBridge.requestNewAllocatedSlot(
+<<<<<<< HEAD
                             PhysicalSlotRequestUtils.normalRequest(ResourceProfile.UNKNOWN),
                             RPC_TIMEOUT);
 
             tryWaitSlotRequestIsDone(declarativeSlotPoolBridge);
+=======
+                            new SlotRequestId(), ResourceProfile.UNKNOWN, Collections.emptyList(), rpcTimeout);
+>>>>>>> 289d9920af4 (initial)
 
             final LocalTaskManagerLocation localTaskManagerLocation =
                     new LocalTaskManagerLocation();

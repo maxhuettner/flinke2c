@@ -43,7 +43,6 @@ public class SlotSelectionStrategyUtils {
                 configuration.get(TaskManagerOptions.TASK_MANAGER_LOAD_BALANCE_MODE);
 
         final SlotSelectionStrategy locationPreferenceSlotSelectionStrategy;
-
         locationPreferenceSlotSelectionStrategy =
                 taskManagerLoadBalanceMode == TaskManagerLoadBalanceMode.SLOTS
                         ? LocationPreferenceSlotSelectionStrategy.createEvenlySpreadOut()

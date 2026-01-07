@@ -66,7 +66,7 @@ class ResourceManagerTaskExecutorTest {
     private static final Duration TIMEOUT = TestingUtils.infiniteTime();
 
     private static final ResourceProfile DEFAULT_SLOT_PROFILE =
-            ResourceProfile.fromResources(1.0, 1234);
+            ResourceProfile.fromResources(1.0, 1234, "");
 
     @RegisterExtension
     static final TestExecutorExtension<ScheduledExecutorService> EXECUTOR_EXTENSION =

@@ -31,6 +31,7 @@ import org.apache.flink.runtime.jobmaster.slotpool.SlotPool;
 import org.apache.flink.runtime.jobmaster.slotpool.SlotSelectionStrategy;
 import org.apache.flink.runtime.scheduler.strategy.PipelinedRegionSchedulingStrategy;
 import org.apache.flink.runtime.scheduler.strategy.SchedulingStrategyFactory;
+import org.apache.flink.runtime.util.ExecutionSlotAllocatorFactoryUtils;
 import org.apache.flink.runtime.util.SlotSelectionStrategyUtils;
 import org.apache.flink.util.clock.SystemClock;
 

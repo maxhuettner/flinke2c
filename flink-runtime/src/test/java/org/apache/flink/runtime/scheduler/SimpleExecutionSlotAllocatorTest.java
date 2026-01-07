@@ -48,7 +48,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Test suits for {@link SimpleExecutionSlotAllocator}. */
 class SimpleExecutionSlotAllocatorTest {
 
-    private static final ResourceProfile RESOURCE_PROFILE = ResourceProfile.fromResources(3, 5);
+    private static final ResourceProfile RESOURCE_PROFILE = ResourceProfile.fromResources(3, 5, "");
     private static final ExecutionAttemptID EXECUTION_ATTEMPT_ID = createExecutionAttemptId();
 
     @Test

@@ -150,7 +150,13 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
         }
         totalResourceRequirements = totalResourceRequirements.add(increment);
 
+<<<<<<< HEAD
         doDeclareResourceRequirements(false);
+=======
+        log.debug("Total resource requirements increased to {}.", totalResourceRequirements);
+
+        declareResourceRequirements();
+>>>>>>> 289d9920af4 (initial)
     }
 
     @Override
@@ -333,10 +339,21 @@ public class DefaultDeclarativeSlotPool implements DeclarativeSlotPool {
 
         if (match.isPresent()) {
             final ResourceProfile matchedRequirement = match.get();
-            log.debug(
-                    "Matched slot offer {} to requirement {}.",
-                    slotOffer.getAllocationId(),
-                    matchedRequirement);
+
+//            if (matchedRequirement.getTaskManagerAddress() == null || !taskManagerLocation
+//                    .getHostname()
+//                    .contains(matchedRequirement.getTaskManagerAddress())) {
+//                log.debug(
+//                        "Matched slot offer {} to requirement {} but TaskManager address does not match.",
+//                        slotOffer.getAllocationId(),
+//                        matchedRequirement);
+//                return Optional.empty();
+//            }
+//
+//            log.debug(
+//                    "Matched slot offer {} to requirement {}.",
+//                    slotOffer.getAllocationId(),
+//                    matchedRequirement);
 
             increaseAvailableResources(ResourceCounter.withResource(matchedRequirement, 1));
 

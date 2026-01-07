@@ -40,7 +40,7 @@ class FineGrainedTaskManagerRegistrationTest {
 
     @Test
     void testFreeSlot() {
-        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000);
+        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000, "");
         final FineGrainedTaskManagerRegistration taskManager =
                 new FineGrainedTaskManagerRegistration(
                         TASK_EXECUTOR_CONNECTION, totalResource, totalResource);
@@ -50,7 +50,7 @@ class FineGrainedTaskManagerRegistrationTest {
                 new FineGrainedTaskManagerSlot(
                         allocationId,
                         jobId,
-                        ResourceProfile.fromResources(2, 100),
+                        ResourceProfile.fromResources(2, 100, ""),
                         TASK_EXECUTOR_CONNECTION,
                         SlotState.ALLOCATED);
         taskManager.notifyAllocation(allocationId, slot);
@@ -63,7 +63,7 @@ class FineGrainedTaskManagerRegistrationTest {
 
     @Test
     void testNotifyAllocation() {
-        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000);
+        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000, "");
         final FineGrainedTaskManagerRegistration taskManager =
                 new FineGrainedTaskManagerRegistration(
                         TASK_EXECUTOR_CONNECTION, totalResource, totalResource);
@@ -73,20 +73,20 @@ class FineGrainedTaskManagerRegistrationTest {
                 new FineGrainedTaskManagerSlot(
                         allocationId,
                         jobId,
-                        ResourceProfile.fromResources(2, 100),
+                        ResourceProfile.fromResources(2, 100, ""),
                         TASK_EXECUTOR_CONNECTION,
                         SlotState.ALLOCATED);
 
         taskManager.notifyAllocation(allocationId, slot);
         assertThat(taskManager.getAvailableResource())
-                .isEqualTo(ResourceProfile.fromResources(8, 900));
+                .isEqualTo(ResourceProfile.fromResources(8, 900, ""));
         assertThat(taskManager.getIdleSince()).isEqualTo(Long.MAX_VALUE);
         assertThat(taskManager.getAllocatedSlots()).containsKey(allocationId);
     }
 
     @Test
     void testNotifyAllocationComplete() {
-        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000);
+        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000, "");
         final FineGrainedTaskManagerRegistration taskManager =
                 new FineGrainedTaskManagerRegistration(
                         TASK_EXECUTOR_CONNECTION, totalResource, totalResource);
@@ -96,19 +96,19 @@ class FineGrainedTaskManagerRegistrationTest {
                 new FineGrainedTaskManagerSlot(
                         allocationId,
                         jobId,
-                        ResourceProfile.fromResources(2, 100),
+                        ResourceProfile.fromResources(2, 100, ""),
                         TASK_EXECUTOR_CONNECTION,
                         SlotState.PENDING);
 
         taskManager.notifyAllocation(allocationId, slot);
         assertThat(taskManager.getAvailableResource())
-                .isEqualTo(ResourceProfile.fromResources(8, 900));
+                .isEqualTo(ResourceProfile.fromResources(8, 900, ""));
         assertThat(taskManager.getIdleSince()).isEqualTo(Long.MAX_VALUE);
         assertThat(taskManager.getAllocatedSlots()).containsKey(allocationId);
 
         taskManager.notifyAllocationComplete(allocationId);
         assertThat(taskManager.getAvailableResource())
-                .isEqualTo(ResourceProfile.fromResources(8, 900));
+                .isEqualTo(ResourceProfile.fromResources(8, 900, ""));
         assertThat(taskManager.getIdleSince()).isEqualTo(Long.MAX_VALUE);
         assertThat(taskManager.getAllocatedSlots()).containsKey(allocationId);
         assertThat(taskManager.getAllocatedSlots().get(allocationId).getState())
@@ -117,7 +117,7 @@ class FineGrainedTaskManagerRegistrationTest {
 
     @Test
     void testNotifyAllocationWithoutEnoughResource() {
-        final ResourceProfile totalResource = ResourceProfile.fromResources(1, 100);
+        final ResourceProfile totalResource = ResourceProfile.fromResources(1, 100, "");
         final FineGrainedTaskManagerRegistration taskManager =
                 new FineGrainedTaskManagerRegistration(
                         TASK_EXECUTOR_CONNECTION, totalResource, totalResource);
@@ -127,14 +127,14 @@ class FineGrainedTaskManagerRegistrationTest {
                 new FineGrainedTaskManagerSlot(
                         allocationId,
                         jobId,
-                        ResourceProfile.fromResources(2, 100),
+                        ResourceProfile.fromResources(2, 100, ""),
                         TASK_EXECUTOR_CONNECTION,
                         SlotState.PENDING);
         final FineGrainedTaskManagerSlot slot2 =
                 new FineGrainedTaskManagerSlot(
                         allocationId,
                         jobId,
-                        ResourceProfile.fromResources(2, 100),
+                        ResourceProfile.fromResources(2, 100, ""),
                         TASK_EXECUTOR_CONNECTION,
                         SlotState.ALLOCATED);
 

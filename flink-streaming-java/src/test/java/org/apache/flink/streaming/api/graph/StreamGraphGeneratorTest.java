@@ -659,9 +659,9 @@ class StreamGraphGeneratorTest {
     void testSetSlotSharingResource() {
         final String slotSharingGroup1 = "a";
         final String slotSharingGroup2 = "b";
-        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10);
-        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20);
-        final ResourceProfile resourceProfile3 = ResourceProfile.fromResources(3, 30);
+        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10, "");
+        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20,  "");
+        final ResourceProfile resourceProfile3 = ResourceProfile.fromResources(3, 30, "");
         final Map<String, ResourceProfile> slotSharingGroupResource = new HashMap<>();
         slotSharingGroupResource.put(slotSharingGroup1, resourceProfile1);
         slotSharingGroupResource.put(slotSharingGroup2, resourceProfile2);
@@ -763,11 +763,11 @@ class StreamGraphGeneratorTest {
         assertThat(streamGraph.getSlotSharingGroupResource("ssg1"))
                 .hasValue(ResourceProfile.fromResources(1, 100));
         assertThat(streamGraph.getSlotSharingGroupResource("ssg2"))
-                .hasValue(ResourceProfile.fromResources(2, 200));
+                .hasValue(ResourceProfile.fromResources(2, 200, ""));
         assertThat(
                         streamGraph.getSlotSharingGroupResource(
                                 StreamGraphGenerator.DEFAULT_SLOT_SHARING_GROUP))
-                .hasValue(ResourceProfile.fromResources(3, 300));
+                .hasValue(ResourceProfile.fromResources(3, 300, ""));
     }
 
     @Test

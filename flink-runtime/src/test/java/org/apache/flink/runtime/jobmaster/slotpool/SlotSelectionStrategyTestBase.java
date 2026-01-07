@@ -28,6 +28,7 @@ import org.apache.flink.runtime.scheduler.TestingPhysicalSlot;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
 
 import java.net.InetAddress;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -35,8 +36,8 @@ import java.util.Optional;
 /** Test base for {@link SlotSelectionStrategy}. */
 abstract class SlotSelectionStrategyTestBase {
 
-    protected final ResourceProfile resourceProfile = ResourceProfile.fromResources(2, 1024);
-    protected final ResourceProfile biggerResourceProfile = ResourceProfile.fromResources(3, 1024);
+    protected final ResourceProfile resourceProfile = ResourceProfile.fromResources(2, 1024, "");
+    protected final ResourceProfile biggerResourceProfile = ResourceProfile.fromResources(3, 1024, "");
 
     protected final AllocationID aid1 = new AllocationID();
     protected final AllocationID aid2 = new AllocationID();

@@ -32,6 +32,7 @@ import javax.annotation.Nullable;
 
 import java.time.Duration;
 import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
@@ -75,6 +76,7 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
      * Registers a TaskExecutor with the given {@link ResourceID} at {@link SlotPool}.
      *
      * @param resourceID identifying the TaskExecutor to register
+     *
      * @return true iff a new resource id was registered
      */
     boolean registerTaskManager(ResourceID resourceID);
@@ -84,6 +86,7 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
      *
      * @param resourceId identifying the TaskExecutor which shall be released from the SlotPool
      * @param cause for the releasing of the TaskManager
+     *
      * @return true iff a given registered resource id was removed
      */
     boolean releaseTaskManager(final ResourceID resourceId, final Exception cause);
@@ -95,8 +98,9 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
      * @param taskManagerLocation from which the slot offers originate
      * @param taskManagerGateway to talk to the slot offerer
      * @param offers slot offers which are offered to the {@link SlotPool}
+     *
      * @return A collection of accepted slot offers. The remaining slot offers are implicitly
-     *     rejected.
+     *         rejected.
      */
     Collection<SlotOffer> offerSlots(
             TaskManagerLocation taskManagerLocation,
@@ -119,7 +123,7 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
      * the slot pool.
      *
      * @return a list of {@link SlotInfo} objects about all slots that are currently allocated in
-     *     the slot pool.
+     *         the slot pool.
      */
     Collection<SlotInfo> getAllocatedSlotsInformation();
 
@@ -129,8 +133,9 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
      *
      * @param allocationID the allocation id of the requested available slot
      * @param physicalSlotRequest the physical slot request.
+     *
      * @return the previously available slot with the given allocation id, if a slot with this
-     *     allocation id exists
+     *         allocation id exists
      */
     Optional<PhysicalSlot> allocateAvailableSlot(
             AllocationID allocationID, PhysicalSlotRequest physicalSlotRequest);
@@ -168,6 +173,7 @@ public interface SlotPool extends AllocatedSlotActions, AutoCloseable {
      * Create report about the allocated slots belonging to the specified task manager.
      *
      * @param taskManagerId identifies the task manager
+     *
      * @return the allocated slots on the task manager
      */
     AllocatedSlotReport createAllocatedSlotReport(ResourceID taskManagerId);

@@ -26,8 +26,15 @@ import org.apache.flink.runtime.clusterframework.types.ResourceProfile;
 import org.apache.flink.runtime.slots.ResourceRequirement;
 import org.apache.flink.util.Preconditions;
 
+<<<<<<< HEAD
 import java.time.Duration;
+=======
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+>>>>>>> 289d9920af4 (initial)
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Iterator;
@@ -82,6 +89,8 @@ public class DefaultResourceAllocationStrategy implements ResourceAllocationStra
     /** Defines the number of redundant task managers. */
     private final int redundantTaskManagerNum;
 
+    private static final Logger log = LoggerFactory.getLogger(DefaultResourceAllocationStrategy.class);
+
     public DefaultResourceAllocationStrategy(
             ResourceProfile totalResourceProfile,
             int numSlotsPerWorker,
@@ -94,6 +103,7 @@ public class DefaultResourceAllocationStrategy implements ResourceAllocationStra
         this.numSlotsPerWorker = numSlotsPerWorker;
         this.defaultSlotResourceProfile =
                 SlotManagerUtils.generateDefaultSlotResourceProfile(
+<<<<<<< HEAD
                         totalResourceProfile, numSlotsPerWorker);
         switch (taskManagerLoadBalanceMode) {
             case SLOTS:
@@ -109,6 +119,13 @@ public class DefaultResourceAllocationStrategy implements ResourceAllocationStra
                         AnyMatchingResourceMatchingStrategy.INSTANCE;
         }
 
+=======
+                        totalResourceProfile, numSlotsPerWorker, totalResourceProfile.getTaskManagerAddress());
+        this.availableResourceMatchingStrategy =
+                evenlySpreadOutSlots
+                        ? LeastUtilizationResourceMatchingStrategy.INSTANCE
+                        : AnyMatchingResourceMatchingStrategy.INSTANCE;
+>>>>>>> 289d9920af4 (initial)
         this.taskManagerTimeout = taskManagerTimeout;
         this.redundantTaskManagerNum = redundantTaskManagerNum;
         this.minTotalCPU = minTotalCPU;
@@ -302,7 +319,20 @@ public class DefaultResourceAllocationStrategy implements ResourceAllocationStra
             List<InternalResourceInfo> registeredResources) {
         Collection<ResourceRequirement> outstandingRequirements = new ArrayList<>();
 
-        for (ResourceRequirement resourceRequirement : missingResources) {
+        Comparator<ResourceRequirement> resourceRequirementComparator = (req1, req2) -> {
+            boolean addrOneIsNull = req1.getResourceProfile().getTaskManagerAddress() == null;
+            boolean addrTwoIsNull = req2.getResourceProfile().getTaskManagerAddress() == null;
+
+            if (addrOneIsNull && !addrTwoIsNull) return 1;
+            if (!addrOneIsNull && addrTwoIsNull) return -1;
+
+            return 0;
+        };
+
+        final List<ResourceRequirement> sortedMissingResources =
+                missingResources.stream().sorted(resourceRequirementComparator).collect(Collectors.toList());
+
+        for (ResourceRequirement resourceRequirement : sortedMissingResources) {
             int numMissingRequirements =
                     availableResourceMatchingStrategy.tryFulfilledRequirementWithResource(
                             registeredResources,
@@ -473,7 +503,16 @@ public class DefaultResourceAllocationStrategy implements ResourceAllocationStra
         boolean tryAllocateSlotForJob(JobID jobId, ResourceProfile requirement) {
             final ResourceProfile effectiveProfile =
                     getEffectiveResourceProfile(requirement, defaultSlotProfile);
+
+            final String requiredTaskManagerAddress = requirement.getTaskManagerAddress();
+            final String taskManagerAddress = defaultSlotProfile.getTaskManagerAddress();
+
+            log.debug("Requirement TaskManager address {}, default slot profile {}", requiredTaskManagerAddress, defaultSlotProfile);
+            if (requiredTaskManagerAddress != null && taskManagerAddress != null && !taskManagerAddress.equals(requiredTaskManagerAddress)) {
+                return false;
+            }
             if (availableProfile.allFieldsNoLessThan(effectiveProfile)) {
+                log.debug("Allocate slot for job {} with profile {}", jobId, effectiveProfile);
                 availableProfile = availableProfile.subtract(effectiveProfile);
                 allocationConsumer.accept(jobId, effectiveProfile);
                 utilization = updateUtilization();

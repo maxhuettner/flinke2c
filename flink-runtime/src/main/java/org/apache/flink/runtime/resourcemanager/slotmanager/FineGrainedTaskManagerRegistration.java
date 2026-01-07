@@ -57,6 +57,7 @@ public class FineGrainedTaskManagerRegistration implements TaskManagerInfo {
         this.taskManagerConnection = Preconditions.checkNotNull(taskManagerConnection);
         this.totalResource = Preconditions.checkNotNull(totalResourceProfile);
         this.defaultSlotResourceProfile = Preconditions.checkNotNull(defaultSlotResourceProfile);
+        this.defaultSlotResourceProfile.setTaskManagerAddress(taskManagerConnection.getTaskExecutorGateway().getHostname());
 
         this.slots = new HashMap<>();
 

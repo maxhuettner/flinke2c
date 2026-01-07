@@ -47,6 +47,7 @@ import org.apache.flink.runtime.metrics.groups.JobManagerJobMetricGroup;
 import org.apache.flink.runtime.rest.messages.JobPlanInfo;
 import org.apache.flink.runtime.scheduler.VertexParallelismStore;
 import org.apache.flink.runtime.scheduler.adaptivebatch.ExecutionPlanSchedulingContext;
+import org.apache.flink.runtime.scheduler.strategy.ExecutionGraphPlacement;
 import org.apache.flink.runtime.shuffle.ShuffleMaster;
 import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.CheckpointStorageLoader;
@@ -100,7 +101,8 @@ public class DefaultExecutionGraphBuilder {
             MarkPartitionFinishedStrategy markPartitionFinishedStrategy,
             boolean nonFinishedHybridPartitionShouldBeUnknown,
             JobManagerJobMetricGroup jobManagerJobMetricGroup,
-            ExecutionPlanSchedulingContext executionPlanSchedulingContext)
+            ExecutionPlanSchedulingContext executionPlanSchedulingContext,
+            ExecutionGraphPlacement executionGraphPlacement)
             throws JobExecutionException, JobException {
 
         checkNotNull(jobGraph, "job graph cannot be null");
@@ -196,6 +198,7 @@ public class DefaultExecutionGraphBuilder {
                     jobId);
         }
         executionGraph.attachJobGraph(sortedTopology, jobManagerJobMetricGroup);
+        executionGraphPlacement.assignPlacement(executionGraph);
 
         if (log.isDebugEnabled()) {
             log.debug(

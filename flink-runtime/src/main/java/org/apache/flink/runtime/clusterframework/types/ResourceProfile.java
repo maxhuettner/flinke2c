@@ -60,7 +60,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  *
  * The extended resources are compared ordered by the resource names.
  */
-public class ResourceProfile implements Serializable {
+public class ResourceProfile implements Serializable, Cloneable {
 
     private static final long serialVersionUID = 1L;
 
@@ -82,6 +82,7 @@ public class ResourceProfile implements Serializable {
                     .setTaskOffHeapMemory(MemorySize.MAX_VALUE)
                     .setManagedMemory(MemorySize.MAX_VALUE)
                     .setNetworkMemory(MemorySize.MAX_VALUE)
+                    .setTaskManagerAddress(null)
                     .build();
 
     /** A ResourceProfile describing zero resources. */
@@ -114,6 +115,9 @@ public class ResourceProfile implements Serializable {
     @Nullable // can be null only for UNKNOWN
     private final MemorySize networkMemory;
 
+    @Nullable
+    private String taskManagerAddress;
+
     /** A extensible field for user specified resources from {@link ResourceSpec}. */
     private final Map<String, ExternalResource> extendedResources;
 
@@ -127,6 +131,7 @@ public class ResourceProfile implements Serializable {
      * @param taskOffHeapMemory The size of the task off-heap memory.
      * @param managedMemory The size of the managed memory.
      * @param networkMemory The size of the network memory.
+     * @param taskManagerAddress The address of the task manager
      * @param extendedResources The extended resources such as GPU and FPGA
      */
     private ResourceProfile(
@@ -135,7 +140,9 @@ public class ResourceProfile implements Serializable {
             final MemorySize taskOffHeapMemory,
             final MemorySize managedMemory,
             final MemorySize networkMemory,
+            final String taskManagerAddress,
             final Map<String, ExternalResource> extendedResources) {
+
 
         checkNotNull(cpuCores);
 
@@ -144,6 +151,8 @@ public class ResourceProfile implements Serializable {
         this.taskOffHeapMemory = checkNotNull(taskOffHeapMemory);
         this.managedMemory = checkNotNull(managedMemory);
         this.networkMemory = checkNotNull(networkMemory);
+
+        this.taskManagerAddress = taskManagerAddress;
 
         this.extendedResources =
                 checkNotNull(extendedResources).entrySet().stream()
@@ -155,6 +164,7 @@ public class ResourceProfile implements Serializable {
      * Creates a special ResourceProfile with negative values, indicating resources are unspecified.
      */
     private ResourceProfile() {
+        this.taskManagerAddress = null;
         this.cpuCores = null;
         this.taskHeapMemory = null;
         this.taskOffHeapMemory = null;
@@ -175,6 +185,10 @@ public class ResourceProfile implements Serializable {
         return cpuCores;
     }
 
+    public String getTaskManagerAddress() {
+        return taskManagerAddress;
+    }
+
     /**
      * Get the task heap memory needed.
      *
@@ -183,6 +197,10 @@ public class ResourceProfile implements Serializable {
     public MemorySize getTaskHeapMemory() {
         throwUnsupportedOperationExceptionIfUnknown();
         return taskHeapMemory;
+    }
+
+    public void setTaskManagerAddress(String taskManagerAddress) {
+        this.taskManagerAddress = taskManagerAddress;
     }
 
     /**
@@ -341,13 +359,15 @@ public class ResourceProfile implements Serializable {
 
     @Override
     public int hashCode() {
-        int result = Objects.hashCode(cpuCores);
-        result = 31 * result + Objects.hashCode(taskHeapMemory);
-        result = 31 * result + Objects.hashCode(taskOffHeapMemory);
-        result = 31 * result + Objects.hashCode(managedMemory);
-        result = 31 * result + Objects.hashCode(networkMemory);
-        result = 31 * result + extendedResources.hashCode();
-        return result;
+        return Objects.hash(
+                cpuCores,
+                taskHeapMemory,
+                taskOffHeapMemory,
+                managedMemory,
+                networkMemory,
+                taskManagerAddress,
+                extendedResources
+        );
     }
 
     @Override
@@ -361,7 +381,8 @@ public class ResourceProfile implements Serializable {
                     && Objects.equals(taskOffHeapMemory, that.taskOffHeapMemory)
                     && Objects.equals(managedMemory, that.managedMemory)
                     && Objects.equals(networkMemory, that.networkMemory)
-                    && Objects.equals(extendedResources, that.extendedResources);
+                    && Objects.equals(extendedResources, that.extendedResources)
+                    && (that.taskManagerAddress == null || taskManagerAddress == null || Objects.equals(taskManagerAddress, that.taskManagerAddress));
         }
         return false;
     }
@@ -377,11 +398,11 @@ public class ResourceProfile implements Serializable {
         checkNotNull(other, "Cannot merge with null resources");
 
         if (equals(ANY) || other.equals(ANY)) {
-            return ANY;
+            return ANY.clone();
         }
 
         if (this.equals(UNKNOWN) || other.equals(UNKNOWN)) {
-            return UNKNOWN;
+            return UNKNOWN.clone();
         }
 
         Map<String, ExternalResource> resultExtendedResource = new HashMap<>(extendedResources);
@@ -400,6 +421,7 @@ public class ResourceProfile implements Serializable {
                 taskOffHeapMemory.add(other.taskOffHeapMemory),
                 managedMemory.add(other.managedMemory),
                 networkMemory.add(other.networkMemory),
+                taskManagerAddress,
                 resultExtendedResource);
     }
 
@@ -413,11 +435,11 @@ public class ResourceProfile implements Serializable {
         checkNotNull(other, "Cannot subtract with null resources");
 
         if (equals(ANY) || other.equals(ANY)) {
-            return ANY;
+            return ANY.clone();
         }
 
         if (this.equals(UNKNOWN) || other.equals(UNKNOWN)) {
-            return UNKNOWN;
+            return UNKNOWN.clone();
         }
 
         checkArgument(
@@ -437,6 +459,7 @@ public class ResourceProfile implements Serializable {
                 taskOffHeapMemory.subtract(other.taskOffHeapMemory),
                 managedMemory.subtract(other.managedMemory),
                 networkMemory.subtract(other.networkMemory),
+                taskManagerAddress,
                 resultExtendedResource);
     }
 
@@ -444,15 +467,15 @@ public class ResourceProfile implements Serializable {
     public ResourceProfile multiply(final int multiplier) {
         checkArgument(multiplier >= 0, "multiplier must be >= 0");
         if (equals(ANY)) {
-            return ANY;
+            return ANY.clone();
         }
 
         if (this.equals(UNKNOWN)) {
-            return UNKNOWN;
+            return UNKNOWN.clone();
         }
 
         if (multiplier == 0) {
-            return ZERO;
+            return ZERO.clone();
         }
 
         Map<String, ExternalResource> resultExtendedResource =
@@ -470,17 +493,18 @@ public class ResourceProfile implements Serializable {
                 taskOffHeapMemory.multiply(multiplier),
                 managedMemory.multiply(multiplier),
                 networkMemory.multiply(multiplier),
+                taskManagerAddress,
                 resultExtendedResource);
     }
 
     @Override
     public String toString() {
         if (this.equals(UNKNOWN)) {
-            return "ResourceProfile{UNKNOWN}";
+            return "ResourceProfile{UNKNOWN" + ", taskManagerAddress=" + taskManagerAddress + "}";
         }
 
         if (this.equals(ANY)) {
-            return "ResourceProfile{ANY}";
+            return "ResourceProfile{ANY" + ", taskManagerAddress=" + taskManagerAddress + "}";
         }
 
         return "ResourceProfile{"
@@ -490,7 +514,7 @@ public class ResourceProfile implements Serializable {
                         : (", "
                                 + ExternalResourceUtils.generateExternalResourcesString(
                                         extendedResources.values())))
-                + '}';
+                + ", taskManagerAddress=" + taskManagerAddress + '}' ;
     }
 
     private String getResourceString() {
@@ -522,11 +546,11 @@ public class ResourceProfile implements Serializable {
         // try to preserve the singleton property for UNKNOWN and ANY
 
         if (this.equals(UNKNOWN)) {
-            return UNKNOWN;
+            return UNKNOWN.clone();
         }
 
         if (this.equals(ANY)) {
-            return ANY;
+            return ANY.clone();
         }
 
         return this;
@@ -538,13 +562,13 @@ public class ResourceProfile implements Serializable {
 
     @VisibleForTesting
     static ResourceProfile fromResourceSpec(ResourceSpec resourceSpec) {
-        return fromResourceSpec(resourceSpec, MemorySize.ZERO);
+        return fromResourceSpec(resourceSpec, MemorySize.ZERO, null);
     }
 
     public static ResourceProfile fromResourceSpec(
-            ResourceSpec resourceSpec, MemorySize networkMemory) {
+            ResourceSpec resourceSpec, MemorySize networkMemory, String taskManagerAddress) {
         if (ResourceSpec.UNKNOWN.equals(resourceSpec)) {
-            return UNKNOWN;
+            return UNKNOWN.clone();
         }
 
         return newBuilder()
@@ -554,12 +578,13 @@ public class ResourceProfile implements Serializable {
                 .setManagedMemory(resourceSpec.getManagedMemory())
                 .setNetworkMemory(networkMemory)
                 .setExtendedResources(resourceSpec.getExtendedResources().values())
+                .setTaskManagerAddress(taskManagerAddress)
                 .build();
     }
 
     @VisibleForTesting
-    public static ResourceProfile fromResources(final double cpuCores, final int taskHeapMemoryMB) {
-        return newBuilder().setCpuCores(cpuCores).setTaskHeapMemoryMB(taskHeapMemoryMB).build();
+    public static ResourceProfile fromResources(final double cpuCores, final int taskHeapMemoryMB, String taskManagerAddress) {
+        return newBuilder().setCpuCores(cpuCores).setTaskHeapMemoryMB(taskHeapMemoryMB).setTaskManagerAddress(taskManagerAddress).build();
     }
 
     public static Builder newBuilder() {
@@ -574,7 +599,17 @@ public class ResourceProfile implements Serializable {
                 .setTaskOffHeapMemory(resourceProfile.taskOffHeapMemory)
                 .setManagedMemory(resourceProfile.managedMemory)
                 .setNetworkMemory(resourceProfile.networkMemory)
+                .setTaskManagerAddress(resourceProfile.taskManagerAddress)
                 .setExtendedResources(resourceProfile.extendedResources.values());
+    }
+
+    @Override
+    public ResourceProfile clone() {
+        try {
+            return (ResourceProfile) super.clone();
+        } catch (CloneNotSupportedException e) {
+            throw new AssertionError();
+        }
     }
 
     /** Builder for the {@link ResourceProfile}. */
@@ -585,6 +620,7 @@ public class ResourceProfile implements Serializable {
         private MemorySize taskOffHeapMemory = MemorySize.ZERO;
         private MemorySize managedMemory = MemorySize.ZERO;
         private MemorySize networkMemory = MemorySize.ZERO;
+        private String taskManagerAddress = null;
         private Map<String, ExternalResource> extendedResources = new HashMap<>();
 
         private Builder() {}
@@ -639,6 +675,11 @@ public class ResourceProfile implements Serializable {
             return this;
         }
 
+        public Builder setTaskManagerAddress(String taskManagerAddress) {
+            this.taskManagerAddress = taskManagerAddress;
+            return this;
+        }
+
         /**
          * Add the given extended resource. The old value with the same resource name will be
          * replaced if present.
@@ -668,6 +709,7 @@ public class ResourceProfile implements Serializable {
                     taskOffHeapMemory,
                     managedMemory,
                     networkMemory,
+                    taskManagerAddress,
                     extendedResources);
         }
     }

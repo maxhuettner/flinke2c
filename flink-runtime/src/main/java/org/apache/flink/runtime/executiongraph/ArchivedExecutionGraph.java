@@ -439,7 +439,7 @@ public class ArchivedExecutionGraph implements AccessExecutionGraph, Serializabl
                             parallelismInfo.getMaxParallelism(),
                             jobVertex.getSlotSharingGroup(),
                             ResourceProfile.fromResourceSpec(
-                                    jobVertex.getMinResources(), MemorySize.ZERO),
+                                    jobVertex.getMinResources(), MemorySize.ZERO, null),
                             new StringifiedAccumulatorResult[0]);
             archivedVerticesInCreationOrder.add(archivedJobVertex);
             archivedJobVertices.put(archivedJobVertex.getJobVertexId(), archivedJobVertex);

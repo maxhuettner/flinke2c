@@ -94,7 +94,7 @@ public abstract class ResourceManagerFactory<T extends ResourceIDRetrievable> {
                         context.getRpcService(),
                         context.getHighAvailabilityServices(),
                         SlotManagerMetricGroup.create(
-                                context.getMetricRegistry(), context.getHostname()));
+                                context.getMetricRegistry(), context.getHostname()), context.getHostname());
 
         return createResourceManager(
                 context.getRmConfig(),
@@ -142,13 +142,15 @@ public abstract class ResourceManagerFactory<T extends ResourceIDRetrievable> {
             ResourceManagerRuntimeServicesConfiguration rmRuntimeServicesConfig,
             RpcService rpcService,
             HighAvailabilityServices highAvailabilityServices,
-            SlotManagerMetricGroup slotManagerMetricGroup) {
+            SlotManagerMetricGroup slotManagerMetricGroup,
+            String taskManagerAddress) {
 
         return ResourceManagerRuntimeServices.fromConfiguration(
                 rmRuntimeServicesConfig,
                 highAvailabilityServices,
                 rpcService.getScheduledExecutor(),
-                slotManagerMetricGroup);
+                slotManagerMetricGroup,
+                taskManagerAddress);
     }
 
     protected abstract ResourceManagerRuntimeServicesConfiguration

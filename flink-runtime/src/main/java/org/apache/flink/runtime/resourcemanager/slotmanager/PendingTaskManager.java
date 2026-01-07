@@ -41,7 +41,7 @@ public class PendingTaskManager {
         this.numSlots = numSlots;
         this.totalResourceProfile = Preconditions.checkNotNull(totalResourceProfile);
         this.defaultSlotResourceProfile =
-                SlotManagerUtils.generateDefaultSlotResourceProfile(totalResourceProfile, numSlots);
+                SlotManagerUtils.generateDefaultSlotResourceProfile(totalResourceProfile, numSlots, totalResourceProfile.getTaskManagerAddress());
         this.pendingTaskManagerId = PendingTaskManagerId.generate();
         this.unusedResource = totalResourceProfile;
         this.pendingSlotAllocationRecords = new HashMap<>();

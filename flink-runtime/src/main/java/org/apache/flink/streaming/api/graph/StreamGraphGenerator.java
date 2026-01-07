@@ -490,9 +490,10 @@ public class StreamGraphGenerator {
                                         (name, profile) -> {
                                             if (profile == null) {
                                                 return ResourceProfile.fromResourceSpec(
-                                                        resourceSpec, MemorySize.ZERO);
+                                                        resourceSpec, MemorySize.ZERO,
+                                                        null);
                                             } else if (!ResourceProfile.fromResourceSpec(
-                                                            resourceSpec, MemorySize.ZERO)
+                                                            resourceSpec, MemorySize.ZERO, profile.getTaskManagerAddress())
                                                     .equals(profile)) {
                                                 throw new IllegalArgumentException(
                                                         "The slot sharing group "

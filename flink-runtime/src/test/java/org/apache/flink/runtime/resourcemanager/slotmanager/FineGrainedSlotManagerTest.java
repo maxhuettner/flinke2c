@@ -697,8 +697,8 @@ class FineGrainedSlotManagerTest extends FineGrainedSlotManagerTestBase {
 
         final SlotID slotId1 = new SlotID(resourceId1, 0);
         final SlotID slotId2 = new SlotID(resourceId2, 0);
-        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10);
-        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20);
+        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10, "");
+        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20, "");
         final SlotStatus slotStatus1 =
                 new SlotStatus(slotId1, resourceProfile1, new JobID(), new AllocationID());
         final SlotStatus slotStatus2 =

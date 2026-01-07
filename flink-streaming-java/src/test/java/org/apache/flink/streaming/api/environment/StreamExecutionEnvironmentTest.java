@@ -286,18 +286,18 @@ class StreamExecutionEnvironmentTest {
         final SlotSharingGroup ssg2 =
                 SlotSharingGroup.newBuilder("ssg2").setCpuCores(2).setTaskHeapMemoryMB(200).build();
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.registerSlotSharingGroup(ssg1);
-        env.registerSlotSharingGroup(ssg2);
-        env.registerSlotSharingGroup(SlotSharingGroup.newBuilder("ssg3").build());
+        env.registerSlotSharingGroup(ssg1, "");
+        env.registerSlotSharingGroup(ssg2, "");
+        env.registerSlotSharingGroup(SlotSharingGroup.newBuilder("ssg3").build(), "");
 
         final DataStream<Integer> source = env.fromData(1).slotSharingGroup("ssg1");
         source.map(value -> value).slotSharingGroup(ssg2).sinkTo(new DiscardingSink<>());
 
         final StreamGraph streamGraph = env.getStreamGraph();
         assertThat(streamGraph.getSlotSharingGroupResource("ssg1").get())
-                .isEqualTo(ResourceProfile.fromResources(1, 100));
+                .isEqualTo(ResourceProfile.fromResources(1, 100, ""));
         assertThat(streamGraph.getSlotSharingGroupResource("ssg2").get())
-                .isEqualTo(ResourceProfile.fromResources(2, 200));
+                .isEqualTo(ResourceProfile.fromResources(2, 200, ""));
         assertThat(streamGraph.getSlotSharingGroupResource("ssg3")).isNotPresent();
     }
 
@@ -308,7 +308,7 @@ class StreamExecutionEnvironmentTest {
         final SlotSharingGroup ssgConflict =
                 SlotSharingGroup.newBuilder("ssg1").setCpuCores(2).setTaskHeapMemoryMB(200).build();
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.registerSlotSharingGroup(ssg);
+        env.registerSlotSharingGroup(ssg, "");
 
         final DataStream<Integer> source = env.fromData(1).slotSharingGroup("ssg1");
         source.map(value -> value).slotSharingGroup(ssgConflict).sinkTo(new DiscardingSink<>());

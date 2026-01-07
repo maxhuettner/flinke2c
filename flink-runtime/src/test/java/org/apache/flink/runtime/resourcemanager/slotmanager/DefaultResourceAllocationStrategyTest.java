@@ -42,7 +42,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** Tests for the {@link DefaultResourceAllocationStrategy}. */
 class DefaultResourceAllocationStrategyTest {
     private static final ResourceProfile DEFAULT_SLOT_RESOURCE =
-            ResourceProfile.fromResources(1, 100);
+            ResourceProfile.fromResources(1, 100, "");
     private static final int NUM_OF_SLOTS = 5;
     private static final DefaultResourceAllocationStrategy ANY_MATCHING_STRATEGY =
             createStrategy(TaskManagerLoadBalanceMode.NONE);

@@ -33,7 +33,11 @@ import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
 import org.apache.flink.runtime.util.DualKeyLinkedMap;
 import org.apache.flink.util.FlinkException;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -59,8 +63,10 @@ public class SimpleExecutionSlotAllocator implements ExecutionSlotAllocator {
     private final SyncPreferredLocationsRetriever preferredLocationsRetriever;
 
     private final DualKeyLinkedMap<
-                    ExecutionAttemptID, SlotRequestId, CompletableFuture<LogicalSlot>>
+            ExecutionAttemptID, SlotRequestId, CompletableFuture<LogicalSlot>>
             requestedPhysicalSlots;
+
+    private static final Logger LOG = LoggerFactory.getLogger(SimpleExecutionSlotAllocator.class);
 
     SimpleExecutionSlotAllocator(
             PhysicalSlotProvider slotProvider,
@@ -94,7 +100,7 @@ public class SimpleExecutionSlotAllocator implements ExecutionSlotAllocator {
             } else {
                 final SlotRequestId slotRequestId = new SlotRequestId();
                 final ResourceProfile resourceProfile =
-                        resourceProfileRetriever.apply(executionAttemptId);
+                        resourceProfileRetriever.apply(executionAttemptId); // TODO(MH): Check clone not necessary
                 Collection<TaskManagerLocation> preferredLocations =
                         preferredLocationsRetriever.getPreferredLocations(
                                 executionAttemptId.getExecutionVertexId(), Collections.emptySet());
@@ -105,6 +111,11 @@ public class SimpleExecutionSlotAllocator implements ExecutionSlotAllocator {
                                 preferredLocations,
                                 Collections.emptyList(),
                                 Collections.emptySet());
+                LOG.debug(
+                        "Requesting slot with slotRequestId {} for execution {} with resource profile {}.",
+                        slotRequestId,
+                        executionAttemptId,
+                        resourceProfile);
                 final PhysicalSlotRequest request =
                         new PhysicalSlotRequest(
                                 slotRequestId,

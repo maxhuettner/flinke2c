@@ -186,8 +186,14 @@ class ResourceProfileTest {
                         .setExtendedResource(new ExternalResource(EXTERNAL_RESOURCE_NAME, 2.2))
                         .build();
         MemorySize networkMemory = MemorySize.ofMebiBytes(100);
+<<<<<<< HEAD
         assertThat(ResourceProfile.fromResourceSpec(rs5, networkMemory))
                 .isEqualTo(ResourceProfile.fromResourceSpec(rs3, networkMemory));
+=======
+        assertEquals(
+                ResourceProfile.fromResourceSpec(rs3, networkMemory, null),
+                ResourceProfile.fromResourceSpec(rs5, networkMemory, null));
+>>>>>>> 289d9920af4 (initial)
 
         final ResourceProfile rp1 =
                 ResourceProfile.newBuilder()
@@ -269,7 +275,7 @@ class ResourceProfileTest {
                 ResourceSpec.newBuilder(1.0, 100)
                         .setExtendedResource(new ExternalResource(EXTERNAL_RESOURCE_NAME, 1.6))
                         .build();
-        ResourceProfile rp = ResourceProfile.fromResourceSpec(rs, MemorySize.ofMebiBytes(50));
+        ResourceProfile rp = ResourceProfile.fromResourceSpec(rs, MemorySize.ofMebiBytes(50), null);
 
         assertThat(rp.getCpuCores()).isEqualTo(new CPUResource(1.0));
         assertThat(rp.getTotalMemory().getMebiBytes()).isEqualTo(150);

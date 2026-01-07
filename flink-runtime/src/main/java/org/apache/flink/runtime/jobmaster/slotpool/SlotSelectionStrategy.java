@@ -24,6 +24,8 @@ import org.apache.flink.runtime.jobmaster.SlotInfo;
 
 import javax.annotation.Nonnull;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 /** Interface for slot selection strategies. */

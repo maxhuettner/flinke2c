@@ -140,6 +140,9 @@ class SharedSlot implements SlotOwner, PhysicalSlot.Payload {
                 executionVertexId);
         CompletableFuture<SingleLogicalSlot> logicalSlotFuture =
                 requestedLogicalSlots.getValueByKeyA(executionVertexId);
+
+        LOG.info("allocateLogicalSlot: logicalSlotFuture: {}", logicalSlotFuture);
+
         if (logicalSlotFuture != null) {
             LOG.debug("Request for {} already exists", getLogicalSlotString(executionVertexId));
         } else {

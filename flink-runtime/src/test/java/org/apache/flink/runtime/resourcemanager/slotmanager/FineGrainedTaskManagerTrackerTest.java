@@ -134,7 +134,7 @@ class FineGrainedTaskManagerTrackerTest {
     void testSlotAllocation() {
         final FineGrainedTaskManagerTracker taskManagerTracker =
                 new FineGrainedTaskManagerTracker();
-        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000);
+        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000, "");
         final AllocationID allocationId1 = new AllocationID();
         final AllocationID allocationId2 = new AllocationID();
         final JobID jobId = new JobID();
@@ -144,7 +144,7 @@ class FineGrainedTaskManagerTrackerTest {
                 allocationId1,
                 jobId,
                 TASK_EXECUTOR_CONNECTION.getInstanceID(),
-                ResourceProfile.fromResources(3, 200),
+                ResourceProfile.fromResources(3, 200, ""),
                 SlotState.PENDING);
         assertThat(taskManagerTracker.getAllocatedOrPendingSlot(allocationId1)).isPresent();
         assertThat(
@@ -153,14 +153,14 @@ class FineGrainedTaskManagerTrackerTest {
                 .hasValueSatisfying(
                         taskManagerInfo ->
                                 assertThat(taskManagerInfo.getAvailableResource())
-                                        .isEqualTo(ResourceProfile.fromResources(7, 800)));
+                                        .isEqualTo(ResourceProfile.fromResources(7, 800, "")));
 
         // Notify pending slot is now allocated
         taskManagerTracker.notifySlotStatus(
                 allocationId1,
                 jobId,
                 TASK_EXECUTOR_CONNECTION.getInstanceID(),
-                ResourceProfile.fromResources(3, 200),
+                ResourceProfile.fromResources(3, 200, ""),
                 SlotState.ALLOCATED);
         assertThat(taskManagerTracker.getAllocatedOrPendingSlot(allocationId1)).isPresent();
         assertThat(
@@ -169,14 +169,14 @@ class FineGrainedTaskManagerTrackerTest {
                 .hasValueSatisfying(
                         taskManagerInfo ->
                                 assertThat(taskManagerInfo.getAvailableResource())
-                                        .isEqualTo(ResourceProfile.fromResources(7, 800)));
+                                        .isEqualTo(ResourceProfile.fromResources(7, 800, "")));
 
         // Notify free slot is now allocated
         taskManagerTracker.notifySlotStatus(
                 allocationId2,
                 jobId,
                 TASK_EXECUTOR_CONNECTION.getInstanceID(),
-                ResourceProfile.fromResources(2, 300),
+                ResourceProfile.fromResources(2, 300, ""),
                 SlotState.ALLOCATED);
         assertThat(taskManagerTracker.getAllocatedOrPendingSlot(allocationId2)).isPresent();
         assertThat(
@@ -185,14 +185,14 @@ class FineGrainedTaskManagerTrackerTest {
                 .hasValueSatisfying(
                         taskManagerInfo ->
                                 assertThat(taskManagerInfo.getAvailableResource())
-                                        .isEqualTo(ResourceProfile.fromResources(5, 500)));
+                                        .isEqualTo(ResourceProfile.fromResources(5, 500, "")));
     }
 
     @Test
     void testFreeSlot() {
         final FineGrainedTaskManagerTracker taskManagerTracker =
                 new FineGrainedTaskManagerTracker();
-        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000);
+        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000, "");
         final AllocationID allocationId1 = new AllocationID();
         final AllocationID allocationId2 = new AllocationID();
         final JobID jobId = new JobID();
@@ -201,13 +201,13 @@ class FineGrainedTaskManagerTrackerTest {
                 allocationId1,
                 jobId,
                 TASK_EXECUTOR_CONNECTION.getInstanceID(),
-                ResourceProfile.fromResources(3, 200),
+                ResourceProfile.fromResources(3, 200, ""),
                 SlotState.PENDING);
         taskManagerTracker.notifySlotStatus(
                 allocationId2,
                 jobId,
                 TASK_EXECUTOR_CONNECTION.getInstanceID(),
-                ResourceProfile.fromResources(2, 300),
+                ResourceProfile.fromResources(2, 300, ""),
                 SlotState.ALLOCATED);
 
         // Free pending slot
@@ -215,7 +215,7 @@ class FineGrainedTaskManagerTrackerTest {
                 allocationId1,
                 jobId,
                 TASK_EXECUTOR_CONNECTION.getInstanceID(),
-                ResourceProfile.fromResources(3, 200),
+                ResourceProfile.fromResources(3, 200, ""),
                 SlotState.FREE);
         assertThat(taskManagerTracker.getAllocatedOrPendingSlot(allocationId1)).isNotPresent();
         assertThat(
@@ -224,13 +224,13 @@ class FineGrainedTaskManagerTrackerTest {
                 .hasValueSatisfying(
                         taskManagerInfo ->
                                 assertThat(taskManagerInfo.getAvailableResource())
-                                        .isEqualTo(ResourceProfile.fromResources(8, 700)));
+                                        .isEqualTo(ResourceProfile.fromResources(8, 700, "")));
         // Free allocated slot
         taskManagerTracker.notifySlotStatus(
                 allocationId2,
                 jobId,
                 TASK_EXECUTOR_CONNECTION.getInstanceID(),
-                ResourceProfile.fromResources(2, 300),
+                ResourceProfile.fromResources(2, 300, ""),
                 SlotState.FREE);
         assertThat(taskManagerTracker.getAllocatedOrPendingSlot(allocationId2)).isNotPresent();
         assertThat(
@@ -291,8 +291,8 @@ class FineGrainedTaskManagerTrackerTest {
     void testPendingTaskManagerUnusedResources() {
         final FineGrainedTaskManagerTracker taskManagerTracker =
                 new FineGrainedTaskManagerTracker();
-        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000);
-        final ResourceProfile defaultSlotResource = ResourceProfile.fromResources(1, 100);
+        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000, "");
+        final ResourceProfile defaultSlotResource = ResourceProfile.fromResources(1, 100, "");
         final PendingTaskManager pendingTaskManager = new PendingTaskManager(totalResource, 10);
         final JobID jobId = new JobID();
         final ResourceCounter resourceCounter =
@@ -314,8 +314,8 @@ class FineGrainedTaskManagerTrackerTest {
     void testGetStatistics() {
         final FineGrainedTaskManagerTracker taskManagerTracker =
                 new FineGrainedTaskManagerTracker();
-        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000);
-        final ResourceProfile defaultSlotResource = ResourceProfile.fromResources(1, 100);
+        final ResourceProfile totalResource = ResourceProfile.fromResources(10, 1000, "");
+        final ResourceProfile defaultSlotResource = ResourceProfile.fromResources(1, 100, "");
         final AllocationID allocationId1 = new AllocationID();
         final AllocationID allocationId2 = new AllocationID();
         final JobID jobId = new JobID();
@@ -325,7 +325,7 @@ class FineGrainedTaskManagerTrackerTest {
                 allocationId1,
                 jobId,
                 TASK_EXECUTOR_CONNECTION.getInstanceID(),
-                ResourceProfile.fromResources(3, 200),
+                ResourceProfile.fromResources(3, 200, ""),
                 SlotState.ALLOCATED);
         taskManagerTracker.notifySlotStatus(
                 allocationId2,
@@ -334,14 +334,14 @@ class FineGrainedTaskManagerTrackerTest {
                 defaultSlotResource,
                 SlotState.ALLOCATED);
         taskManagerTracker.addPendingTaskManager(
-                new PendingTaskManager(ResourceProfile.fromResources(4, 200), 1));
+                new PendingTaskManager(ResourceProfile.fromResources(4, 200, ""), 1));
 
         assertThat(taskManagerTracker.getFreeResource())
-                .isEqualTo(ResourceProfile.fromResources(6, 700));
+                .isEqualTo(ResourceProfile.fromResources(6, 700, ""));
         assertThat(taskManagerTracker.getRegisteredResource()).isEqualTo(totalResource);
         assertThat(taskManagerTracker.getNumberRegisteredSlots()).isEqualTo(10);
         assertThat(taskManagerTracker.getNumberFreeSlots()).isEqualTo(8);
         assertThat(taskManagerTracker.getPendingResource())
-                .isEqualTo(ResourceProfile.fromResources(4, 200));
+                .isEqualTo(ResourceProfile.fromResources(4, 200, ""));
     }
 }

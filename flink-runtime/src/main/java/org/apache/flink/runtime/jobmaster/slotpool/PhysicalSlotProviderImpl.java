@@ -68,6 +68,8 @@ public class PhysicalSlotProviderImpl implements PhysicalSlotProvider {
         Map<SlotRequestId, Optional<PhysicalSlot>> availablePhysicalSlots =
                 tryAllocateFromAvailable(physicalSlotRequestsById.values());
 
+        LOG.debug("Available physical slots: {}", availablePhysicalSlots);
+
         return availablePhysicalSlots.entrySet().stream()
                 .collect(
                         Collectors.toMap(

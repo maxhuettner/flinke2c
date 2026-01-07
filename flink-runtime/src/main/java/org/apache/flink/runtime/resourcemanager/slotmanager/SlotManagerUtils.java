@@ -29,7 +29,7 @@ public class SlotManagerUtils {
      * org.apache.flink.runtime.taskexecutor.TaskExecutorResourceUtils#generateDefaultSlotResourceProfile}.
      */
     public static ResourceProfile generateDefaultSlotResourceProfile(
-            WorkerResourceSpec workerResourceSpec, int numSlotsPerWorker) {
+            WorkerResourceSpec workerResourceSpec, int numSlotsPerWorker, String taskManagerAddress) {
         final ResourceProfile.Builder resourceProfileBuilder =
                 ResourceProfile.newBuilder()
                         .setCpuCores(workerResourceSpec.getCpuCores().divide(numSlotsPerWorker))
@@ -40,7 +40,8 @@ public class SlotManagerUtils {
                         .setManagedMemory(
                                 workerResourceSpec.getManagedMemSize().divide(numSlotsPerWorker))
                         .setNetworkMemory(
-                                workerResourceSpec.getNetworkMemSize().divide(numSlotsPerWorker));
+                                workerResourceSpec.getNetworkMemSize().divide(numSlotsPerWorker))
+                        .setTaskManagerAddress(taskManagerAddress);
         workerResourceSpec
                 .getExtendedResources()
                 .forEach(
@@ -55,7 +56,7 @@ public class SlotManagerUtils {
      * org.apache.flink.runtime.taskexecutor.TaskExecutorResourceUtils#generateDefaultSlotResourceProfile}.
      */
     public static ResourceProfile generateDefaultSlotResourceProfile(
-            ResourceProfile resourceProfile, int numSlotsPerWorker) {
+            ResourceProfile resourceProfile, int numSlotsPerWorker, String taskManagerAddress) {
         final ResourceProfile.Builder resourceProfileBuilder =
                 ResourceProfile.newBuilder()
                         .setCpuCores(resourceProfile.getCpuCores().divide(numSlotsPerWorker))
@@ -66,7 +67,8 @@ public class SlotManagerUtils {
                         .setManagedMemory(
                                 resourceProfile.getManagedMemory().divide(numSlotsPerWorker))
                         .setNetworkMemory(
-                                resourceProfile.getNetworkMemory().divide(numSlotsPerWorker));
+                                resourceProfile.getNetworkMemory().divide(numSlotsPerWorker))
+                        .setTaskManagerAddress(taskManagerAddress);
         resourceProfile
                 .getExtendedResources()
                 .forEach(
@@ -100,7 +102,7 @@ public class SlotManagerUtils {
     }
 
     public static ResourceProfile generateTaskManagerTotalResourceProfile(
-            WorkerResourceSpec workerResourceSpec) {
+            WorkerResourceSpec workerResourceSpec, String taskManagerAddress) {
         return ResourceProfile.newBuilder()
                 .setCpuCores(workerResourceSpec.getCpuCores())
                 .setTaskHeapMemory(workerResourceSpec.getTaskHeapSize())
@@ -108,6 +110,7 @@ public class SlotManagerUtils {
                 .setManagedMemory(workerResourceSpec.getManagedMemSize())
                 .setNetworkMemory(workerResourceSpec.getNetworkMemSize())
                 .setExtendedResources(workerResourceSpec.getExtendedResources().values())
+                .setTaskManagerAddress(taskManagerAddress)
                 .build();
     }
 }

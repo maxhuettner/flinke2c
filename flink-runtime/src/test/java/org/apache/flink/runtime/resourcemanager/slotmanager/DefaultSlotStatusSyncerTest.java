@@ -193,8 +193,8 @@ class DefaultSlotStatusSyncerTest {
         final SlotID slotId1 = new SlotID(taskExecutorConnection.getResourceID(), 0);
         final SlotID slotId2 = new SlotID(taskExecutorConnection.getResourceID(), 1);
         final SlotID slotId3 = new SlotID(taskExecutorConnection.getResourceID(), 2);
-        final ResourceProfile totalResource = ResourceProfile.fromResources(5, 20);
-        final ResourceProfile resource = ResourceProfile.fromResources(1, 4);
+        final ResourceProfile totalResource = ResourceProfile.fromResources(5, 20, "");
+        final ResourceProfile resource = ResourceProfile.fromResources(1, 4, "");
         final SlotReport slotReport1 =
                 new SlotReport(
                         Arrays.asList(
@@ -217,7 +217,7 @@ class DefaultSlotStatusSyncerTest {
                 .hasValueSatisfying(
                         taskManagerInfo ->
                                 assertThat(taskManagerInfo.getAvailableResource())
-                                        .isEqualTo(ResourceProfile.fromResources(3, 12)));
+                                        .isEqualTo(ResourceProfile.fromResources(3, 12, "")));
         assertThat(taskManagerTracker.getAllocatedOrPendingSlot(allocationId1)).isPresent();
         assertThat(taskManagerTracker.getAllocatedOrPendingSlot(allocationId2)).isPresent();
 
@@ -231,7 +231,7 @@ class DefaultSlotStatusSyncerTest {
                 .hasValueSatisfying(
                         taskManagerInfo ->
                                 assertThat(taskManagerInfo.getAvailableResource())
-                                        .isEqualTo(ResourceProfile.fromResources(2, 8)));
+                                        .isEqualTo(ResourceProfile.fromResources(2, 8, "")));
         final AllocationID allocationId3 =
                 taskManagerTracker
                         .getRegisteredTaskManager(taskExecutorConnection.getInstanceID())
@@ -257,7 +257,7 @@ class DefaultSlotStatusSyncerTest {
                 .hasValueSatisfying(
                         taskManagerInfo ->
                                 assertThat(taskManagerInfo.getAvailableResource())
-                                        .isEqualTo(ResourceProfile.fromResources(3, 12)));
+                                        .isEqualTo(ResourceProfile.fromResources(3, 12, "")));
         assertThat(taskManagerTracker.getAllocatedOrPendingSlot(allocationId2)).isNotPresent();
         assertThat(taskManagerTracker.getAllocatedOrPendingSlot(allocationId1))
                 .hasValueSatisfying(

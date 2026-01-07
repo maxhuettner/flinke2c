@@ -62,7 +62,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Test suite for {@link SlotSharingExecutionSlotAllocator}. */
 class SlotSharingExecutionSlotAllocatorTest {
     private static final Duration ALLOCATION_TIMEOUT = Duration.ofMillis(100L);
-    private static final ResourceProfile RESOURCE_PROFILE = ResourceProfile.fromResources(3, 5);
+    private static final ResourceProfile RESOURCE_PROFILE = ResourceProfile.fromResources(3, 5, "");
 
     private static final ExecutionVertexID EV1 = createRandomExecutionVertexId();
     private static final ExecutionVertexID EV2 = createRandomExecutionVertexId();
@@ -444,8 +444,8 @@ class SlotSharingExecutionSlotAllocatorTest {
 
     @Test
     void testSlotRequestProfileFromExecutionSlotSharingGroup() {
-        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10);
-        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20);
+        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10, "");
+        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20, "");
         final AllocationContext context =
                 AllocationContext.newBuilder()
                         .addGroupAndResource(resourceProfile1, EV1, EV3)
