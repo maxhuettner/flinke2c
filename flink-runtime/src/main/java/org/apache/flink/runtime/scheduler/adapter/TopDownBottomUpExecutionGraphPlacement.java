@@ -1,15 +1,9 @@
 package org.apache.flink.runtime.scheduler.adapter;
 
-import org.apache.flink.runtime.jobgraph.JobEdge;
-
-import org.jgrapht.Graph;
-import org.jgrapht.graph.DefaultDirectedGraph;
-import org.jgrapht.graph.DefaultEdge;
-
 import org.apache.flink.configuration.ClusterOptions;
-import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.executiongraph.ExecutionGraph;
 import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
+import org.apache.flink.runtime.jobgraph.JobEdge;
 import org.apache.flink.runtime.jobgraph.JobVertex;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.scheduler.strategy.ExecutionGraphPlacement;
@@ -17,6 +11,8 @@ import org.apache.flink.runtime.scheduler.strategy.ExecutionGraphPlacement;
 import org.jgrapht.Graph;
 import org.jgrapht.graph.DefaultDirectedGraph;
 import org.jgrapht.graph.DefaultEdge;
+import org.jgrapht.nio.Attribute;
+import org.jgrapht.nio.graphml.GraphMLImporter;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,14 +21,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
+import java.util.Locale;
 import java.util.stream.Collectors;
-
-//import org.jgrapht.nio.Attribute;
-//import org.jgrapht.nio.DefaultAttribute;
-//import org.jgrapht.nio.graphml.GraphMLImporter;
-
-import static org.apache.flink.configuration.ClusterOptions.PLACEMENT_METHOD;
 
 /**
  * An ExecutionGraphPlacement implementation that assigns pipeline operators
@@ -51,59 +47,163 @@ public class TopDownBottomUpExecutionGraphPlacement implements ExecutionGraphPla
     }
 
     private Graph<TopologyNode, DefaultEdge> loadTopologyFromGraphML(String path) {
-//        Graph<TopologyNode, DefaultEdge> graph = new DefaultDirectedGraph<>(DefaultEdge.class);
-//        // Importer to create our topology nodes
-//        GraphMLImporter<TopologyNode, DefaultEdge> importer = new GraphMLImporter<>(
-//                (id, attrs) -> {
-//                    String type = attrs.getOrDefault("type", DefaultAttribute.createAttribute("compute")).getValue();
-//                    switch (type.toLowerCase()) {
-//                        case "source": return new SourceNode(id);
-//                        case "sink":   return new SinkNode(id);
-//                        default:
-//                            int slots = Integer.parseInt(attrs.getOrDefault("slots", DefaultAttribute.createAttribute("1")).getValue());
-//                            double comp = Double.parseDouble(attrs.getOrDefault("computeCapability", DefaultAttribute.createAttribute("1.0")).getValue());
-//                            double mem  = Double.parseDouble(attrs.getOrDefault("memoryCapability", DefaultAttribute.createAttribute("1.0")).getValue());
-//                            return new ComputeNode(id, comp, mem, slots);
-//                    }
-//                },
-//                (from, to, label, attrs) -> graph.getEdgeFactory().createEdge(from, to)
-//        );
-//        try (InputStream in = getClass().getResourceAsStream(path)) {
-//            if (in == null) {
-//                throw new IllegalArgumentException("Cannot find topology at " + path);
-//            }
-//            importer.importGraph(graph, new InputStreamReader(in));
-//        } catch (IOException e) {
-//            throw new UncheckedIOException("Failed to load GraphML", e);
-//        }
-//        return graph;
-        // Hardcoded directed topology; replace with GraphML import if desired
+        if (path == null || path.trim().isEmpty()) {
+            throw new IllegalArgumentException("GraphML path must be provided");
+        }
+
+        Graph<String, DefaultEdge> rawGraph = new DefaultDirectedGraph<>(DefaultEdge.class);
+        Map<String, Map<String, Attribute>> vertexAttributes = new HashMap<>();
+        GraphMLImporter<String, DefaultEdge> importer = new GraphMLImporter<>();
+        importer.setVertexFactory(id -> id);
+        importer.addVertexWithAttributesConsumer((vertex, attributes) -> {
+            Map<String, Attribute> attributeCopy = new HashMap<>();
+            if (attributes != null) {
+                attributeCopy.putAll(attributes);
+            }
+            vertexAttributes.put(vertex, attributeCopy);
+        });
+        importer.addVertexAttributeConsumer((pair, attribute) -> {
+            String vertexId = pair.getFirst();
+            String attrKey = pair.getSecond();
+            vertexAttributes
+                    .computeIfAbsent(vertexId, ignored -> new HashMap<>())
+                    .put(attrKey, attribute);
+        });
+
+        try (InputStream stream = openGraphMlStream(path);
+                InputStreamReader reader = new InputStreamReader(stream, StandardCharsets.UTF_8)) {
+            importer.importGraph(rawGraph, reader);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to load topology GraphML from " + path, e);
+        }
+
         Graph<TopologyNode, DefaultEdge> graph = new DefaultDirectedGraph<>(DefaultEdge.class);
-        SourceNode src = new SourceNode("Source1");
-        ComputeNode n2 = new ComputeNode("10.10.10.2", 1.0, 1.0, 2);
-        ComputeNode n3 = new ComputeNode("10.10.10.3", 1.0, 1.0, 2);
-        ComputeNode n5 = new ComputeNode("10.10.10.5", 1.0, 1.0, 2);
-        ComputeNode n7 = new ComputeNode("10.10.10.7", 1.0, 1.0, 2);
-        ComputeNode n8 = new ComputeNode("10.10.10.8", 1.0, 1.0, 2);
-        SinkNode sink = new SinkNode("Sink1");
+        Map<String, TopologyNode> nodeMapping = new HashMap<>();
 
-        graph.addVertex(src);
-        graph.addVertex(n2);
-        graph.addVertex(n3);
-        graph.addVertex(n5);
-        graph.addVertex(n7);
-        graph.addVertex(n8);
-        graph.addVertex(sink);
+        for (String vertexId : rawGraph.vertexSet()) {
+            Map<String, Attribute> attributes = vertexAttributes.getOrDefault(vertexId, Collections.emptyMap());
+            TopologyNode node = createTopologyNode(vertexId, attributes);
+            graph.addVertex(node);
+            nodeMapping.put(vertexId, node);
+        }
 
-        graph.addEdge(src, n8);
-        graph.addEdge(n8, n7);
-        graph.addEdge(n7, n3);
-        graph.addEdge(n7, n5);
-        graph.addEdge(n3, n2);
-        graph.addEdge(n5, n2);
-        graph.addEdge(n2, sink);
+        for (DefaultEdge edge : rawGraph.edgeSet()) {
+            TopologyNode source = nodeMapping.get(rawGraph.getEdgeSource(edge));
+            TopologyNode target = nodeMapping.get(rawGraph.getEdgeTarget(edge));
+            graph.addEdge(source, target);
+        }
 
         return graph;
+    }
+
+    private TopologyNode createTopologyNode(String vertexId, Map<String, Attribute> attributes) {
+        String type = readAttribute(attributes, "type");
+        if (type == null) {
+            throw new IllegalArgumentException("Missing 'type' attribute for vertex " + vertexId);
+        }
+
+        String nodeId = Optional.ofNullable(readAttribute(attributes, "id")).filter(s -> !s.isEmpty()).orElse(vertexId);
+        String normalizedType = type.trim().toLowerCase(Locale.ROOT);
+
+        switch (normalizedType) {
+            case "source":
+                return new SourceNode(nodeId);
+            case "sink":
+                return new SinkNode(nodeId);
+            case "compute":
+            case "compute_node":
+            case "node":
+                double computeCapability = parseDouble(firstNonEmpty(
+                        readAttribute(attributes, "computeCapability"),
+                        readAttribute(attributes, "compute_capability")), 1.0);
+                double memoryCapability = parseDouble(firstNonEmpty(
+                        readAttribute(attributes, "memoryCapability"),
+                        readAttribute(attributes, "memory_capability")), 1.0);
+                int slots = parseInt(firstNonEmpty(
+                        readAttribute(attributes, "slots"),
+                        readAttribute(attributes, "numSlots"),
+                        readAttribute(attributes, "num_slots")), 1);
+                return new ComputeNode(nodeId, computeCapability, memoryCapability, slots);
+            default:
+                throw new IllegalArgumentException(
+                        "Unsupported topology node type '" + type + "' for vertex " + vertexId);
+        }
+    }
+
+    private String readAttribute(Map<String, Attribute> attributes, String key) {
+        if (attributes == null || attributes.isEmpty()) {
+            return null;
+        }
+        Attribute attribute = attributes.get(key);
+        if (attribute == null) {
+            attribute = attributes.get(key.toLowerCase(Locale.ROOT));
+        }
+        if (attribute == null) {
+            for (Map.Entry<String, Attribute> entry : attributes.entrySet()) {
+                if (key.equalsIgnoreCase(entry.getKey())) {
+                    attribute = entry.getValue();
+                    break;
+                }
+            }
+        }
+        if (attribute == null) {
+            return null;
+        }
+        return attribute.getValue();
+    }
+
+    private String firstNonEmpty(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String value : values) {
+            if (value != null && !value.trim().isEmpty()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private double parseDouble(String value, double defaultValue) {
+        if (value == null) {
+            return defaultValue;
+        }
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid double value '" + value + "' in GraphML", e);
+        }
+    }
+
+    private int parseInt(String value, int defaultValue) {
+        if (value == null) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid integer value '" + value + "' in GraphML", e);
+        }
+    }
+
+    private InputStream openGraphMlStream(String graphMlPath) throws IOException {
+        try {
+            Path filePath = Paths.get(graphMlPath);
+            if (Files.exists(filePath)) {
+                return Files.newInputStream(filePath);
+            }
+        } catch (InvalidPathException e) {
+            LOG.debug("Provided GraphML path '{}' is not a file path", graphMlPath, e);
+        }
+
+        InputStream resource = TopDownBottomUpExecutionGraphPlacement.class
+                .getClassLoader()
+                .getResourceAsStream(graphMlPath);
+        if (resource != null) {
+            return resource;
+        }
+
+        throw new IOException("Topology GraphML not found at " + graphMlPath);
     }
 
     @Override
@@ -160,13 +260,13 @@ public class TopDownBottomUpExecutionGraphPlacement implements ExecutionGraphPla
         TopologyNode topoSource = processingTopology
                 .vertexSet()
                 .stream()
-                .filter(n -> n instanceof SourceNode)
+                .filter(SourceNode.class::isInstance)
                 .findFirst()
                 .orElseThrow(() -> new NoSuchElementException("No source indicator in topology"));
         TopologyNode topoSink = processingTopology
                 .vertexSet()
                 .stream()
-                .filter(n -> n instanceof SinkNode)
+                .filter(SinkNode.class::isInstance)
                 .findFirst()
                 .orElseThrow(() -> new NoSuchElementException("No sink indicator in topology"));
 
@@ -207,7 +307,7 @@ public class TopDownBottomUpExecutionGraphPlacement implements ExecutionGraphPla
         }
 
         Map<ComputeNode, Integer> slots = processingTopology.vertexSet().stream()
-                .filter(n -> n instanceof ComputeNode)
+                .filter(ComputeNode.class::isInstance)
                 .map(n -> (ComputeNode) n)
                 .collect(Collectors.toMap(n -> n, n -> n.numSlots));
 
@@ -225,6 +325,8 @@ public class TopDownBottomUpExecutionGraphPlacement implements ExecutionGraphPla
             executionGraph.getJobVertex(vertexId)
                     .getResourceProfile()
                     .setTaskManagerAddress(target.getId());
+                    executionGraph.getJobVertex(vertexId).getTaskVertices().map(ExecutionVertex::getID).forEach(id ->
+                        id.selectSlotSelectionStrategy
             LOG.debug("Assigned operator {} to compute node {}", vertexId, target.getId());
         }
     }

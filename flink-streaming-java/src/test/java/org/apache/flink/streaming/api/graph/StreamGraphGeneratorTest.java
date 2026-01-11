@@ -761,7 +761,7 @@ class StreamGraphGeneratorTest {
 
         final StreamGraph streamGraph = env.getStreamGraph();
         assertThat(streamGraph.getSlotSharingGroupResource("ssg1"))
-                .hasValue(ResourceProfile.fromResources(1, 100));
+                .hasValue(ResourceProfile.fromResources(1, 100, ""));
         assertThat(streamGraph.getSlotSharingGroupResource("ssg2"))
                 .hasValue(ResourceProfile.fromResources(2, 200, ""));
         assertThat(

@@ -41,12 +41,9 @@ import org.apache.flink.runtime.metrics.groups.JobManagerJobMetricGroup;
 import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 import org.apache.flink.runtime.scheduler.SchedulerBase;
 import org.apache.flink.runtime.scheduler.VertexParallelismStore;
-<<<<<<< HEAD
 import org.apache.flink.runtime.scheduler.adaptivebatch.ExecutionPlanSchedulingContext;
 import org.apache.flink.runtime.scheduler.adaptivebatch.NonAdaptiveExecutionPlanSchedulingContext;
-=======
 import org.apache.flink.runtime.scheduler.adapter.TopologyExecutionGraphPlacement;
->>>>>>> 289d9920af4 (initial)
 import org.apache.flink.runtime.shuffle.ShuffleMaster;
 import org.apache.flink.runtime.shuffle.ShuffleTestUtils;
 
@@ -226,13 +223,9 @@ public class TestingDefaultExecutionGraphBuilder {
                 executionJobVertexFactory,
                 markPartitionFinishedStrategy,
                 nonFinishedHybridPartitionShouldBeUnknown,
-<<<<<<< HEAD
                 metricGroup,
-                executionPlanSchedulingContext);
-=======
-                UnregisteredMetricGroups.createUnregisteredJobManagerJobMetricGroup(),
+                executionPlanSchedulingContext,
                 new TopologyExecutionGraphPlacement());
->>>>>>> 289d9920af4 (initial)
     }
 
     public DefaultExecutionGraph build(ScheduledExecutorService executorService)

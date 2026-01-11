@@ -72,11 +72,11 @@ abstract class AbstractSlotSharingStrategyTest {
         final TestingSchedulingExecutionVertex ev11 = topology.newExecutionVertex(jobVertexId1, 1);
         final TestingSchedulingExecutionVertex ev20 = topology.newExecutionVertex(jobVertexId2, 0);
 
-        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10);
+        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10, "");
         slotSharingGroup1.addVertexToGroup(jobVertexId1);
         slotSharingGroup1.setResourceProfile(resourceProfile1);
 
-        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20);
+        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20, "");
         slotSharingGroup2.addVertexToGroup(jobVertexId2);
         slotSharingGroup2.setResourceProfile(resourceProfile2);
 
