@@ -105,7 +105,6 @@ class DeclarativeSlotPoolBridgeRequestCompletionTest {
                                             slotPool.requestNewAllocatedSlot(
                                                     PhysicalSlotRequestUtils.normalRequest(
                                                             slotRequestId, ResourceProfile.UNKNOWN),
-                                                    Collections.emptyList(),
                                                     TIMEOUT))
                             .collect(Collectors.toList());
 

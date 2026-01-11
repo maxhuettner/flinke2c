@@ -36,7 +36,7 @@ public class SlotSharingExecutionSlotAllocatorFactory implements ExecutionSlotAl
 
     private final SlotSharingStrategy.Factory slotSharingStrategyFactory;
 
-    SlotSharingExecutionSlotAllocatorFactory(
+    public SlotSharingExecutionSlotAllocatorFactory(
             PhysicalSlotProvider slotProvider,
             boolean slotWillBeOccupiedIndefinitely,
             PhysicalSlotRequestBulkChecker bulkChecker,

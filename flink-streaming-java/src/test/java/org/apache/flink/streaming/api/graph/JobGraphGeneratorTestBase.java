@@ -1503,9 +1503,9 @@ abstract class JobGraphGeneratorTestBase {
     void testSlotSharingResourceConfiguration() {
         final String slotSharingGroup1 = "slot-a";
         final String slotSharingGroup2 = "slot-b";
-        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10);
-        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20);
-        final ResourceProfile resourceProfile3 = ResourceProfile.fromResources(3, 30);
+        final ResourceProfile resourceProfile1 = ResourceProfile.fromResources(1, 10, "");
+        final ResourceProfile resourceProfile2 = ResourceProfile.fromResources(2, 20, "");
+        final ResourceProfile resourceProfile3 = ResourceProfile.fromResources(3, 30, "");
         final Map<String, ResourceProfile> slotSharingGroupResource = new HashMap<>();
         slotSharingGroupResource.put(slotSharingGroup1, resourceProfile1);
         slotSharingGroupResource.put(slotSharingGroup2, resourceProfile2);
@@ -1550,7 +1550,7 @@ abstract class JobGraphGeneratorTestBase {
 
     @Test
     void testSlotSharingResourceConfigurationWithDefaultSlotSharingGroup() {
-        final ResourceProfile resourceProfile = ResourceProfile.fromResources(1, 10);
+        final ResourceProfile resourceProfile = ResourceProfile.fromResources(1, 10, "");
         final Map<String, ResourceProfile> slotSharingGroupResource = new HashMap<>();
         slotSharingGroupResource.put(
                 StreamGraphGenerator.DEFAULT_SLOT_SHARING_GROUP, resourceProfile);

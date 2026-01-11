@@ -19,26 +19,27 @@
 
 package org.apache.flink.runtime.util;
 
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.ClusterOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.jobgraph.JobType;
 import org.apache.flink.runtime.jobmaster.slotpool.PhysicalSlotProvider;
 import org.apache.flink.runtime.jobmaster.slotpool.PhysicalSlotRequestBulkChecker;
-
 import org.apache.flink.runtime.scheduler.ExecutionSlotAllocatorFactory;
-
+import org.apache.flink.runtime.scheduler.LocalInputPreferredSlotSharingStrategy;
 import org.apache.flink.runtime.scheduler.SimpleExecutionSlotAllocator;
 
 import org.apache.flink.runtime.scheduler.SlotSharingExecutionSlotAllocatorFactory;
+import org.apache.flink.runtime.scheduler.TaskBalancedPreferredSlotSharingStrategy;
 
 import static org.apache.flink.configuration.ClusterOptions.EXECUTION_SLOT_ALLOCATOR_TYPE;
+
+import java.time.Duration;
 
 /** Utility class for selecting {@link ExecutionSlotAllocatorFactory}. */
 public class ExecutionSlotAllocatorFactoryUtils {
 
     public static ExecutionSlotAllocatorFactory selectExecutionSlotAllocatorFactory(
-            final JobType jobType, final Configuration configuration, PhysicalSlotProvider physicalSlotProvider, PhysicalSlotRequestBulkChecker bulkChecker, Time slotRequestTimeout) {
+            final JobType jobType, final Configuration configuration, PhysicalSlotProvider physicalSlotProvider, PhysicalSlotRequestBulkChecker bulkChecker, Duration slotRequestTimeout, boolean balancedAtStreamingMode) {
         final ClusterOptions.ExecutionSlotAllocatorType slotAllocationType =
                 configuration.get(EXECUTION_SLOT_ALLOCATOR_TYPE);
 
@@ -52,10 +53,12 @@ public class ExecutionSlotAllocatorFactoryUtils {
                         physicalSlotProvider,
                         jobType == JobType.STREAMING,
                         bulkChecker,
-                        slotRequestTimeout);
+                        slotRequestTimeout,
+                        balancedAtStreamingMode
+                                ? new TaskBalancedPreferredSlotSharingStrategy.Factory()
+                                : new LocalInputPreferredSlotSharingStrategy.Factory());
         }
     }
 
-    /** Private default constructor to avoid being instantiated. */
     private ExecutionSlotAllocatorFactoryUtils() {}
 }

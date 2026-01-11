@@ -21,6 +21,7 @@ package org.apache.flink.runtime.scheduler;
 
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.TaskManagerOptions;
+import org.apache.flink.configuration.TaskManagerOptions.TaskManagerLoadBalanceMode;
 import org.apache.flink.runtime.concurrent.ComponentMainThreadExecutor;
 import org.apache.flink.runtime.jobgraph.JobType;
 import org.apache.flink.runtime.jobmaster.slotpool.PhysicalSlotProvider;
@@ -29,6 +30,7 @@ import org.apache.flink.runtime.jobmaster.slotpool.PhysicalSlotRequestBulkChecke
 import org.apache.flink.runtime.jobmaster.slotpool.PhysicalSlotRequestBulkCheckerImpl;
 import org.apache.flink.runtime.jobmaster.slotpool.SlotPool;
 import org.apache.flink.runtime.jobmaster.slotpool.SlotSelectionStrategy;
+import org.apache.flink.runtime.jobmaster.slotpool.SlotSelectionStrategy.NoOpSlotSelectionStrategy;
 import org.apache.flink.runtime.scheduler.strategy.PipelinedRegionSchedulingStrategy;
 import org.apache.flink.runtime.scheduler.strategy.SchedulingStrategyFactory;
 import org.apache.flink.runtime.util.ExecutionSlotAllocatorFactoryUtils;
@@ -109,15 +111,13 @@ public class DefaultSchedulerComponents {
                         slotPool, SystemClock.getInstance());
         final PhysicalSlotProvider physicalSlotProvider =
                 new PhysicalSlotProviderImpl(slotSelectionStrategy, slotPool);
-        final ExecutionSlotAllocatorFactory allocatorFactory =
-                new SlotSharingExecutionSlotAllocatorFactory(
-                        physicalSlotProvider,
-                        jobType == JobType.STREAMING,
-                        bulkChecker,
-                        slotRequestTimeout,
-                        balancedAtStreamingMode
-                                ? new TaskBalancedPreferredSlotSharingStrategy.Factory()
-                                : new LocalInputPreferredSlotSharingStrategy.Factory());
+        final ExecutionSlotAllocatorFactory allocatorFactory = ExecutionSlotAllocatorFactoryUtils.selectExecutionSlotAllocatorFactory(
+                jobType,
+                jobMasterConfiguration,
+                physicalSlotProvider,
+                bulkChecker,
+                slotRequestTimeout,
+                balancedAtStreamingMode);
         return new DefaultSchedulerComponents(
                 new PipelinedRegionSchedulingStrategy.Factory(),
                 bulkChecker::start,
