@@ -325,8 +325,6 @@ public class TopDownBottomUpExecutionGraphPlacement implements ExecutionGraphPla
             executionGraph.getJobVertex(vertexId)
                     .getResourceProfile()
                     .setTaskManagerAddress(target.getId());
-                    executionGraph.getJobVertex(vertexId).getTaskVertices().map(ExecutionVertex::getID).forEach(id ->
-                        id.selectSlotSelectionStrategy
             LOG.debug("Assigned operator {} to compute node {}", vertexId, target.getId());
         }
     }
