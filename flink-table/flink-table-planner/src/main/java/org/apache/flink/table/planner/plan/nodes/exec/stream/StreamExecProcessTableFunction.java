@@ -24,7 +24,9 @@ import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.transformations.KeyedMultipleInputTransformation;
+import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.ProcessTableFunction;
@@ -35,6 +37,7 @@ import org.apache.flink.table.planner.codegen.EqualiserCodeGenerator;
 import org.apache.flink.table.planner.codegen.HashCodeGenerator;
 import org.apache.flink.table.planner.codegen.ProcessTableRunnerGenerator;
 import org.apache.flink.table.planner.delegation.PlannerBase;
+import org.apache.flink.table.planner.functions.bridging.BridgingSqlFunction;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeContext;
@@ -45,9 +48,12 @@ import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodeUtil;
 import org.apache.flink.table.planner.plan.nodes.exec.utils.TransformationMetadata;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalProcessTableFunction;
 import org.apache.flink.table.planner.plan.utils.KeySelectorUtil;
+import org.apache.flink.table.planner.utils.ShortcutUtils;
 import org.apache.flink.table.runtime.generated.GeneratedHashFunction;
 import org.apache.flink.table.runtime.generated.GeneratedProcessTableRunner;
 import org.apache.flink.table.runtime.generated.GeneratedRecordEqualiser;
+import org.apache.flink.table.runtime.functions.table.ProxyOperator;
+import org.apache.flink.table.runtime.functions.table.ProxyTableFunction;
 import org.apache.flink.table.runtime.keyselector.RowDataKeySelector;
 import org.apache.flink.table.runtime.operators.process.ProcessTableOperatorFactory;
 import org.apache.flink.table.runtime.operators.process.RuntimeChangelogMode;
@@ -65,12 +71,18 @@ import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.annotation.JsonPro
 
 import org.apache.calcite.linq4j.Ord;
 import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlKind;
 import org.checkerframework.checker.nullness.qual.Nullable;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -93,6 +105,9 @@ import static org.apache.flink.table.types.logical.utils.LogicalTypeChecks.getFi
         minStateVersion = FlinkVersion.v2_1)
 public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
         implements StreamExecNode<RowData>, SingleTransformationTranslator<RowData> {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(StreamExecProcessTableFunction.class);
 
     public static final String PROCESS_TRANSFORMATION = "process";
 
@@ -167,6 +182,20 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                 getInputEdges().stream()
                         .map(e -> (Transformation<RowData>) e.translateToPlan(planner))
                         .collect(Collectors.toList());
+        final RexCall udfCall = StreamPhysicalProcessTableFunction.toUdfCall(invocation);
+        if (isProxyFunction(udfCall)) {
+            if (inputTransforms.size() != 1) {
+                throw new TableException(
+                        "ProxyTableFunction supports exactly one table input.");
+            }
+            final String conf = extractProxyConf(udfCall);
+            LOG.info(
+                    "Proxy rewrite injecting pre/post operators: conf={}, uid={}, input={}",
+                    conf,
+                    uid,
+                    inputTransforms.get(0).getName());
+            return createProxyChain(inputTransforms.get(0), conf, config);
+        }
 
         final List<Ord<StaticArgument>> providedInputArgs =
                 StreamPhysicalProcessTableFunction.getProvidedInputArgs(invocation);
@@ -188,7 +217,6 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
         final CodeGeneratorContext ctx =
                 new CodeGeneratorContext(config, planner.getFlinkContext().getClassLoader());
 
-        final RexCall udfCall = StreamPhysicalProcessTableFunction.toUdfCall(invocation);
         final GeneratedRunnerResult generated =
                 ProcessTableRunnerGenerator.generate(
                         ctx, udfCall, inputTimeColumns, inputChangelogModes, outputChangelogMode);
@@ -363,5 +391,109 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
             return Long.MAX_VALUE;
         }
         return globalRetentionTime;
+    }
+
+    private Transformation<RowData> createProxyChain(
+            Transformation<RowData> input, String conf, ExecNodeConfig config) {
+        final RowType rowType = extractInputRowType(input);
+        final OneInputTransformation<RowData, RowData> pre =
+                ExecNodeUtil.createOneInputTransformation(
+                        input,
+                        createTransformationMeta("proxy-pre", "ProxyPre", "ProxyPre", config),
+                        new ProxyOperator(conf, ProxyOperator.Side.PRE, rowType),
+                        input.getOutputType(),
+                        input.getParallelism(),
+                        input.isParallelismConfigured());
+        copyPlacementConstraints(input, pre);
+        pre.setChainingStrategy(ChainingStrategy.ALWAYS);
+        setMaxParallelismIfConfigured(input, pre);
+
+        final OneInputTransformation<RowData, RowData> post =
+                ExecNodeUtil.createOneInputTransformation(
+                        pre,
+                        createTransformationMeta("proxy-post", "ProxyPost", "ProxyPost", config),
+                        new ProxyOperator(conf, ProxyOperator.Side.POST, rowType),
+                        pre.getOutputType(),
+                        pre.getParallelism(),
+                        pre.isParallelismConfigured());
+        copyPlacementConstraints(input, post);
+        post.setChainingStrategy(ChainingStrategy.ALWAYS);
+        setMaxParallelismIfConfigured(input, post);
+
+        return post;
+    }
+
+    private static void copyPlacementConstraints(Transformation<?> from, Transformation<?> to) {
+        from.getSlotSharingGroup().ifPresent(to::setSlotSharingGroup);
+        if (from.getCoLocationGroupKey() != null) {
+            to.setCoLocationGroupKey(from.getCoLocationGroupKey());
+        }
+    }
+
+    private static void setMaxParallelismIfConfigured(
+            Transformation<?> from, Transformation<?> to) {
+        if (from.getMaxParallelism() > 0) {
+            to.setMaxParallelism(from.getMaxParallelism());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static RowType extractInputRowType(Transformation<RowData> input) {
+        if (input.getOutputType() instanceof InternalTypeInfo) {
+            return ((InternalTypeInfo<RowData>) input.getOutputType()).toRowType();
+        }
+        throw new TableException(
+                "ProxyTableFunction requires InternalTypeInfo output type, but was "
+                        + input.getOutputType());
+    }
+
+    private static boolean isProxyFunction(RexCall udfCall) {
+        final BridgingSqlFunction bridging = ShortcutUtils.unwrapBridgingSqlFunction(udfCall);
+        if (bridging == null) {
+                LOG.info("Proxy rewrite bridging is null");
+            return false;
+        }
+        final Object definition = bridging.getDefinition();
+        if (definition instanceof ProxyTableFunction) {
+            LOG.info(
+                    "Proxy rewrite matched (instanceof): defClass={}, defCl={}",
+                    definition.getClass().getName(),
+                    definition.getClass().getClassLoader());
+            return true;
+        }
+        if (definition == null) {
+                LOG.info("Proxy rewrite definition is null");
+            return false;
+        }
+        final String defClassName = definition.getClass().getName();
+        if (ProxyTableFunction.class.getName().equals(defClassName)) {
+            LOG.info(
+                    "Proxy rewrite matched (name): defClass={}, defCl={}, proxyCl={}",
+                    defClassName,
+                    definition.getClass().getClassLoader(),
+                    ProxyTableFunction.class.getClassLoader());
+            return true;
+        }
+        if (defClassName.endsWith("ProxyTableFunction")) {
+            LOG.info(
+                    "Proxy rewrite not matched: defClass={}, defCl={}, proxyCl={}",
+                    defClassName,
+                    definition.getClass().getClassLoader(),
+                    ProxyTableFunction.class.getClassLoader());
+        }
+        return false;
+    }
+
+    private static String extractProxyConf(RexCall udfCall) {
+        for (RexNode operand : udfCall.getOperands()) {
+            if (operand instanceof RexLiteral) {
+                return Objects.toString(RexLiteral.stringValue((RexLiteral) operand), "");
+            }
+            if (operand.getKind() == SqlKind.DEFAULT) {
+                return "";
+            }
+        }
+        throw new TableException(
+                "ProxyTableFunction requires a literal string 'conf' argument.");
     }
 }
