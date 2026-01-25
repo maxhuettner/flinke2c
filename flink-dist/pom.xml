@@ -34,6 +34,7 @@ under the License.
 
 	<properties>
 		<japicmp.skip>true</japicmp.skip>
+		<arrow.version>18.3.0</arrow.version>
 	</properties>
 
 	<dependencies>
@@ -115,6 +116,28 @@ under the License.
 			<artifactId>flink-statebackend-changelog</artifactId>
 			<version>${project.version}</version>
 			<optional>${flink.markBundledAsOptional}</optional>
+		</dependency>
+
+		<!-- Arrow runtime for ProxyOperator -->
+		<dependency>
+			<groupId>org.apache.arrow</groupId>
+			<artifactId>arrow-vector</artifactId>
+			<version>${arrow.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.arrow</groupId>
+			<artifactId>arrow-memory-core</artifactId>
+			<version>${arrow.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.arrow</groupId>
+			<artifactId>arrow-memory-netty</artifactId>
+			<version>${arrow.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.arrow</groupId>
+			<artifactId>arrow-format</artifactId>
+			<version>${arrow.version}</version>
 		</dependency>
 
         <dependency>
