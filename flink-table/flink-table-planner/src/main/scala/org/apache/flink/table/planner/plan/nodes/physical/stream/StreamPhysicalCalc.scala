@@ -62,7 +62,7 @@ class StreamPhysicalCalc(
       projection.size,
       condition != null)
 
-    val rewriter = new StreamPhysicalCalc.ProxyScalarFunctionRewriter
+    val rewriter = new StreamPhysicalCalc.ProxyScalarFunctionRewriter(inputRel.getRowType)
     val rewrittenProjection = projection.map(_.accept(rewriter))
     val rewrittenCondition = if (condition != null) {
       condition.accept(rewriter)
@@ -70,9 +70,10 @@ class StreamPhysicalCalc(
       null
     }
     StreamPhysicalCalc.LOG.info(
-      "StreamPhysicalCalc proxy rewrite: hasProxyFunction={}, proxyConfPresent={}",
-      rewriter.hasProxyFunction,
-      !rewriter.getProxyConf.isEmpty)
+      s"StreamPhysicalCalc proxy rewrite: hasProxyFunction=${rewriter.hasProxyFunction}, " +
+        s"proxyConfPresent=${!rewriter.getProxyConf.isEmpty}, " +
+        s"proxyFieldIndex=${rewriter.getProxyFieldIndex.orNull}, " +
+        s"proxyFieldName=${rewriter.getProxyFieldName}")
 
     if (rewriter.hasProxyFunction) {
       StreamPhysicalCalc.LOG.info(
@@ -85,7 +86,9 @@ class StreamPhysicalCalc(
         InputProperty.DEFAULT,
         FlinkTypeFactory.toLogicalRowType(getRowType),
         getRelDetailedDescription,
-        rewriter.getProxyConf)
+        rewriter.getProxyConf,
+        rewriter.getProxyFieldIndex.orNull,
+        rewriter.getProxyFieldName)
     } else {
       new StreamExecCalc(
         unwrapTableConfig(this),
@@ -212,9 +215,44 @@ private object StreamPhysicalCalc {
     ""
   }
 
-  private class ProxyScalarFunctionRewriter extends RexShuttle {
+  private def extractProxyFieldIndex(operand: RexNode): Option[Integer] = {
+    operand match {
+      case inputRef: RexInputRef =>
+        Some(inputRef.getIndex)
+      case fieldAccess: RexFieldAccess =>
+        fieldAccess.getReferenceExpr match {
+          case inputRef: RexInputRef => Some(inputRef.getIndex)
+          case refCall: RexCall if refCall.getKind == SqlKind.CAST || refCall.getKind == SqlKind.AS =>
+            extractProxyFieldIndex(refCall.getOperands.get(0))
+          case _ => None
+        }
+      case call: RexCall =>
+        if (call.getKind == SqlKind.CAST || call.getKind == SqlKind.AS) {
+          extractProxyFieldIndex(call.getOperands.get(0))
+        } else {
+          None
+        }
+      case _ => None
+    }
+  }
+
+  private def resolveFieldName(inputType: RelDataType, fieldIndex: Integer): Option[String] = {
+    if (inputType == null || fieldIndex == null) {
+      return None
+    }
+    val fields = inputType.getFieldList
+    if (fieldIndex < 0 || fieldIndex >= fields.size()) {
+      None
+    } else {
+      Option(fields.get(fieldIndex).getName)
+    }
+  }
+
+  private class ProxyScalarFunctionRewriter(inputType: RelDataType) extends RexShuttle {
     private var proxyFunctionFound = false
     private var proxyConf: String = null
+    private var proxyFieldIndex: Integer = null
+    private var proxyFieldName: String = null
 
     override def visitCall(call: RexCall): RexNode = {
       if (!isProxyScalarFunction(call)) {
@@ -231,11 +269,24 @@ private object StreamPhysicalCalc {
       }
       proxyFunctionFound = true
       proxyConf = mergeProxyConf(proxyConf, extractProxyConf(operands))
+      extractProxyFieldIndex(operand).foreach { idx =>
+        if (proxyFieldIndex == null) {
+          proxyFieldIndex = idx
+          proxyFieldName = resolveFieldName(inputType, idx).orNull
+        } else if (proxyFieldIndex != idx) {
+          throw new TableException(
+            "Proxy scalar function requires a single, consistent input field.")
+        }
+      }
       operand.accept(this)
     }
 
     def hasProxyFunction: Boolean = proxyFunctionFound
 
     def getProxyConf: String = if (proxyConf == null) "" else proxyConf
+
+    def getProxyFieldIndex: Option[Integer] = Option(proxyFieldIndex)
+
+    def getProxyFieldName: String = if (proxyFieldName == null) "" else proxyFieldName
   }
 }

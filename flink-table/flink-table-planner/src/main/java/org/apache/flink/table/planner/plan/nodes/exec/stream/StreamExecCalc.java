@@ -69,8 +69,12 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
     private static final Logger LOG = LoggerFactory.getLogger(StreamExecCalc.class);
 
     public static final String FIELD_NAME_PROXY_CONF = "proxyConf";
+    public static final String FIELD_NAME_PROXY_FIELD_INDEX = "proxyFieldIndex";
+    public static final String FIELD_NAME_PROXY_FIELD_NAME = "proxyFieldName";
 
     private final @Nullable String proxyConf;
+    private final @Nullable Integer proxyFieldIndex;
+    private final @Nullable String proxyFieldName;
 
     static {
         final String source =
@@ -95,6 +99,8 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 Collections.singletonList(inputProperty),
                 outputType,
                 description,
+                null,
+                null,
                 null);
     }
 
@@ -115,7 +121,33 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 Collections.singletonList(inputProperty),
                 outputType,
                 description,
-                proxyConf);
+                proxyConf,
+                null,
+                null);
+    }
+
+    public StreamExecCalc(
+            ReadableConfig tableConfig,
+            List<RexNode> projection,
+            @Nullable RexNode condition,
+            InputProperty inputProperty,
+            RowType outputType,
+            String description,
+            @Nullable String proxyConf,
+            @Nullable Integer proxyFieldIndex,
+            @Nullable String proxyFieldName) {
+        this(
+                ExecNodeContext.newNodeId(),
+                ExecNodeContext.newContext(StreamExecCalc.class),
+                ExecNodeContext.newPersistedConfig(StreamExecCalc.class, tableConfig),
+                projection,
+                condition,
+                Collections.singletonList(inputProperty),
+                outputType,
+                description,
+                proxyConf,
+                proxyFieldIndex,
+                proxyFieldName);
     }
 
     @JsonCreator
@@ -128,7 +160,9 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             @JsonProperty(FIELD_NAME_INPUT_PROPERTIES) List<InputProperty> inputProperties,
             @JsonProperty(FIELD_NAME_OUTPUT_TYPE) RowType outputType,
             @JsonProperty(FIELD_NAME_DESCRIPTION) String description,
-            @JsonProperty(FIELD_NAME_PROXY_CONF) @Nullable String proxyConf) {
+            @JsonProperty(FIELD_NAME_PROXY_CONF) @Nullable String proxyConf,
+            @JsonProperty(FIELD_NAME_PROXY_FIELD_INDEX) @Nullable Integer proxyFieldIndex,
+            @JsonProperty(FIELD_NAME_PROXY_FIELD_NAME) @Nullable String proxyFieldName) {
         super(
                 id,
                 context,
@@ -141,12 +175,16 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 outputType,
                 description);
         this.proxyConf = proxyConf;
+        this.proxyFieldIndex = proxyFieldIndex;
+        this.proxyFieldName = proxyFieldName;
         LOG.info(
-                "StreamExecCalc ctor: id={}, projectionSize={}, conditionPresent={}, proxyConfPresent={}",
+                "StreamExecCalc ctor: id={}, projectionSize={}, conditionPresent={}, proxyConfPresent={}, proxyFieldIndex={}, proxyFieldName={}",
                 id,
                 projection.size(),
                 condition != null,
-                proxyConf != null);
+                proxyConf != null,
+                proxyFieldIndex,
+                proxyFieldName);
     }
 
     @SuppressWarnings("unchecked")
@@ -201,6 +239,10 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 throw new TableException(
                         "Proxy scalar function requires a TCP conf literal or table.exec.proxy.conf.");
             }
+            if (proxyFieldIndex != null || (proxyFieldName != null && !proxyFieldName.isEmpty())) {
+                proxyConfValue =
+                        appendProxyField(proxyConfValue, proxyFieldIndex, proxyFieldName);
+            }
             LOG.info(
                     "Proxy rewrite injecting pre/post operators for scalar UDF: {}, conf={}",
                     CUSTOM_PROXY_FUNCTION_NAME,
@@ -239,5 +281,50 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             return createProxyChain(calcTransform, resolvedProxyConf, config);
         }
         return calcTransform;
+    }
+
+    private static String appendProxyField(
+            String conf, @Nullable Integer fieldIndex, @Nullable String fieldName) {
+        String result = conf;
+        if (fieldIndex != null && !containsConfKey(result, "calcfieldindex")) {
+            result = appendConfValue(result, "calcFieldIndex", String.valueOf(fieldIndex));
+        }
+        if (fieldName != null && !fieldName.isEmpty()
+                && !containsConfKey(result, "calcfieldname")) {
+            result = appendConfValue(result, "calcFieldName", fieldName);
+        }
+        return result;
+    }
+
+    private static boolean containsConfKey(String conf, String keyLower) {
+        if (conf == null || conf.isEmpty()) {
+            return false;
+        }
+        final String[] parts = conf.split(";");
+        for (String part : parts) {
+            final String trimmed = part.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            final int idx = trimmed.indexOf('=');
+            if (idx <= 0) {
+                continue;
+            }
+            final String k = trimmed.substring(0, idx).trim().toLowerCase();
+            if (k.equals(keyLower)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String appendConfValue(String conf, String key, String value) {
+        if (conf == null || conf.isEmpty()) {
+            return key + "=" + value;
+        }
+        if (conf.endsWith(";")) {
+            return conf + key + "=" + value;
+        }
+        return conf + ";" + key + "=" + value;
     }
 }
