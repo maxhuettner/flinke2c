@@ -81,10 +81,14 @@ import java.util.stream.Collectors;
 /**
  * A proxy operator that forwards records through an external TCP process.
  *
- * <p>The PRE side sends input rows, the POST side receives processed rows and emits them
+ * <p>
+ * The PRE side sends input rows, the POST side receives processed rows and
+ * emits them
  * downstream.
  *
- * <p>PRE and POST send one JSON config preamble (length-prefixed) before the Arrow IPC stream
+ * <p>
+ * PRE and POST send one JSON config preamble (length-prefixed) before the Arrow
+ * IPC stream
  * begins (PRE before sending, POST before reading).
  */
 @Internal
@@ -143,10 +147,9 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         super.open();
 
         this.tcpConfig = ProxyTcpConfig.from(conf);
-        this.fieldTypes =
-                rowType.getFields().stream()
-                        .map(RowType.RowField::getType)
-                        .collect(Collectors.toList());
+        this.fieldTypes = rowType.getFields().stream()
+                .map(RowType.RowField::getType)
+                .collect(Collectors.toList());
 
         if (side == Side.PRE) {
             openPre();
@@ -220,8 +223,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         final Schema arrowSchema = toArrowSchema(rowType, tcpConfig.reorderResponses);
         this.writeRoot = VectorSchemaRoot.create(arrowSchema, allocator);
         this.writeVectors = writeRoot.getFieldVectors();
-        this.writeRowIdVector =
-                tcpConfig.reorderResponses ? (BigIntVector) writeVectors.get(1) : null;
+        this.writeRowIdVector = tcpConfig.reorderResponses ? (BigIntVector) writeVectors.get(1) : null;
 
         this.writer = new ArrowStreamWriter(writeRoot, /* DictionaryProvider */ null, out);
         this.writer.start(); // writes schema header
@@ -268,7 +270,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
 
         batchRowIndex++;
 
-        // optional: flush per-row if you really want minimum latency (not recommended generally)
+        // optional: flush per-row if you really want minimum latency (not recommended
+        // generally)
         if (tcpConfig.flushOnWrite) {
             flushArrowBatch();
         } else if (tcpConfig.flushEvery > 0 && batchRowIndex >= tcpConfig.flushEvery) {
@@ -356,8 +359,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         this.in = new BufferedInputStream(socket.getInputStream(), tcpConfig.bufferSize);
 
         // POST registers itself with the proxy before Arrow stream starts
-        final BufferedOutputStream postOut =
-                new BufferedOutputStream(socket.getOutputStream(), tcpConfig.bufferSize);
+        final BufferedOutputStream postOut = new BufferedOutputStream(socket.getOutputStream(), tcpConfig.bufferSize);
         final String configJson = buildConfigJson(side);
         writeLengthPrefixedJson(postOut, configJson);
 
@@ -368,8 +370,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         this.readVectors = readRoot.getFieldVectors();
         this.readBatchRowCount = 0;
         this.readBatchRowIndex = 0;
-        this.readRowIdVector =
-                tcpConfig.reorderResponses ? (BigIntVector) readVectors.get(1) : null;
+        this.readRowIdVector = tcpConfig.reorderResponses ? (BigIntVector) readVectors.get(1) : null;
         this.expectedRowId = 0L;
         this.reorderBuffer = tcpConfig.reorderResponses ? new HashMap<>() : null;
 
@@ -501,7 +502,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     // ------------------------------------------------------------------------
 
     private String buildConfigJson(Side side) {
-        // Provided snippet (may need import/package adjustment depending on Flink version)
+        // Provided snippet (may need import/package adjustment depending on Flink
+        // version)
         final StreamingRuntimeContext ctx = (StreamingRuntimeContext) getRuntimeContext();
 
         final TaskInfo taskInfo = getRuntimeContext().getTaskInfo();
@@ -511,7 +513,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         String jobId = "unknown";
 
         try {
-            // These types/methods exist in many Flink versions; adjust if your version differs.
+            // These types/methods exist in many Flink versions; adjust if your version
+            // differs.
             final Object tm = ctx.getTaskManagerRuntimeInfo();
             tmHost = (String) tm.getClass().getMethod("getTaskManagerExternalAddress").invoke(tm);
 
@@ -648,9 +651,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 return;
             }
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE: {
-                final long ms =
-                        row.getTimestamp(pos, ((LocalZonedTimestampType) type).getPrecision())
-                                .getMillisecond();
+                final long ms = row.getTimestamp(pos, ((LocalZonedTimestampType) type).getPrecision())
+                        .getMillisecond();
                 ((TimeStampMilliVector) v).setSafe(idx, ms);
                 return;
             }
@@ -759,7 +761,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         try {
             c.close();
             return null;
-        } catch(IOException e) {
+        } catch (IOException e) {
             return e;
         } catch (Exception e) {
             return new IOException(e);
@@ -818,7 +820,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
 
         // re-used knobs (interpreted for Arrow)
         private final boolean flushOnWrite; // if true, flush after each append (low latency, low throughput)
-        private final int flushEvery;       // if >0, flush once batch has this many rows (<= batchMaxRows)
+        private final int flushEvery; // if >0, flush once batch has this many rows (<= batchMaxRows)
         private final int batchMaxRows;
         private final boolean reorderResponses;
         private final int reorderMaxBuffer;
@@ -856,8 +858,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             final Map<String, String> map = parse(conf);
 
             final int bufferSize = parseInt(map.get("buffersize"), DEFAULT_BUFFER_SIZE);
-            final int connectTimeoutMs =
-                    parseInt(map.get("connecttimeoutms"), DEFAULT_CONNECT_TIMEOUT_MS);
+            final int connectTimeoutMs = parseInt(map.get("connecttimeoutms"), DEFAULT_CONNECT_TIMEOUT_MS);
             final int readTimeoutMs = parseInt(map.get("readtimeoutms"), 0);
             final int maxFrameSize = parseInt(map.get("maxframesize"), DEFAULT_MAX_FRAME_SIZE);
 
@@ -866,10 +867,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             final int batchMaxRows = parseInt(map.get("batchmaxrows"), DEFAULT_BATCH_MAX_ROWS);
             final Integer calcFieldIndex = parseInt(map.get("calcfieldindex"));
             final String calcFieldName = map.get("calcfieldname");
-            final boolean reorderResponses =
-                    parseBoolean(firstNonNull(map, "reorder", "correlate"), false);
-            final int reorderMaxBuffer =
-                    parseInt(map.get("reordermax"), DEFAULT_REORDER_MAX_BUFFER);
+            final boolean reorderResponses = parseBoolean(firstNonNull(map, "reorder", "correlate"), false);
+            final int reorderMaxBuffer = parseInt(map.get("reordermax"), DEFAULT_REORDER_MAX_BUFFER);
 
             final List<ProxyEndpoint> proxies = parseProxies(map.get("proxies"));
             final ProxyEndpoint selectedProxy = proxies.get(0);
