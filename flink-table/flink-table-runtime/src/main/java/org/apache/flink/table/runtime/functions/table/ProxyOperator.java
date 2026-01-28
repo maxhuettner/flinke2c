@@ -23,6 +23,7 @@ import org.apache.flink.api.common.TaskInfo;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -35,6 +36,7 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.TimestampType;
+import org.apache.flink.table.types.logical.utils.LogicalTypeParser;
 import org.apache.flink.types.RowKind;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -58,6 +60,8 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
@@ -67,8 +71,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -105,10 +111,18 @@ public class ProxyOperator extends TableStreamOperator<RowData>
 
     private final String conf;
     private final Side side;
-    private final RowType rowType;
+    private final RowType inputRowType;
+    private final RowType resultRowType;
 
     private transient ProxyTcpConfig tcpConfig;
     private transient List<LogicalType> fieldTypes;
+    private transient List<Integer> payloadFieldIndices;
+    private transient List<String> payloadFieldNames;
+    private transient List<LogicalType> payloadWriteTypes;
+    private transient List<Integer> resultFieldIndices;
+    private transient List<LogicalType> resultFieldTypes;
+    private transient RowData.FieldGetter[] resultFieldGetters;
+    private transient RowData.FieldGetter[] fullRowFieldGetters;
 
     // shared socket
     private transient Socket socket;
@@ -137,9 +151,15 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     private transient Map<Long, RowData> reorderBuffer;
 
     public ProxyOperator(String conf, Side side, RowType rowType) {
+        this(conf, side, rowType, rowType);
+    }
+
+    public ProxyOperator(String conf, Side side, RowType inputRowType, @Nullable RowType resultRowType) {
         this.conf = conf == null ? "" : conf;
         this.side = side == null ? Side.PRE : side;
-        this.rowType = Objects.requireNonNull(rowType, "rowType");
+        this.inputRowType = Objects.requireNonNull(inputRowType, "inputRowType");
+        this.resultRowType =
+                resultRowType == null ? this.inputRowType : resultRowType;
     }
 
     @Override
@@ -147,9 +167,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         super.open();
 
         this.tcpConfig = ProxyTcpConfig.from(conf);
-        this.fieldTypes = rowType.getFields().stream()
-                .map(RowType.RowField::getType)
-                .collect(Collectors.toList());
+        initializePayloadFields();
 
         if (side == Side.PRE) {
             openPre();
@@ -165,14 +183,110 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             // keep original behavior: forward input downstream unchanged
             output.collect(element);
         } else {
-            final RowData outRow;
+            final RowData proxyRow;
             if (tcpConfig.reorderResponses) {
-                outRow = readNextOrderedRow(element.getValue().getRowKind());
+                proxyRow = readNextOrderedRow(element.getValue().getRowKind());
             } else {
-                outRow = readNextRow(element.getValue().getRowKind());
+                proxyRow = readNextRow(element.getValue().getRowKind());
             }
+            final RowData outRow = mergeProxyRow(element.getValue(), proxyRow);
             output.collect(element.replace(outRow));
         }
+    }
+
+    private void initializePayloadFields() {
+        final List<RowType.RowField> inputFields = inputRowType.getFields();
+        final List<RowType.RowField> resultFields = resultRowType.getFields();
+        final int fieldCount = inputFields.size();
+        final List<Integer> indices = new ArrayList<>();
+
+        if (tcpConfig.argFieldNames != null && !tcpConfig.argFieldNames.isEmpty()) {
+            final Map<String, Integer> nameToIndex = new HashMap<>();
+            for (int i = 0; i < fieldCount; i++) {
+                final String name = inputFields.get(i).getName();
+                if (name != null) {
+                    nameToIndex.put(name.toLowerCase(Locale.ROOT), i);
+                }
+            }
+            for (String name : tcpConfig.argFieldNames) {
+                if (name == null || name.trim().isEmpty()) {
+                    throw new TableException("ProxyOperator argument field name is empty.");
+                }
+                final Integer idx = nameToIndex.get(name.toLowerCase(Locale.ROOT));
+                if (idx == null) {
+                    throw new TableException(
+                            "ProxyOperator argument field '" + name + "' not found in row type.");
+                }
+                indices.add(idx);
+            }
+        } else if (!tcpConfig.argFieldIndices.isEmpty()) {
+            indices.addAll(tcpConfig.argFieldIndices);
+        } else {
+            for (int i = 0; i < fieldCount; i++) {
+                indices.add(i);
+            }
+        }
+
+        this.payloadFieldIndices = indices;
+        this.fieldTypes =
+                indices.stream().map(i -> inputFields.get(i).getType()).collect(Collectors.toList());
+        this.payloadFieldNames = new ArrayList<>(indices.size());
+        if (tcpConfig.argFieldNames != null
+                && tcpConfig.argFieldNames.size() == indices.size()) {
+            this.payloadFieldNames.addAll(tcpConfig.argFieldNames);
+        } else {
+            for (int idx : indices) {
+                payloadFieldNames.add(inputFields.get(idx).getName());
+            }
+        }
+
+        this.payloadWriteTypes = new ArrayList<>(indices.size());
+        if (tcpConfig.argFieldTypes != null
+                && tcpConfig.argFieldTypes.size() == indices.size()) {
+            final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
+            for (int i = 0; i < indices.size(); i++) {
+                final String typeString = tcpConfig.argFieldTypes.get(i);
+                if (typeString == null || typeString.trim().isEmpty()) {
+                    payloadWriteTypes.add(fieldTypes.get(i));
+                } else {
+                    payloadWriteTypes.add(LogicalTypeParser.parse(typeString, cl));
+                }
+            }
+        } else {
+            payloadWriteTypes.addAll(fieldTypes);
+        }
+
+        if (!tcpConfig.resultFieldIndices.isEmpty()) {
+            this.resultFieldIndices = new ArrayList<>(tcpConfig.resultFieldIndices);
+        } else {
+            this.resultFieldIndices = new ArrayList<>(payloadFieldIndices);
+        }
+        this.resultFieldTypes =
+                resultFieldIndices.stream()
+                        .map(i -> resultFields.get(i).getType())
+                        .collect(Collectors.toList());
+        this.resultFieldGetters = new RowData.FieldGetter[resultFieldTypes.size()];
+        for (int i = 0; i < resultFieldTypes.size(); i++) {
+            resultFieldGetters[i] = RowData.createFieldGetter(resultFieldTypes.get(i), i);
+        }
+        this.fullRowFieldGetters = new RowData.FieldGetter[fieldCount];
+        for (int i = 0; i < fieldCount; i++) {
+            fullRowFieldGetters[i] = RowData.createFieldGetter(inputFields.get(i).getType(), i);
+        }
+    }
+
+    private RowData mergeProxyRow(RowData baseRow, RowData proxyRow) {
+        final int fieldCount = inputRowType.getFieldCount();
+        final GenericRowData outRow = new GenericRowData(fieldCount);
+        outRow.setRowKind(proxyRow.getRowKind());
+        for (int i = 0; i < fieldCount; i++) {
+            outRow.setField(i, fullRowFieldGetters[i].getFieldOrNull(baseRow));
+        }
+        for (int i = 0; i < resultFieldIndices.size(); i++) {
+            final int targetIndex = resultFieldIndices.get(i);
+            outRow.setField(targetIndex, resultFieldGetters[i].getFieldOrNull(proxyRow));
+        }
+        return outRow;
     }
 
     @Override
@@ -220,7 +334,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
 
         this.allocator = new RootAllocator(Long.MAX_VALUE);
 
-        final Schema arrowSchema = toArrowSchema(rowType, tcpConfig.reorderResponses);
+        final Schema arrowSchema =
+                toArrowSchema(payloadFieldNames, payloadWriteTypes, tcpConfig.reorderResponses);
         this.writeRoot = VectorSchemaRoot.create(arrowSchema, allocator);
         this.writeVectors = writeRoot.getFieldVectors();
         this.writeRowIdVector = tcpConfig.reorderResponses ? (BigIntVector) writeVectors.get(1) : null;
@@ -233,7 +348,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 side,
                 proxy.host,
                 port,
-                rowType,
+                inputRowType,
                 batchMaxRows,
                 configJson.getBytes(StandardCharsets.UTF_8).length);
     }
@@ -257,15 +372,17 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         // columns payloadOffset..N: fields
         for (int i = 0; i < fieldTypes.size(); i++) {
             final int col = i + payloadOffset;
-            final LogicalType type = fieldTypes.get(i);
+            final LogicalType targetType = payloadWriteTypes.get(i);
+            final LogicalType sourceType = fieldTypes.get(i);
             final FieldVector v = writeVectors.get(col);
+            final int sourceIndex = payloadFieldIndices.get(i);
 
-            if (row.isNullAt(i)) {
+            if (row.isNullAt(sourceIndex)) {
                 v.setNull(batchRowIndex);
                 continue;
             }
 
-            writeFieldValue(v, type, row, i, batchRowIndex);
+            writeFieldValueWithCast(v, targetType, sourceType, row, sourceIndex, batchRowIndex);
         }
 
         batchRowIndex++;
@@ -381,7 +498,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 side,
                 proxy.host,
                 port,
-                rowType,
+                inputRowType,
                 configJson.getBytes(StandardCharsets.UTF_8).length);
     }
 
@@ -396,7 +513,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             }
         }
 
-        final int fieldCount = fieldTypes.size();
+        final int fieldCount = resultFieldTypes.size();
         final GenericRowData outRow = new GenericRowData(fieldCount);
 
         // op is column 0
@@ -410,7 +527,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             if (v.isNull(readBatchRowIndex)) {
                 outRow.setField(i, null);
             } else {
-                outRow.setField(i, readFieldValue(v, fieldTypes.get(i), readBatchRowIndex));
+                outRow.setField(i, readFieldValue(v, resultFieldTypes.get(i), readBatchRowIndex));
             }
         }
 
@@ -540,11 +657,145 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                     .append(jsonEscape(tcpConfig.calcFieldName))
                     .append('"');
         }
+        if (tcpConfig.functionClass != null && !tcpConfig.functionClass.isEmpty()) {
+            sb.append(",\"functionClass\":\"")
+                    .append(jsonEscape(tcpConfig.functionClass))
+                    .append('"');
+        }
+        if (tcpConfig.functionKind != null && !tcpConfig.functionKind.isEmpty()) {
+            sb.append(",\"functionKind\":\"")
+                    .append(jsonEscape(tcpConfig.functionKind))
+                    .append('"');
+        }
+        appendFunctionArgMetadata(sb);
+        appendFunctionResultMetadata(sb);
+        appendRowFieldMetadata(sb);
         if (tcpConfig.reorderResponses) {
             sb.append(",\"reorderResponses\":true");
         }
         sb.append('}');
         return sb.toString();
+    }
+
+    private void appendFunctionArgMetadata(StringBuilder sb) {
+        final int maxArgs = Math.max(
+                tcpConfig.argFieldIndices.size(),
+                Math.max(tcpConfig.argFieldNames.size(), tcpConfig.argFieldTypes.size()));
+        if (maxArgs == 0) {
+            return;
+        }
+        sb.append(",\"functionArgs\":[");
+        for (int i = 0; i < maxArgs; i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append('{');
+            boolean wrote = false;
+            if (i < tcpConfig.argFieldIndices.size()) {
+                sb.append("\"index\":").append(tcpConfig.argFieldIndices.get(i));
+                wrote = true;
+            }
+            if (i < tcpConfig.argFieldNames.size()) {
+                if (wrote) {
+                    sb.append(',');
+                }
+                sb.append("\"name\":\"")
+                        .append(jsonEscape(tcpConfig.argFieldNames.get(i)))
+                        .append('"');
+                wrote = true;
+            }
+            if (i < tcpConfig.argFieldTypes.size()) {
+                if (wrote) {
+                    sb.append(',');
+                }
+                sb.append("\"type\":\"")
+                        .append(jsonEscape(tcpConfig.argFieldTypes.get(i)))
+                        .append('"');
+            }
+            sb.append('}');
+        }
+        sb.append(']');
+    }
+
+    private void appendFunctionResultMetadata(StringBuilder sb) {
+        final int maxResults = Math.max(
+                tcpConfig.resultFieldIndices.size(),
+                Math.max(tcpConfig.resultFieldNames.size(), tcpConfig.resultFieldTypes.size()));
+        if (maxResults == 0) {
+            return;
+        }
+        sb.append(",\"functionResults\":[");
+        for (int i = 0; i < maxResults; i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append('{');
+            boolean wrote = false;
+            if (i < tcpConfig.resultFieldIndices.size()) {
+                sb.append("\"outputIndex\":").append(tcpConfig.resultFieldIndices.get(i));
+                wrote = true;
+            }
+            if (i < tcpConfig.resultFieldNames.size()) {
+                if (wrote) {
+                    sb.append(',');
+                }
+                sb.append("\"outputName\":\"")
+                        .append(jsonEscape(tcpConfig.resultFieldNames.get(i)))
+                        .append('"');
+                wrote = true;
+            }
+            if (i < tcpConfig.resultFieldTypes.size()) {
+                if (wrote) {
+                    sb.append(',');
+                }
+                sb.append("\"outputType\":\"")
+                        .append(jsonEscape(tcpConfig.resultFieldTypes.get(i)))
+                        .append('"');
+                wrote = true;
+            }
+            final int udfFieldIndex =
+                    i < tcpConfig.resultUdfFieldIndices.size()
+                            ? tcpConfig.resultUdfFieldIndices.get(i)
+                            : -1;
+            if (udfFieldIndex >= 0) {
+                if (wrote) {
+                    sb.append(',');
+                }
+                sb.append("\"udfFieldIndex\":").append(udfFieldIndex);
+            }
+            sb.append('}');
+        }
+        sb.append(']');
+    }
+
+    private void appendRowFieldMetadata(StringBuilder sb) {
+        final List<RowType.RowField> fields = inputRowType.getFields();
+        sb.append(",\"fields\":[");
+        for (int i = 0; i < payloadFieldIndices.size(); i++) {
+            final int idx = payloadFieldIndices.get(i);
+            final RowType.RowField field = fields.get(idx);
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append("{\"name\":\"")
+                    .append(jsonEscape(resolvePayloadFieldName(i, field)))
+                    .append("\",\"type\":\"")
+                    .append(jsonEscape(field.getType().asSerializableString()))
+                    .append("\"}");
+        }
+        sb.append(']');
+    }
+
+    private String resolvePayloadFieldName(int payloadIndex, RowType.RowField fallbackField) {
+        if (payloadFieldNames != null
+                && payloadIndex >= 0
+                && payloadIndex < payloadFieldNames.size()) {
+            final String name = payloadFieldNames.get(payloadIndex);
+            if (name != null && !name.isEmpty()) {
+                return name;
+            }
+        }
+        return fallbackField.getName();
     }
 
     private static void writeLengthPrefixedJson(OutputStream out, String json) throws IOException {
@@ -567,7 +818,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     // Arrow schema + value mapping
     // ------------------------------------------------------------------------
 
-    private static Schema toArrowSchema(RowType rowType, boolean includeRowId) {
+    private static Schema toArrowSchema(
+            List<String> fieldNames, List<LogicalType> fieldTypes, boolean includeRowId) {
         final List<Field> fields = new ArrayList<>();
 
         // column 0: op
@@ -579,9 +831,12 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         }
 
         // columns (1/2)..N: row fields in order
-        for (RowType.RowField f : rowType.getFields()) {
-            final String name = f.getName();
-            final LogicalType t = f.getType();
+        for (int i = 0; i < fieldTypes.size(); i++) {
+            final String name =
+                    fieldNames != null && i < fieldNames.size() && fieldNames.get(i) != null
+                            ? fieldNames.get(i)
+                            : "f" + i;
+            final LogicalType t = fieldTypes.get(i);
             fields.add(new Field(name, FieldType.nullable(toArrowType(t)), /* children */ null));
         }
         return new Schema(fields);
@@ -619,6 +874,78 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 // default to Utf8 to avoid hard failures
                 return ArrowType.Utf8.INSTANCE;
         }
+    }
+
+    private static void writeFieldValueWithCast(
+            FieldVector v,
+            LogicalType targetType,
+            LogicalType sourceType,
+            RowData row,
+            int pos,
+            int idx) {
+        if (targetType == null || sourceType == null) {
+            v.setNull(idx);
+            return;
+        }
+        final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
+        final LogicalTypeRoot sourceRoot = sourceType.getTypeRoot();
+
+        // fast path: same root (or compatible string/timestamp families)
+        if (targetRoot == sourceRoot
+                || (isStringRoot(targetRoot) && isStringRoot(sourceRoot))
+                || (isTimestampRoot(targetRoot) && isTimestampRoot(sourceRoot))) {
+            writeFieldValue(v, targetType, row, pos, idx);
+            return;
+        }
+
+        if (targetRoot == LogicalTypeRoot.DECIMAL) {
+            final DecimalType dt = (DecimalType) targetType;
+            final BigDecimal bd;
+            switch (sourceRoot) {
+                case BIGINT:
+                    bd = BigDecimal.valueOf(row.getLong(pos));
+                    break;
+                case INTEGER:
+                    bd = BigDecimal.valueOf(row.getInt(pos));
+                    break;
+                case FLOAT:
+                    bd = BigDecimal.valueOf(row.getFloat(pos));
+                    break;
+                case DOUBLE:
+                    bd = BigDecimal.valueOf(row.getDouble(pos));
+                    break;
+                case DECIMAL: {
+                    final DecimalType st = (DecimalType) sourceType;
+                    final DecimalData dec = row.getDecimal(pos, st.getPrecision(), st.getScale());
+                    bd = dec.toBigDecimal();
+                    break;
+                }
+                default:
+                    throw new TableException(
+                            "ProxyOperator cannot cast "
+                                    + sourceType.asSerializableString()
+                                    + " to "
+                                    + targetType.asSerializableString());
+            }
+            final BigDecimal scaled = bd.setScale(dt.getScale(), RoundingMode.HALF_UP);
+            ((org.apache.arrow.vector.DecimalVector) v).setSafe(idx, scaled);
+            return;
+        }
+
+        throw new TableException(
+                "ProxyOperator cannot cast "
+                        + sourceType.asSerializableString()
+                        + " to "
+                        + targetType.asSerializableString());
+    }
+
+    private static boolean isStringRoot(LogicalTypeRoot root) {
+        return root == LogicalTypeRoot.CHAR || root == LogicalTypeRoot.VARCHAR;
+    }
+
+    private static boolean isTimestampRoot(LogicalTypeRoot root) {
+        return root == LogicalTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE
+                || root == LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE;
     }
 
     private static void writeFieldValue(FieldVector v, LogicalType type, RowData row, int pos, int idx) {
@@ -815,6 +1142,15 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         private final int maxFrameSize;
         private final Integer calcFieldIndex;
         private final String calcFieldName;
+        private final String functionClass;
+        private final String functionKind;
+        private final List<Integer> argFieldIndices;
+        private final List<String> argFieldNames;
+        private final List<String> argFieldTypes;
+        private final List<Integer> resultFieldIndices;
+        private final List<String> resultFieldNames;
+        private final List<String> resultFieldTypes;
+        private final List<Integer> resultUdfFieldIndices;
 
         // re-used knobs (interpreted for Arrow)
         private final boolean flushOnWrite; // if true, flush after each append (low latency, low throughput)
@@ -833,6 +1169,15 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 int batchMaxRows,
                 Integer calcFieldIndex,
                 String calcFieldName,
+                String functionClass,
+                String functionKind,
+                List<Integer> argFieldIndices,
+                List<String> argFieldNames,
+                List<String> argFieldTypes,
+                List<Integer> resultFieldIndices,
+                List<String> resultFieldNames,
+                List<String> resultFieldTypes,
+                List<Integer> resultUdfFieldIndices,
                 boolean reorderResponses,
                 int reorderMaxBuffer,
                 List<ProxyEndpoint> proxies,
@@ -846,6 +1191,15 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             this.batchMaxRows = batchMaxRows;
             this.calcFieldIndex = calcFieldIndex;
             this.calcFieldName = calcFieldName;
+            this.functionClass = functionClass;
+            this.functionKind = functionKind;
+            this.argFieldIndices = argFieldIndices;
+            this.argFieldNames = argFieldNames;
+            this.argFieldTypes = argFieldTypes;
+            this.resultFieldIndices = resultFieldIndices;
+            this.resultFieldNames = resultFieldNames;
+            this.resultFieldTypes = resultFieldTypes;
+            this.resultUdfFieldIndices = resultUdfFieldIndices;
             this.reorderResponses = reorderResponses;
             this.reorderMaxBuffer = reorderMaxBuffer;
             this.proxies = proxies;
@@ -865,6 +1219,15 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             final int batchMaxRows = parseInt(map.get("batchmaxrows"), DEFAULT_BATCH_MAX_ROWS);
             final Integer calcFieldIndex = parseInt(map.get("calcfieldindex"));
             final String calcFieldName = map.get("calcfieldname");
+            final String functionClass = firstNonNull(map, "class", "functionclass");
+            final String functionKind = firstNonNull(map, "type", "functionkind");
+            final List<Integer> argFieldIndices = parseIntList(map.get("argfieldindices"));
+            final List<String> argFieldNames = parseStringList(map.get("argfieldnames"));
+            final List<String> argFieldTypes = parseStringList(map.get("argfieldtypes"));
+            final List<Integer> resultFieldIndices = parseIntList(map.get("resultfieldindices"));
+            final List<String> resultFieldNames = parseStringList(map.get("resultfieldnames"));
+            final List<String> resultFieldTypes = parseStringList(map.get("resultfieldtypes"));
+            final List<Integer> resultUdfFieldIndices = parseIntList(map.get("resultudffieldindices"));
             final boolean reorderResponses = parseBoolean(firstNonNull(map, "reorder", "correlate"), false);
             final int reorderMaxBuffer = parseInt(map.get("reordermax"), DEFAULT_REORDER_MAX_BUFFER);
 
@@ -881,6 +1244,15 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                     batchMaxRows,
                     calcFieldIndex,
                     calcFieldName,
+                    functionClass,
+                    functionKind,
+                    argFieldIndices,
+                    argFieldNames,
+                    argFieldTypes,
+                    resultFieldIndices,
+                    resultFieldNames,
+                    resultFieldTypes,
+                    resultUdfFieldIndices,
                     reorderResponses,
                     reorderMaxBuffer,
                     proxies,
@@ -975,6 +1347,36 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 return null;
             }
             return Integer.parseInt(value);
+        }
+
+        private static List<Integer> parseIntList(String value) {
+            final List<Integer> result = new ArrayList<>();
+            if (value == null || value.isEmpty()) {
+                return result;
+            }
+            final String[] parts = value.split(",");
+            for (String part : parts) {
+                final String trimmed = part.trim();
+                if (!trimmed.isEmpty()) {
+                    result.add(Integer.parseInt(trimmed));
+                }
+            }
+            return result;
+        }
+
+        private static List<String> parseStringList(String value) {
+            final List<String> result = new ArrayList<>();
+            if (value == null || value.isEmpty()) {
+                return result;
+            }
+            final String[] parts = value.split(",");
+            for (String part : parts) {
+                final String trimmed = part.trim();
+                if (!trimmed.isEmpty()) {
+                    result.add(URLDecoder.decode(trimmed, StandardCharsets.UTF_8));
+                }
+            }
+            return result;
         }
 
         private static int parseInt(String value, int defaultValue) {

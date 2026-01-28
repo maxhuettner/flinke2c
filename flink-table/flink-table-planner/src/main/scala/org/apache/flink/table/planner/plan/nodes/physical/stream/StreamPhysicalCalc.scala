@@ -19,6 +19,7 @@ package org.apache.flink.table.planner.plan.nodes.physical.stream
 
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory
 import org.apache.flink.table.planner.plan.nodes.exec.{ExecNode, InputProperty}
+import org.apache.flink.table.planner.plan.nodes.exec.common.CommonExecCalc
 import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecCalc
 import org.apache.flink.table.planner.utils.ShortcutUtils.unwrapTableConfig
 import org.apache.flink.table.api.TableException
@@ -62,8 +63,22 @@ class StreamPhysicalCalc(
       projection.size,
       condition != null)
 
-    val rewriter = new StreamPhysicalCalc.ProxyScalarFunctionRewriter(inputRel.getRowType)
-    val rewrittenProjection = projection.map(_.accept(rewriter))
+    val tableConfig = unwrapTableConfig(this)
+    val proxyFunctionClass =
+      tableConfig.getOptional(CommonExecCalc.PROXY_FUNCTION_CLASS_OPTION)
+        .orElse(CommonExecCalc.CUSTOM_PROXY_FUNCTION_CLASS_NAME)
+
+    val rewriter =
+      new StreamPhysicalCalc.ProxyScalarFunctionRewriter(
+        inputRel.getRowType,
+        getRowType,
+        proxyFunctionClass)
+    val rewrittenProjection = projection.zipWithIndex.map {
+      case (node, idx) =>
+        rewriter.setCurrentOutputFieldIndex(idx)
+        node.accept(rewriter)
+    }
+    rewriter.setCurrentOutputFieldIndex(-1)
     val rewrittenCondition = if (condition != null) {
       condition.accept(rewriter)
     } else {
@@ -73,11 +88,19 @@ class StreamPhysicalCalc(
       s"StreamPhysicalCalc proxy rewrite: hasProxyFunction=${rewriter.hasProxyFunction}, " +
         s"proxyConfPresent=${!rewriter.getProxyConf.isEmpty}, " +
         s"proxyFieldIndex=${rewriter.getProxyFieldIndex.orNull}, " +
-        s"proxyFieldName=${rewriter.getProxyFieldName}")
+        s"proxyFieldName=${rewriter.getProxyFieldName}, " +
+        s"proxyFunctionClass=${rewriter.getProxyFunctionClass}, " +
+        s"proxyFunctionKind=${rewriter.getProxyFunctionKind}, " +
+        s"proxyArgFieldIndices=${rewriter.getProxyArgFieldIndices}, " +
+        s"proxyResultFieldIndices=${rewriter.getProxyResultFieldIndices}")
 
     if (rewriter.hasProxyFunction) {
       StreamPhysicalCalc.LOG.info(
-        "Proxy rewrite matched scalar UDF in StreamPhysicalCalc, conf={}",
+        "Proxy rewrite matched function in StreamPhysicalCalc: functionClass={}, functionKind={}, argFieldIndices={}, resultFieldIndices={}, conf={}",
+        rewriter.getProxyFunctionClass,
+        rewriter.getProxyFunctionKind,
+        rewriter.getProxyArgFieldIndices,
+        rewriter.getProxyResultFieldIndices,
         rewriter.getProxyConf)
       new StreamExecCalc(
         unwrapTableConfig(this),
@@ -88,7 +111,16 @@ class StreamPhysicalCalc(
         getRelDetailedDescription,
         rewriter.getProxyConf,
         rewriter.getProxyFieldIndex.orNull,
-        rewriter.getProxyFieldName)
+        rewriter.getProxyFieldName,
+        rewriter.getProxyFunctionClass,
+        rewriter.getProxyFunctionKind,
+        rewriter.getProxyArgFieldIndices,
+        rewriter.getProxyArgFieldNames,
+        rewriter.getProxyArgFieldTypes,
+        rewriter.getProxyResultFieldIndices,
+        rewriter.getProxyResultFieldNames,
+        rewriter.getProxyResultFieldTypes,
+        rewriter.getProxyResultUdfFieldIndices)
     } else {
       new StreamExecCalc(
         unwrapTableConfig(this),
@@ -106,10 +138,8 @@ private object StreamPhysicalCalc {
   private val source = String.valueOf(classOf[StreamPhysicalCalc].getProtectionDomain.getCodeSource)
   LOG.warn("StreamPhysicalCalc object loaded from {}", source)
   System.err.println("StreamPhysicalCalc object loaded from " + source)
-  private val CustomProxyFunctionName = "CurrencyConversionFunction"
-  private val CustomProxyFunctionClassName = "org.example.flinke2c.CurrencyConversionFunction"
 
-  private def matchesOperatorName(name: String): Boolean = {
+  private def matchesOperatorName(name: String, targetSimpleName: String): Boolean = {
     if (name == null) {
       return false
     }
@@ -118,52 +148,56 @@ private object StreamPhysicalCalc {
       return false
     }
     val normalized = trimmed.replace("\"", "").replace("`", "")
-    if (normalized.equalsIgnoreCase(CustomProxyFunctionName)) {
+    if (targetSimpleName != null && normalized.equalsIgnoreCase(targetSimpleName)) {
       return true
     }
     val lastDot = normalized.lastIndexOf('.')
     if (lastDot >= 0 && lastDot < normalized.length - 1) {
       val simple = normalized.substring(lastDot + 1)
-      if (simple.equalsIgnoreCase(CustomProxyFunctionName)) {
+      if (targetSimpleName != null && simple.equalsIgnoreCase(targetSimpleName)) {
         return true
       }
     }
     val suffixIndex = normalized.indexOf('$')
     if (suffixIndex > 0) {
-      return normalized.substring(0, suffixIndex).equalsIgnoreCase(CustomProxyFunctionName)
+      return targetSimpleName != null &&
+        normalized.substring(0, suffixIndex).equalsIgnoreCase(targetSimpleName)
     }
     false
   }
 
-  private def matchesDefinition(definition: FunctionDefinition): Boolean = {
+  private def matchesDefinition(definition: FunctionDefinition, targetClassName: String): Boolean = {
     if (definition == null) {
       return false
     }
     definition match {
       case scalarDef: ScalarFunctionDefinition =>
-        CustomProxyFunctionClassName == scalarDef.getScalarFunction.getClass.getName
+        targetClassName == scalarDef.getScalarFunction.getClass.getName
       case scalar: ScalarFunction =>
-        CustomProxyFunctionClassName == scalar.getClass.getName
+        targetClassName == scalar.getClass.getName
       case _ => false
     }
   }
 
-  private def isProxyScalarFunction(call: RexCall): Boolean = {
+  private def isProxyScalarFunction(
+      call: RexCall,
+      targetClassName: String,
+      targetSimpleName: String): Boolean = {
     val operator = call.getOperator
-    if (matchesOperatorName(operator.getName)) {
+    if (matchesOperatorName(operator.getName, targetSimpleName)) {
       return true
     }
     operator match {
       case scalar: ScalarSqlFunction =>
-        CustomProxyFunctionClassName == scalar.scalarFunction.getClass.getName
+        targetClassName == scalar.scalarFunction.getClass.getName
       case bridging: BridgingSqlFunction =>
         val identifier = bridging.getResolvedFunction.getIdentifier
         val identifierName =
           if (identifier.isPresent) identifier.get.getFunctionName else null
-        if (matchesOperatorName(identifierName)) {
+        if (matchesOperatorName(identifierName, targetSimpleName)) {
           return true
         }
-        matchesDefinition(bridging.getDefinition)
+        matchesDefinition(bridging.getDefinition, targetClassName)
       case _ => false
     }
   }
@@ -241,6 +275,9 @@ private object StreamPhysicalCalc {
       return None
     }
     val fields = inputType.getFieldList
+    if (fields == null) {
+      return None
+    }
     if (fieldIndex < 0 || fieldIndex >= fields.size()) {
       None
     } else {
@@ -248,37 +285,131 @@ private object StreamPhysicalCalc {
     }
   }
 
-  private class ProxyScalarFunctionRewriter(inputType: RelDataType) extends RexShuttle {
+  private def resolveFieldType(inputType: RelDataType, fieldIndex: Integer): Option[String] = {
+    if (inputType == null || fieldIndex == null) {
+      return None
+    }
+    val fields = inputType.getFieldList
+    if (fields == null) {
+      return None
+    }
+    if (fieldIndex < 0 || fieldIndex >= fields.size()) {
+      None
+    } else {
+      val logicalType = FlinkTypeFactory.toLogicalType(fields.get(fieldIndex).getType)
+      Option(logicalType.asSerializableString)
+    }
+  }
+
+  private def resolveOperandType(
+      operand: RexNode,
+      inputType: RelDataType,
+      fieldIndex: Integer): Option[String] = {
+    operand match {
+      case call: RexCall if call.getKind == SqlKind.CAST || call.getKind == SqlKind.AS =>
+        Option(FlinkTypeFactory.toLogicalType(call.getType).asSerializableString)
+      case fieldAccess: RexFieldAccess =>
+        fieldAccess.getReferenceExpr match {
+          case refCall: RexCall if refCall.getKind == SqlKind.CAST || refCall.getKind == SqlKind.AS =>
+            Option(FlinkTypeFactory.toLogicalType(refCall.getType).asSerializableString)
+          case _ =>
+            resolveFieldType(inputType, fieldIndex)
+        }
+      case _ =>
+        resolveFieldType(inputType, fieldIndex)
+    }
+  }
+
+  private class ProxyScalarFunctionRewriter(
+      inputType: RelDataType,
+      outputType: RelDataType,
+      targetClassName: String)
+    extends RexShuttle {
+    private val targetSimpleName = deriveSimpleName(targetClassName)
     private var proxyFunctionFound = false
     private var proxyConf: String = null
     private var proxyFieldIndex: Integer = null
     private var proxyFieldName: String = null
+    private var proxyFunctionClass: String = null
+    private var proxyFunctionKind: String = null
+    private var currentOutputFieldIndex: Int = -1
+    private var currentUdfFieldIndexOverride: Integer = null
+    private val proxyArgFieldIndices = new java.util.ArrayList[Integer]()
+    private val proxyArgFieldNames = new java.util.ArrayList[String]()
+    private val proxyArgFieldTypes = new java.util.ArrayList[String]()
+    private val proxyResultFieldIndices = new java.util.ArrayList[Integer]()
+    private val proxyResultFieldNames = new java.util.ArrayList[String]()
+    private val proxyResultFieldTypes = new java.util.ArrayList[String]()
+    private val proxyResultUdfFieldIndices = new java.util.ArrayList[Integer]()
+
+    def setCurrentOutputFieldIndex(idx: Int): Unit = {
+      currentOutputFieldIndex = idx
+    }
+
+    override def visitFieldAccess(fieldAccess: RexFieldAccess): RexNode = {
+      val proxyCall = unwrapProxyCall(fieldAccess.getReferenceExpr)
+      if (proxyCall == null || fieldAccess.getField == null) {
+        return super.visitFieldAccess(fieldAccess)
+      }
+      currentUdfFieldIndexOverride = fieldAccess.getField.getIndex
+      try {
+        // Drop the field access from the rewritten expression. The external proxy
+        // will extract the correct field based on the recorded udfFieldIndex.
+        proxyCall.accept(this)
+      } finally {
+        currentUdfFieldIndexOverride = null
+      }
+    }
 
     override def visitCall(call: RexCall): RexNode = {
-      if (!isProxyScalarFunction(call)) {
+      if (!isProxyScalarFunction(call, targetClassName, targetSimpleName)) {
         return super.visitCall(call)
       }
       val operands = call.getOperands
       if (operands.isEmpty) {
         throw new TableException("Proxy scalar function requires at least one argument.")
       }
-      val operand = operands.get(0)
-      if (!isSupportedProxyOperand(operand)) {
-        throw new TableException(
-          "Proxy scalar function requires a column reference as its first argument.")
-      }
       proxyFunctionFound = true
       proxyConf = mergeProxyConf(proxyConf, extractProxyConf(operands))
-      extractProxyFieldIndex(operand).foreach { idx =>
-        if (proxyFieldIndex == null) {
-          proxyFieldIndex = idx
-          proxyFieldName = resolveFieldName(inputType, idx).orNull
-        } else if (proxyFieldIndex != idx) {
-          throw new TableException(
-            "Proxy scalar function requires a single, consistent input field.")
+      proxyFunctionClass = targetClassName
+      proxyFunctionKind = CommonExecCalc.PROXY_FUNCTION_KIND_SCALAR
+      var foundFieldArg = false
+      var firstFieldOperand: RexNode = null
+      var firstFieldIndex: Integer = null
+      val iterator = operands.iterator()
+      while (iterator.hasNext) {
+        val operand = iterator.next()
+        if (!(operand.isInstanceOf[RexLiteral] || operand.getKind == SqlKind.DEFAULT)) {
+          if (!isSupportedProxyOperand(operand)) {
+            throw new TableException(
+              "Proxy scalar function requires column references for all non-literal arguments.")
+          }
+          extractProxyFieldIndex(operand) match {
+            case Some(idx) =>
+              proxyArgFieldIndices.add(idx)
+              proxyArgFieldNames.add(resolveFieldName(inputType, idx).orNull)
+              proxyArgFieldTypes.add(resolveOperandType(operand, inputType, idx).orNull)
+              if (proxyFieldIndex == null) {
+                proxyFieldIndex = idx
+                proxyFieldName = resolveFieldName(inputType, idx).orNull
+              }
+              if (firstFieldOperand == null) {
+                firstFieldOperand = operand
+                firstFieldIndex = idx
+              }
+              foundFieldArg = true
+            case None =>
+              throw new TableException(
+                "Proxy scalar function requires input references as arguments.")
+          }
         }
       }
-      operand.accept(this)
+      if (!foundFieldArg) {
+        throw new TableException(
+          "Proxy scalar function requires at least one column reference argument.")
+      }
+      addResultField(currentUdfFieldIndexOverride, firstFieldIndex)
+      firstFieldOperand.accept(this)
     }
 
     def hasProxyFunction: Boolean = proxyFunctionFound
@@ -288,5 +419,60 @@ private object StreamPhysicalCalc {
     def getProxyFieldIndex: Option[Integer] = Option(proxyFieldIndex)
 
     def getProxyFieldName: String = if (proxyFieldName == null) "" else proxyFieldName
+
+    def getProxyFunctionClass: String = if (proxyFunctionClass == null) "" else proxyFunctionClass
+
+    def getProxyFunctionKind: String = if (proxyFunctionKind == null) "" else proxyFunctionKind
+
+    def getProxyArgFieldIndices: java.util.List[Integer] = proxyArgFieldIndices
+
+    def getProxyArgFieldNames: java.util.List[String] = proxyArgFieldNames
+
+    def getProxyArgFieldTypes: java.util.List[String] = proxyArgFieldTypes
+
+    def getProxyResultFieldIndices: java.util.List[Integer] = proxyResultFieldIndices
+
+    def getProxyResultFieldNames: java.util.List[String] = proxyResultFieldNames
+
+    def getProxyResultFieldTypes: java.util.List[String] = proxyResultFieldTypes
+
+    def getProxyResultUdfFieldIndices: java.util.List[Integer] = proxyResultUdfFieldIndices
+
+    private def addResultField(udfFieldIndex: Integer, targetFieldIndex: Integer): Unit = {
+      if (currentOutputFieldIndex < 0) {
+        return
+      }
+      if (targetFieldIndex == null || targetFieldIndex < 0) {
+        return
+      }
+      if (proxyResultFieldIndices.contains(targetFieldIndex: Integer)) {
+        return
+      }
+      proxyResultFieldIndices.add(targetFieldIndex)
+      proxyResultFieldNames.add(resolveFieldName(outputType, currentOutputFieldIndex).orNull)
+      proxyResultFieldTypes.add(resolveFieldType(outputType, currentOutputFieldIndex).orNull)
+      proxyResultUdfFieldIndices.add(if (udfFieldIndex == null) -1 else udfFieldIndex)
+    }
+
+    private def unwrapProxyCall(node: RexNode): RexCall = {
+      node match {
+        case call: RexCall =>
+          if (isProxyScalarFunction(call, targetClassName, targetSimpleName)) {
+            call
+          } else if (call.getKind == SqlKind.CAST || call.getKind == SqlKind.AS) {
+            unwrapProxyCall(call.getOperands.get(0))
+          } else {
+            null
+          }
+        case _ => null
+      }
+    }
+
+    private def deriveSimpleName(className: String): String = {
+      val lastDot = className.lastIndexOf('.')
+      val base = if (lastDot < 0) className else className.substring(lastDot + 1)
+      val suffixIndex = base.indexOf('$')
+      if (suffixIndex > 0) base.substring(0, suffixIndex) else base
+    }
   }
 }
