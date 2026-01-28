@@ -21,8 +21,6 @@ package org.apache.flink.table.planner.plan.nodes.exec.stream;
 import org.apache.flink.FlinkVersion;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
-import org.apache.flink.streaming.api.operators.ChainingStrategy;
-import org.apache.flink.streaming.api.transformations.PhysicalTransformation;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.planner.codegen.CalcCodeGenerator;
@@ -71,10 +69,29 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
     public static final String FIELD_NAME_PROXY_CONF = "proxyConf";
     public static final String FIELD_NAME_PROXY_FIELD_INDEX = "proxyFieldIndex";
     public static final String FIELD_NAME_PROXY_FIELD_NAME = "proxyFieldName";
+    public static final String FIELD_NAME_PROXY_FUNCTION_CLASS = "proxyFunctionClass";
+    public static final String FIELD_NAME_PROXY_FUNCTION_KIND = "proxyFunctionKind";
+    public static final String FIELD_NAME_PROXY_ARG_FIELD_INDICES = "proxyArgFieldIndices";
+    public static final String FIELD_NAME_PROXY_ARG_FIELD_NAMES = "proxyArgFieldNames";
+    public static final String FIELD_NAME_PROXY_ARG_FIELD_TYPES = "proxyArgFieldTypes";
+    public static final String FIELD_NAME_PROXY_RESULT_FIELD_INDICES = "proxyResultFieldIndices";
+    public static final String FIELD_NAME_PROXY_RESULT_FIELD_NAMES = "proxyResultFieldNames";
+    public static final String FIELD_NAME_PROXY_RESULT_FIELD_TYPES = "proxyResultFieldTypes";
+    public static final String FIELD_NAME_PROXY_RESULT_UDF_FIELD_INDICES =
+            "proxyResultUdfFieldIndices";
 
     private final @Nullable String proxyConf;
     private final @Nullable Integer proxyFieldIndex;
     private final @Nullable String proxyFieldName;
+    private final @Nullable String proxyFunctionClass;
+    private final @Nullable String proxyFunctionKind;
+    private final @Nullable List<Integer> proxyArgFieldIndices;
+    private final @Nullable List<String> proxyArgFieldNames;
+    private final @Nullable List<String> proxyArgFieldTypes;
+    private final @Nullable List<Integer> proxyResultFieldIndices;
+    private final @Nullable List<String> proxyResultFieldNames;
+    private final @Nullable List<String> proxyResultFieldTypes;
+    private final @Nullable List<Integer> proxyResultUdfFieldIndices;
 
     static {
         final String source =
@@ -101,6 +118,15 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 description,
                 null,
                 null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
                 null);
     }
 
@@ -123,6 +149,15 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 description,
                 proxyConf,
                 null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
                 null);
     }
 
@@ -135,7 +170,16 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             String description,
             @Nullable String proxyConf,
             @Nullable Integer proxyFieldIndex,
-            @Nullable String proxyFieldName) {
+            @Nullable String proxyFieldName,
+            @Nullable String proxyFunctionClass,
+            @Nullable String proxyFunctionKind,
+            @Nullable List<Integer> proxyArgFieldIndices,
+            @Nullable List<String> proxyArgFieldNames,
+            @Nullable List<String> proxyArgFieldTypes,
+            @Nullable List<Integer> proxyResultFieldIndices,
+            @Nullable List<String> proxyResultFieldNames,
+            @Nullable List<String> proxyResultFieldTypes,
+            @Nullable List<Integer> proxyResultUdfFieldIndices) {
         this(
                 ExecNodeContext.newNodeId(),
                 ExecNodeContext.newContext(StreamExecCalc.class),
@@ -147,7 +191,16 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 description,
                 proxyConf,
                 proxyFieldIndex,
-                proxyFieldName);
+                proxyFieldName,
+                proxyFunctionClass,
+                proxyFunctionKind,
+                proxyArgFieldIndices,
+                proxyArgFieldNames,
+                proxyArgFieldTypes,
+                proxyResultFieldIndices,
+                proxyResultFieldNames,
+                proxyResultFieldTypes,
+                proxyResultUdfFieldIndices);
     }
 
     @JsonCreator
@@ -162,7 +215,23 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             @JsonProperty(FIELD_NAME_DESCRIPTION) String description,
             @JsonProperty(FIELD_NAME_PROXY_CONF) @Nullable String proxyConf,
             @JsonProperty(FIELD_NAME_PROXY_FIELD_INDEX) @Nullable Integer proxyFieldIndex,
-            @JsonProperty(FIELD_NAME_PROXY_FIELD_NAME) @Nullable String proxyFieldName) {
+            @JsonProperty(FIELD_NAME_PROXY_FIELD_NAME) @Nullable String proxyFieldName,
+            @JsonProperty(FIELD_NAME_PROXY_FUNCTION_CLASS) @Nullable String proxyFunctionClass,
+            @JsonProperty(FIELD_NAME_PROXY_FUNCTION_KIND) @Nullable String proxyFunctionKind,
+            @JsonProperty(FIELD_NAME_PROXY_ARG_FIELD_INDICES)
+                    @Nullable List<Integer> proxyArgFieldIndices,
+            @JsonProperty(FIELD_NAME_PROXY_ARG_FIELD_NAMES)
+                    @Nullable List<String> proxyArgFieldNames,
+            @JsonProperty(FIELD_NAME_PROXY_ARG_FIELD_TYPES)
+                    @Nullable List<String> proxyArgFieldTypes,
+            @JsonProperty(FIELD_NAME_PROXY_RESULT_FIELD_INDICES)
+                    @Nullable List<Integer> proxyResultFieldIndices,
+            @JsonProperty(FIELD_NAME_PROXY_RESULT_FIELD_NAMES)
+                    @Nullable List<String> proxyResultFieldNames,
+            @JsonProperty(FIELD_NAME_PROXY_RESULT_FIELD_TYPES)
+                    @Nullable List<String> proxyResultFieldTypes,
+            @JsonProperty(FIELD_NAME_PROXY_RESULT_UDF_FIELD_INDICES)
+                    @Nullable List<Integer> proxyResultUdfFieldIndices) {
         super(
                 id,
                 context,
@@ -177,14 +246,27 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
         this.proxyConf = proxyConf;
         this.proxyFieldIndex = proxyFieldIndex;
         this.proxyFieldName = proxyFieldName;
+        this.proxyFunctionClass = proxyFunctionClass;
+        this.proxyFunctionKind = proxyFunctionKind;
+        this.proxyArgFieldIndices = proxyArgFieldIndices;
+        this.proxyArgFieldNames = proxyArgFieldNames;
+        this.proxyArgFieldTypes = proxyArgFieldTypes;
+        this.proxyResultFieldIndices = proxyResultFieldIndices;
+        this.proxyResultFieldNames = proxyResultFieldNames;
+        this.proxyResultFieldTypes = proxyResultFieldTypes;
+        this.proxyResultUdfFieldIndices = proxyResultUdfFieldIndices;
         LOG.info(
-                "StreamExecCalc ctor: id={}, projectionSize={}, conditionPresent={}, proxyConfPresent={}, proxyFieldIndex={}, proxyFieldName={}",
+                "StreamExecCalc ctor: id={}, projectionSize={}, conditionPresent={}, proxyConfPresent={}, proxyFieldIndex={}, proxyFieldName={}, proxyFunctionClass={}, proxyFunctionKind={}, proxyArgFieldIndices={}, proxyResultFieldIndices={}",
                 id,
                 projection.size(),
                 condition != null,
                 proxyConf != null,
                 proxyFieldIndex,
-                proxyFieldName);
+                proxyFieldName,
+                proxyFunctionClass,
+                proxyFunctionKind,
+                proxyArgFieldIndices,
+                proxyResultFieldIndices);
     }
 
     @SuppressWarnings("unchecked")
@@ -200,12 +282,28 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
         final ExecEdge inputEdge = getInputEdges().get(0);
         final Transformation<RowData> inputTransform =
                 (Transformation<RowData>) inputEdge.translateToPlan(planner);
+        final RowType inputRowType = extractRowType(inputTransform);
+        final RowType outputRowType = (RowType) getOutputType();
 
-        final ProxyScalarFunctionRewriter rewriter = new ProxyScalarFunctionRewriter();
+        final String resolvedProxyFunctionClass =
+                proxyFunctionClass != null && !proxyFunctionClass.isEmpty()
+                        ? proxyFunctionClass
+                        : config.getOptional(PROXY_FUNCTION_CLASS_OPTION)
+                                .orElse(CUSTOM_PROXY_FUNCTION_CLASS_NAME);
+        final String resolvedProxyFunctionKind =
+                proxyFunctionKind != null && !proxyFunctionKind.isEmpty()
+                        ? proxyFunctionKind
+                        : PROXY_FUNCTION_KIND_SCALAR;
+
+        final ProxyScalarFunctionRewriter rewriter =
+                new ProxyScalarFunctionRewriter(
+                        resolvedProxyFunctionClass, inputRowType, outputRowType);
         final List<RexNode> rewrittenProjection = new ArrayList<>(projection.size());
-        for (RexNode node : projection) {
-            rewrittenProjection.add(node.accept(rewriter));
+        for (int i = 0; i < projection.size(); i++) {
+            rewriter.setCurrentOutputFieldIndex(i);
+            rewrittenProjection.add(projection.get(i).accept(rewriter));
         }
+        rewriter.setCurrentOutputFieldIndex(-1);
         final @Nullable RexNode rewrittenCondition =
                 condition == null ? null : condition.accept(rewriter);
 
@@ -222,8 +320,39 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
         final @Nullable RexNode effectiveCondition =
                 hasProxyFunction ? rewrittenCondition : condition;
         final @Nullable String resolvedProxyConf;
+        @Nullable List<String> resolvedResultFieldTypes = null;
+        @Nullable List<Integer> resolvedResultFieldIndices = null;
         if (useProxyOperators) {
             String proxyConfValue = rewriter.getProxyConf();
+
+            final List<Integer> resolvedArgFieldIndices =
+                    proxyArgFieldIndices != null
+                            ? proxyArgFieldIndices
+                            : rewriter.getProxyArgFieldIndices();
+            final List<String> resolvedArgFieldNames =
+                    proxyArgFieldNames != null
+                            ? proxyArgFieldNames
+                            : rewriter.getProxyArgFieldNames();
+            final List<String> resolvedArgFieldTypes =
+                    proxyArgFieldTypes != null
+                            ? proxyArgFieldTypes
+                            : rewriter.getProxyArgFieldTypes();
+            final List<String> resolvedResultFieldNames =
+                    proxyResultFieldNames != null
+                            ? proxyResultFieldNames
+                            : rewriter.getProxyResultFieldNames();
+            resolvedResultFieldTypes =
+                    proxyResultFieldTypes != null
+                            ? proxyResultFieldTypes
+                            : rewriter.getProxyResultFieldTypes();
+            resolvedResultFieldIndices =
+                    proxyResultFieldIndices != null
+                            ? proxyResultFieldIndices
+                            : rewriter.getProxyResultFieldIndices();
+            final List<Integer> resolvedResultUdfFieldIndices =
+                    proxyResultUdfFieldIndices != null
+                            ? proxyResultUdfFieldIndices
+                            : rewriter.getProxyResultUdfFieldIndices();
             if (proxyConf != null && !proxyConf.isEmpty()) {
                 if (proxyConfValue.isEmpty()) {
                     proxyConfValue = proxyConf;
@@ -243,14 +372,47 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 proxyConfValue =
                         appendProxyField(proxyConfValue, proxyFieldIndex, proxyFieldName);
             }
+            proxyConfValue =
+                    appendProxyFunctionMetadata(
+                            proxyConfValue, resolvedProxyFunctionClass, resolvedProxyFunctionKind);
+            proxyConfValue =
+                    appendProxyFunctionArgsMetadata(
+                            proxyConfValue,
+                            resolvedArgFieldIndices,
+                            resolvedArgFieldNames,
+                            resolvedArgFieldTypes);
+            proxyConfValue =
+                    appendProxyFunctionResultMetadata(
+                            proxyConfValue,
+                            resolvedResultFieldIndices,
+                            resolvedResultFieldNames,
+                            resolvedResultFieldTypes,
+                            resolvedResultUdfFieldIndices);
             LOG.info(
-                    "Proxy rewrite injecting pre/post operators for scalar UDF: {}, conf={}",
-                    CUSTOM_PROXY_FUNCTION_NAME,
+                    "Proxy rewrite injecting pre/post operators: functionClass={}, functionKind={}, argFieldIndices={}, resultFieldIndices={}, conf={}",
+                    resolvedProxyFunctionClass,
+                    resolvedProxyFunctionKind,
+                    resolvedArgFieldIndices,
+                    resolvedResultFieldIndices,
                     proxyConfValue);
             resolvedProxyConf = proxyConfValue;
         } else {
             resolvedProxyConf = null;
         }
+
+        final RowType proxyOutputRowType =
+                resolvedProxyConf != null
+                        ? applyResultTypes(
+                                inputRowType,
+                                resolvedResultFieldIndices,
+                                resolvedResultFieldTypes,
+                                planner.getFlinkContext().getClassLoader())
+                        : inputRowType;
+
+        final Transformation<RowData> proxyInputTransform =
+                resolvedProxyConf != null
+                        ? createProxyChain(inputTransform, resolvedProxyConf, config, proxyOutputRowType)
+                        : inputTransform;
 
         final CodeGeneratorContext ctx =
                 new CodeGeneratorContext(config, planner.getFlinkContext().getClassLoader())
@@ -259,7 +421,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
         final CodeGenOperatorFactory<RowData> substituteStreamOperator =
                 CalcCodeGenerator.generateCalcOperator(
                         ctx,
-                        inputTransform,
+                        proxyInputTransform,
                         (RowType) getOutputType(),
                         JavaScalaConversionUtil.toScala(effectiveProjection),
                         JavaScalaConversionUtil.toScala(Optional.ofNullable(effectiveCondition)),
@@ -267,19 +429,12 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                         getClass().getSimpleName());
         final Transformation<RowData> calcTransform =
                 ExecNodeUtil.createOneInputTransformation(
-                        inputTransform,
+                        proxyInputTransform,
                         createTransformationMeta(CALC_TRANSFORMATION, config),
                         substituteStreamOperator,
                         InternalTypeInfo.of(getOutputType()),
-                        inputTransform.getParallelism(),
+                        proxyInputTransform.getParallelism(),
                         false);
-        if (resolvedProxyConf != null) {
-            if (config.get(PROXY_CHAIN_ONLY_OPTION) && calcTransform instanceof PhysicalTransformation) {
-                ((PhysicalTransformation<?>) calcTransform)
-                        .setChainingStrategy(ChainingStrategy.HEAD);
-            }
-            return createProxyChain(calcTransform, resolvedProxyConf, config);
-        }
         return calcTransform;
     }
 
@@ -294,37 +449,5 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             result = appendConfValue(result, "calcFieldName", fieldName);
         }
         return result;
-    }
-
-    private static boolean containsConfKey(String conf, String keyLower) {
-        if (conf == null || conf.isEmpty()) {
-            return false;
-        }
-        final String[] parts = conf.split(";");
-        for (String part : parts) {
-            final String trimmed = part.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            final int idx = trimmed.indexOf('=');
-            if (idx <= 0) {
-                continue;
-            }
-            final String k = trimmed.substring(0, idx).trim().toLowerCase();
-            if (k.equals(keyLower)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static String appendConfValue(String conf, String key, String value) {
-        if (conf == null || conf.isEmpty()) {
-            return key + "=" + value;
-        }
-        if (conf.endsWith(";")) {
-            return conf + key + "=" + value;
-        }
-        return conf + ";" + key + "=" + value;
     }
 }
