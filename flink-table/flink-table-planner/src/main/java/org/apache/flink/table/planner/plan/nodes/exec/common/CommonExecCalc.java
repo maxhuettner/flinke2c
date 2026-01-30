@@ -63,6 +63,8 @@ import org.apache.calcite.sql.SqlKind;
 
 import org.apache.flink.table.functions.FunctionIdentifier;
 import org.apache.calcite.sql.SqlOperator;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeField;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
@@ -203,6 +205,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                             rewriter.getProxyResultFieldIndices(),
                             rewriter.getProxyResultFieldNames(),
                             rewriter.getProxyResultFieldTypes(),
+                            rewriter.getProxyResultUdfFieldTypes(),
                             rewriter.getProxyResultUdfFieldIndices());
             LOG.info(
                     "Proxy rewrite injecting pre/post operators for scalar UDF: functionClass={}, functionKind={}, resultFieldIndices={}, conf={}",
@@ -415,6 +418,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             @Nullable List<Integer> resultFieldIndices,
             @Nullable List<String> resultFieldNames,
             @Nullable List<String> resultFieldTypes,
+            @Nullable List<String> resultUdfFieldTypes,
             @Nullable List<Integer> resultUdfFieldIndices) {
         String result = conf;
         if (resultFieldIndices != null
@@ -443,6 +447,15 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                             result,
                             "resultFieldTypes",
                             joinStringList(resultFieldTypes));
+        }
+        if (resultUdfFieldTypes != null
+                && !resultUdfFieldTypes.isEmpty()
+                && !containsConfKey(result, "resultudffieldtypes")) {
+            result =
+                    appendConfValue(
+                            result,
+                            "resultUdfFieldTypes",
+                            joinStringList(resultUdfFieldTypes));
         }
         if (resultUdfFieldIndices != null
                 && !resultUdfFieldIndices.isEmpty()
@@ -646,6 +659,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         private final List<String> proxyResultFieldNames = new ArrayList<>();
         private final List<String> proxyResultFieldTypes = new ArrayList<>();
         private final List<Integer> proxyResultUdfFieldIndices = new ArrayList<>();
+        private final List<String> proxyResultUdfFieldTypes = new ArrayList<>();
 
         public ProxyScalarFunctionRewriter(
                 String targetClassName, RowType inputRowType, RowType outputRowType) {
@@ -781,7 +795,8 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                 throw new TableException(
                         "Proxy scalar function requires at least one column reference argument.");
             }
-            addResultField(currentUdfFieldIndexOverride, firstFieldIndex);
+            final String udfReturnType = resolveUdfReturnType(call, currentUdfFieldIndexOverride);
+            addResultField(currentUdfFieldIndexOverride, firstFieldIndex, udfReturnType);
             return firstFieldOperand.accept(this);
         }
 
@@ -829,6 +844,10 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             return proxyResultUdfFieldIndices;
         }
 
+        public List<String> getProxyResultUdfFieldTypes() {
+            return proxyResultUdfFieldTypes;
+        }
+
         private static String deriveSimpleName(String className) {
             final int lastDot = className.lastIndexOf('.');
             String simple = lastDot < 0 ? className : className.substring(lastDot + 1);
@@ -845,7 +864,10 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             proxyArgFieldTypes.add(resolveFieldType(inputRowType, fieldIndex));
         }
 
-        private void addResultField(@Nullable Integer udfFieldIndex, @Nullable Integer targetFieldIndex) {
+        private void addResultField(
+                @Nullable Integer udfFieldIndex,
+                @Nullable Integer targetFieldIndex,
+                @Nullable String udfFieldType) {
             if (currentOutputFieldIndex < 0) {
                 return;
             }
@@ -859,6 +881,25 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             proxyResultFieldNames.add(resolveFieldName(outputRowType, currentOutputFieldIndex));
             proxyResultFieldTypes.add(resolveFieldType(outputRowType, currentOutputFieldIndex));
             proxyResultUdfFieldIndices.add(udfFieldIndex == null ? -1 : udfFieldIndex);
+            proxyResultUdfFieldTypes.add(udfFieldType);
+        }
+
+        private @Nullable String resolveUdfReturnType(
+                RexCall call, @Nullable Integer udfFieldIndex) {
+            if (call == null) {
+                return null;
+            }
+            final RelDataType relType = call.getType();
+            if (udfFieldIndex != null && udfFieldIndex >= 0 && relType != null) {
+                final List<RelDataTypeField> fields = relType.getFieldList();
+                if (fields != null && udfFieldIndex < fields.size()) {
+                    return FlinkTypeFactory.toLogicalType(fields.get(udfFieldIndex).getType())
+                            .asSerializableString();
+                }
+            }
+            return relType == null
+                    ? null
+                    : FlinkTypeFactory.toLogicalType(relType).asSerializableString();
         }
 
         private @Nullable RexCall unwrapProxyCall(RexNode node) {
