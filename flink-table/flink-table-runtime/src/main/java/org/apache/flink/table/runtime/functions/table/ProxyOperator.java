@@ -108,6 +108,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     private transient List<Integer> resultFieldIndices;
     private transient List<LogicalType> resultFieldTypes;
     private transient List<LogicalType> resultReadTypes;
+    private transient List<LogicalType> postFieldTypes;
     private transient RowData.FieldGetter[] resultFieldGetters;
     private transient RowData.FieldGetter[] fullRowFieldGetters;
 
@@ -159,8 +160,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     public void processElement(StreamRecord<RowData> element) throws Exception {
         if (side == Side.PRE) {
             appendRowToMsgPack(element.getValue());
-            // keep original behavior: forward input downstream unchanged
-            output.collect(element);
+        final RowData placeholder = createPlaceholderRow(element.getValue().getRowKind());
+        output.collect(element.replace(placeholder));
         } else {
             final RowData proxyRow;
             if (tcpConfig.reorderResponses) {
@@ -168,7 +169,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             } else {
                 proxyRow = readNextRow(element.getValue().getRowKind());
             }
-            final RowData outRow = mergeProxyRow(element.getValue(), proxyRow);
+            final RowData outRow = proxyRow;
             output.collect(element.replace(outRow));
         }
     }
@@ -179,7 +180,122 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         final int fieldCount = inputFields.size();
         final List<Integer> indices = new ArrayList<>();
 
-        if (tcpConfig.argFieldNames != null && !tcpConfig.argFieldNames.isEmpty()) {
+        for (int i = 0; i < fieldCount; i++) {
+            indices.add(i);
+        }
+        this.payloadFieldIndices = indices;
+        this.fieldTypes =
+                indices.stream()
+                        .map(i -> inputFields.get(i).getType())
+                        .collect(Collectors.toList());
+        this.payloadFieldNames = new ArrayList<>(indices.size());
+        for (int idx : indices) {
+            payloadFieldNames.add(inputFields.get(idx).getName());
+        }
+        final Map<Integer, LogicalType> argTypeByIndex = new HashMap<>();
+        if (tcpConfig.argFieldTypes != null && !tcpConfig.argFieldTypes.isEmpty()) {
+            final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
+            if (tcpConfig.argFieldIndices != null
+                    && !tcpConfig.argFieldIndices.isEmpty()
+                    && tcpConfig.argFieldIndices.size() == tcpConfig.argFieldTypes.size()) {
+                for (int i = 0; i < tcpConfig.argFieldIndices.size(); i++) {
+                    final Integer idx = tcpConfig.argFieldIndices.get(i);
+                    final String typeString = tcpConfig.argFieldTypes.get(i);
+                    if (idx == null || idx < 0 || idx >= fieldCount) {
+                        continue;
+                    }
+                    if (typeString == null || typeString.trim().isEmpty()) {
+                        continue;
+                    }
+                    argTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
+                }
+            } else if (tcpConfig.argFieldNames != null
+                    && !tcpConfig.argFieldNames.isEmpty()
+                    && tcpConfig.argFieldNames.size() == tcpConfig.argFieldTypes.size()) {
+                final Map<String, Integer> nameToIndex = new HashMap<>();
+                for (int i = 0; i < fieldCount; i++) {
+                    final String name = inputFields.get(i).getName();
+                    if (name != null) {
+                        nameToIndex.put(name.toLowerCase(Locale.ROOT), i);
+                    }
+                }
+                for (int i = 0; i < tcpConfig.argFieldNames.size(); i++) {
+                    final String name = tcpConfig.argFieldNames.get(i);
+                    final String typeString = tcpConfig.argFieldTypes.get(i);
+                    if (name == null || name.trim().isEmpty()) {
+                        continue;
+                    }
+                    final Integer idx = nameToIndex.get(name.toLowerCase(Locale.ROOT));
+                    if (idx == null || idx < 0 || idx >= fieldCount) {
+                        continue;
+                    }
+                    if (typeString == null || typeString.trim().isEmpty()) {
+                        continue;
+                    }
+                    argTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
+                }
+            }
+        }
+
+        this.payloadWriteTypes = new ArrayList<>(fieldCount);
+        for (int i = 0; i < fieldCount; i++) {
+            final LogicalType argType = argTypeByIndex.get(i);
+            if (argType != null) {
+                payloadWriteTypes.add(argType);
+            } else {
+                payloadWriteTypes.add(inputFields.get(i).getType());
+            }
+        }
+
+        this.resultFieldIndices = new ArrayList<>(resultFields.size());
+        for (int i = 0; i < resultFields.size(); i++) {
+            resultFieldIndices.add(i);
+        }
+        this.resultFieldTypes =
+                resultFieldIndices.stream()
+                        .map(i -> resultFields.get(i).getType())
+                        .collect(Collectors.toList());
+
+        final Map<Integer, LogicalType> udfTypeByIndex = new HashMap<>();
+        final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
+        boolean mappedByIndex = false;
+        if (tcpConfig.resultFieldIndices != null
+                && !tcpConfig.resultFieldIndices.isEmpty()
+                && tcpConfig.resultUdfFieldTypes != null
+                && tcpConfig.resultFieldIndices.size() == tcpConfig.resultUdfFieldTypes.size()) {
+            for (int i = 0; i < tcpConfig.resultFieldIndices.size(); i++) {
+                final Integer idx = tcpConfig.resultFieldIndices.get(i);
+                final String typeString = tcpConfig.resultUdfFieldTypes.get(i);
+                if (idx == null || idx < 0 || idx >= fieldCount) {
+                    continue;
+                }
+                if (typeString == null || typeString.trim().isEmpty()) {
+                    continue;
+                }
+                udfTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
+                mappedByIndex = true;
+            }
+        } else if (tcpConfig.resultUdfFieldIndices != null
+                && tcpConfig.resultUdfFieldTypes != null
+                && tcpConfig.resultUdfFieldIndices.size()
+                        == tcpConfig.resultUdfFieldTypes.size()) {
+            for (int i = 0; i < tcpConfig.resultUdfFieldIndices.size(); i++) {
+                final Integer idx = tcpConfig.resultUdfFieldIndices.get(i);
+                final String typeString = tcpConfig.resultUdfFieldTypes.get(i);
+                if (idx == null || idx < 0 || idx >= fieldCount) {
+                    continue;
+                }
+                if (typeString == null || typeString.trim().isEmpty()) {
+                    continue;
+                }
+                udfTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
+                mappedByIndex = true;
+            }
+        }
+        if (!mappedByIndex
+                && tcpConfig.resultFieldNames != null
+                && tcpConfig.resultUdfFieldTypes != null
+                && tcpConfig.resultFieldNames.size() == tcpConfig.resultUdfFieldTypes.size()) {
             final Map<String, Integer> nameToIndex = new HashMap<>();
             for (int i = 0; i < fieldCount; i++) {
                 final String name = inputFields.get(i).getName();
@@ -187,91 +303,44 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                     nameToIndex.put(name.toLowerCase(Locale.ROOT), i);
                 }
             }
-            for (String name : tcpConfig.argFieldNames) {
+            for (int i = 0; i < tcpConfig.resultFieldNames.size(); i++) {
+                final String name = tcpConfig.resultFieldNames.get(i);
+                final String typeString = tcpConfig.resultUdfFieldTypes.get(i);
                 if (name == null || name.trim().isEmpty()) {
-                    throw new TableException("ProxyOperator argument field name is empty.");
+                    continue;
                 }
                 final Integer idx = nameToIndex.get(name.toLowerCase(Locale.ROOT));
-                if (idx == null) {
-                    throw new TableException(
-                            "ProxyOperator argument field '" + name + "' not found in row type.");
+                if (idx == null || idx < 0 || idx >= fieldCount) {
+                    continue;
                 }
-                indices.add(idx);
-            }
-        } else if (!tcpConfig.argFieldIndices.isEmpty()) {
-            indices.addAll(tcpConfig.argFieldIndices);
-        } else {
-            for (int i = 0; i < fieldCount; i++) {
-                indices.add(i);
-            }
-        }
-
-        this.payloadFieldIndices = indices;
-        this.fieldTypes =
-                indices.stream().map(i -> inputFields.get(i).getType()).collect(Collectors.toList());
-        this.payloadFieldNames = new ArrayList<>(indices.size());
-        if (tcpConfig.argFieldNames != null
-                && tcpConfig.argFieldNames.size() == indices.size()) {
-            this.payloadFieldNames.addAll(tcpConfig.argFieldNames);
-        } else {
-            for (int idx : indices) {
-                payloadFieldNames.add(inputFields.get(idx).getName());
-            }
-        }
-
-        this.payloadWriteTypes = new ArrayList<>(indices.size());
-        if (tcpConfig.argFieldTypes != null
-                && tcpConfig.argFieldTypes.size() == indices.size()) {
-            final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
-            for (int i = 0; i < indices.size(); i++) {
-                final String typeString = tcpConfig.argFieldTypes.get(i);
                 if (typeString == null || typeString.trim().isEmpty()) {
-                    payloadWriteTypes.add(fieldTypes.get(i));
-                } else {
-                    payloadWriteTypes.add(LogicalTypeParser.parse(typeString, cl));
+                    continue;
                 }
+                udfTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
             }
-        } else {
-            payloadWriteTypes.addAll(fieldTypes);
         }
 
-        if (!tcpConfig.resultFieldIndices.isEmpty()) {
-            this.resultFieldIndices = new ArrayList<>(tcpConfig.resultFieldIndices);
-        } else {
-            this.resultFieldIndices = new ArrayList<>(payloadFieldIndices);
-        }
-        this.resultFieldTypes =
-                resultFieldIndices.stream()
-                        .map(i -> resultFields.get(i).getType())
-                        .collect(Collectors.toList());
-        this.resultReadTypes = new ArrayList<>(resultFieldTypes.size());
-        if (tcpConfig.resultUdfFieldTypes != null
-                && tcpConfig.resultUdfFieldTypes.size() == resultFieldTypes.size()) {
-            final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
-            boolean parsedAll = true;
-            for (int i = 0; i < tcpConfig.resultUdfFieldTypes.size(); i++) {
-                final String typeString = tcpConfig.resultUdfFieldTypes.get(i);
-                if (typeString == null || typeString.trim().isEmpty()) {
-                    parsedAll = false;
-                    break;
-                }
-                resultReadTypes.add(LogicalTypeParser.parse(typeString, cl));
-            }
-            if (!parsedAll) {
-                resultReadTypes.clear();
+        this.postFieldTypes = new ArrayList<>(fieldCount);
+        for (int i = 0; i < fieldCount; i++) {
+            final LogicalType udfType = udfTypeByIndex.get(i);
+            if (udfType != null) {
+                postFieldTypes.add(udfType);
+            } else {
+                postFieldTypes.add(inputFields.get(i).getType());
             }
         }
-        if (resultReadTypes.isEmpty()) {
-            resultReadTypes.addAll(resultFieldTypes);
-        }
+        this.resultReadTypes = new ArrayList<>(postFieldTypes);
+
         this.resultFieldGetters = new RowData.FieldGetter[resultFieldTypes.size()];
         for (int i = 0; i < resultFieldTypes.size(); i++) {
             resultFieldGetters[i] = RowData.createFieldGetter(resultFieldTypes.get(i), i);
         }
         this.fullRowFieldGetters = new RowData.FieldGetter[fieldCount];
         for (int i = 0; i < fieldCount; i++) {
-            fullRowFieldGetters[i] = RowData.createFieldGetter(inputFields.get(i).getType(), i);
+            fullRowFieldGetters[i] =
+                    RowData.createFieldGetter(inputFields.get(i).getType(), i);
         }
+        return;
     }
 
     private RowData mergeProxyRow(RowData baseRow, RowData proxyRow) {
@@ -286,6 +355,13 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             outRow.setField(targetIndex, resultFieldGetters[i].getFieldOrNull(proxyRow));
         }
         return outRow;
+    }
+
+    private RowData createPlaceholderRow(RowKind kind) {
+        final int fieldCount = inputRowType.getFieldCount();
+        final GenericRowData row = new GenericRowData(fieldCount);
+        row.setRowKind(kind);
+        return row;
     }
 
     @Override
@@ -614,9 +690,12 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                     .append(jsonEscape(tcpConfig.functionKind))
                     .append('"');
         }
+        sb.append(",\"externalOnly\":true");
         sb.append(",\"reorderResponses\":").append(tcpConfig.reorderResponses);
         appendFunctionArgMetadata(sb);
         appendFunctionResultMetadata(sb);
+        appendPreFieldMetadata(sb);
+        appendPostFieldMetadata(sb);
         sb.append('}');
         return sb.toString();
     }
@@ -715,46 +794,54 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         sb.append(",\"preFields\":[");
 
         // index 0: op
-        sb.append("{\"name\":\"__op\",\"type\":\"INT\"}");
+        sb.append("{\"name\":\"__op\",\"wireType\":\"INT32\"}");
 
         // index 1: rowId (if enabled)
         if (tcpConfig.reorderResponses) {
-            sb.append(",{\"name\":\"__rowId\",\"type\":\"BIGINT\"}");
+            sb.append(",{\"name\":\"__rowId\",\"wireType\":\"INT64\"}");
         }
 
         // payload fields start at index 1 or 2 depending on rowId presence
         for (int i = 0; i < payloadFieldIndices.size(); i++) {
             final int idx = payloadFieldIndices.get(i);
             final RowType.RowField field = fields.get(idx);
+            final LogicalType wireType =
+                    payloadWriteTypes != null && idx < payloadWriteTypes.size()
+                            ? payloadWriteTypes.get(idx)
+                            : field.getType();
             sb.append(",{\"name\":\"")
                     .append(jsonEscape(resolvePayloadFieldName(i, field)))
-                    .append("\",\"type\":\"")
-                    .append(jsonEscape(field.getType().asSerializableString()))
+                    .append("\",\"wireType\":\"")
+                    .append(wireTypeFor(wireType))
                     .append("\"}");
         }
         sb.append(']');
     }
 
     private void appendPostFieldMetadata(StringBuilder sb) {
-        final List<RowType.RowField> fields = resultRowType.getFields();
+        final List<RowType.RowField> fields = inputRowType.getFields();
         sb.append(",\"postFields\":[");
 
         // index 0: op
-        sb.append("{\"name\":\"__op\",\"type\":\"INT\"}");
+        sb.append("{\"name\":\"__op\",\"wireType\":\"INT32\"}");
 
         // index 1: rowId (if enabled)
         if (tcpConfig.reorderResponses) {
-            sb.append(",{\"name\":\"__rowId\",\"type\":\"BIGINT\"}");
+            sb.append(",{\"name\":\"__rowId\",\"wireType\":\"INT64\"}");
         }
 
         // result fields follow the order of resultFieldIndices / resultFieldTypes
         for (int i = 0; i < resultFieldIndices.size(); i++) {
             final int idx = resultFieldIndices.get(i);
             final RowType.RowField field = fields.get(idx);
+            final LogicalType postType =
+                    postFieldTypes != null && idx < postFieldTypes.size()
+                            ? postFieldTypes.get(idx)
+                            : field.getType();
             sb.append(",{\"name\":\"")
                     .append(jsonEscape(field.getName()))
-                    .append("\",\"type\":\"")
-                    .append(jsonEscape(field.getType().asSerializableString()))
+                    .append("\",\"wireType\":\"")
+                    .append(wireTypeFor(postType))
                     .append("\"}");
         }
         sb.append(']');
@@ -770,6 +857,41 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             }
         }
         return fallbackField.getName();
+    }
+
+    private static String wireTypeFor(LogicalType type) {
+        if (type == null) {
+            return "NIL";
+        }
+        switch (type.getTypeRoot()) {
+            case BOOLEAN:
+                return "BOOL";
+            case TINYINT:
+            case SMALLINT:
+            case INTEGER:
+            case DATE:
+            case TIME_WITHOUT_TIME_ZONE:
+                return "INT32";
+            case BIGINT:
+                return "INT64";
+            case FLOAT:
+                return "FLOAT32";
+            case DOUBLE:
+                return "FLOAT64";
+            case CHAR:
+            case VARCHAR:
+                return "STRING";
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                return "INT64";
+            case DECIMAL:
+                return "STRING";
+            case BINARY:
+            case VARBINARY:
+                return "BIN";
+            default:
+                return "NIL";
+        }
     }
 
     private static void writeLengthPrefixedJson(OutputStream out, String json) throws IOException {
