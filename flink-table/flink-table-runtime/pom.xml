@@ -101,16 +101,9 @@ under the License.
 
 		<!-- MsgPack for ProxyOperator TCP serialization -->
 		<dependency>
-			<groupId>org.apache.arrow</groupId>
-			<artifactId>arrow-memory</artifactId>
-			<version>18.3.0</version>
-			<type>pom</type>
-			<scope>compile</scope>
-		</dependency>
-		<dependency>
-			<groupId>org.apache.arrow</groupId>
-			<artifactId>arrow-vector</artifactId>
-			<version>18.3.0</version>
+			<groupId>org.msgpack</groupId>
+			<artifactId>msgpack-core</artifactId>
+			<version>0.9.8</version>
 			<scope>compile</scope>
 		</dependency>
 

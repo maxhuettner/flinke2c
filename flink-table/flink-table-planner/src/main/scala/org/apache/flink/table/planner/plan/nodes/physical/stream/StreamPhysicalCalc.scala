@@ -120,6 +120,7 @@ class StreamPhysicalCalc(
         rewriter.getProxyResultFieldIndices,
         rewriter.getProxyResultFieldNames,
         rewriter.getProxyResultFieldTypes,
+        rewriter.getProxyResultUdfFieldTypes,
         rewriter.getProxyResultUdfFieldIndices)
     } else {
       new StreamExecCalc(
@@ -341,6 +342,7 @@ private object StreamPhysicalCalc {
     private val proxyResultFieldNames = new java.util.ArrayList[String]()
     private val proxyResultFieldTypes = new java.util.ArrayList[String]()
     private val proxyResultUdfFieldIndices = new java.util.ArrayList[Integer]()
+    private val proxyResultUdfFieldTypes = new java.util.ArrayList[String]()
 
     def setCurrentOutputFieldIndex(idx: Int): Unit = {
       currentOutputFieldIndex = idx
@@ -408,7 +410,8 @@ private object StreamPhysicalCalc {
         throw new TableException(
           "Proxy scalar function requires at least one column reference argument.")
       }
-      addResultField(currentUdfFieldIndexOverride, firstFieldIndex)
+      val udfReturnType = resolveUdfReturnType(call, currentUdfFieldIndexOverride)
+      addResultField(currentUdfFieldIndexOverride, firstFieldIndex, udfReturnType)
       firstFieldOperand.accept(this)
     }
 
@@ -438,7 +441,12 @@ private object StreamPhysicalCalc {
 
     def getProxyResultUdfFieldIndices: java.util.List[Integer] = proxyResultUdfFieldIndices
 
-    private def addResultField(udfFieldIndex: Integer, targetFieldIndex: Integer): Unit = {
+    def getProxyResultUdfFieldTypes: java.util.List[String] = proxyResultUdfFieldTypes
+
+    private def addResultField(
+        udfFieldIndex: Integer,
+        targetFieldIndex: Integer,
+        udfFieldType: String): Unit = {
       if (currentOutputFieldIndex < 0) {
         return
       }
@@ -452,6 +460,7 @@ private object StreamPhysicalCalc {
       proxyResultFieldNames.add(resolveFieldName(outputType, currentOutputFieldIndex).orNull)
       proxyResultFieldTypes.add(resolveFieldType(outputType, currentOutputFieldIndex).orNull)
       proxyResultUdfFieldIndices.add(if (udfFieldIndex == null) -1 else udfFieldIndex)
+      proxyResultUdfFieldTypes.add(udfFieldType)
     }
 
     private def unwrapProxyCall(node: RexNode): RexCall = {
@@ -473,6 +482,25 @@ private object StreamPhysicalCalc {
       val base = if (lastDot < 0) className else className.substring(lastDot + 1)
       val suffixIndex = base.indexOf('$')
       if (suffixIndex > 0) base.substring(0, suffixIndex) else base
+    }
+
+    private def resolveUdfReturnType(call: RexCall, udfFieldIndex: Integer): String = {
+      if (call == null) {
+        return null
+      }
+      val relType = call.getType
+      if (udfFieldIndex != null && udfFieldIndex >= 0 && relType != null) {
+        val fields = relType.getFieldList
+        if (fields != null && udfFieldIndex < fields.size()) {
+          val fieldType = fields.get(udfFieldIndex).getType
+          return FlinkTypeFactory.toLogicalType(fieldType).asSerializableString
+        }
+      }
+      if (relType == null) {
+        null
+      } else {
+        FlinkTypeFactory.toLogicalType(relType).asSerializableString
+      }
     }
   }
 }

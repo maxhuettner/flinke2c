@@ -19,12 +19,11 @@
 package org.apache.flink.table.runtime.functions.table;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.api.common.TaskInfo;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
-import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.DecimalData;
+import org.apache.flink.table.data.DecimalDataUtils;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
@@ -39,23 +38,11 @@ import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.utils.LogicalTypeParser;
 import org.apache.flink.types.RowKind;
 
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.Float4Vector;
-import org.apache.arrow.vector.Float8Vector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.TimeStampMilliVector;
-import org.apache.arrow.vector.VarCharVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowStreamReader;
-import org.apache.arrow.vector.ipc.ArrowStreamWriter;
-import org.apache.arrow.vector.types.FloatingPointPrecision;
-import org.apache.arrow.vector.types.pojo.ArrowType;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
-import org.apache.arrow.vector.types.pojo.Schema;
+import org.msgpack.core.MessageFormat;
+import org.msgpack.core.MessagePack;
+import org.msgpack.core.MessagePacker;
+import org.msgpack.core.MessageUnpacker;
+import org.msgpack.value.ValueType;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -93,9 +80,8 @@ import java.util.stream.Collectors;
  * downstream.
  *
  * <p>
- * PRE and POST send one JSON config preamble (length-prefixed) before the Arrow
- * IPC stream
- * begins (PRE before sending, POST before reading).
+ * PRE sends a full JSON config preamble (length-prefixed) before the MessagePack
+ * stream begins. POST can send a minimal preamble (role only) if configured.
  */
 @Internal
 public class ProxyOperator extends TableStreamOperator<RowData>
@@ -121,32 +107,25 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     private transient List<LogicalType> payloadWriteTypes;
     private transient List<Integer> resultFieldIndices;
     private transient List<LogicalType> resultFieldTypes;
+    private transient List<LogicalType> resultReadTypes;
     private transient RowData.FieldGetter[] resultFieldGetters;
     private transient RowData.FieldGetter[] fullRowFieldGetters;
 
     // shared socket
     private transient Socket socket;
 
-    // PRE (Arrow writer + batch state)
+    // PRE (MsgPack writer + batch state)
     private transient BufferedOutputStream out;
-    private transient BufferAllocator allocator;
-    private transient VectorSchemaRoot writeRoot;
-    private transient ArrowStreamWriter writer;
-    private transient BigIntVector writeRowIdVector;
+    private transient MessagePacker packer;
 
     private transient int batchMaxRows;
     private transient int batchRowIndex;
-    private transient List<FieldVector> writeVectors; // includes op column at 0
     private transient long nextRowId;
+    private transient boolean flushTimerScheduled;
 
-    // POST (Arrow reader + current batch cursor)
+    // POST (MsgPack reader)
     private transient BufferedInputStream in;
-    private transient ArrowStreamReader reader;
-    private transient VectorSchemaRoot readRoot;
-    private transient int readBatchRowCount;
-    private transient int readBatchRowIndex;
-    private transient List<FieldVector> readVectors;
-    private transient BigIntVector readRowIdVector;
+    private transient MessageUnpacker unpacker;
     private transient long expectedRowId;
     private transient Map<Long, RowData> reorderBuffer;
 
@@ -179,7 +158,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     @Override
     public void processElement(StreamRecord<RowData> element) throws Exception {
         if (side == Side.PRE) {
-            appendRowToArrowBatch(element.getValue());
+            appendRowToMsgPack(element.getValue());
             // keep original behavior: forward input downstream unchanged
             output.collect(element);
         } else {
@@ -265,6 +244,26 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 resultFieldIndices.stream()
                         .map(i -> resultFields.get(i).getType())
                         .collect(Collectors.toList());
+        this.resultReadTypes = new ArrayList<>(resultFieldTypes.size());
+        if (tcpConfig.resultUdfFieldTypes != null
+                && tcpConfig.resultUdfFieldTypes.size() == resultFieldTypes.size()) {
+            final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
+            boolean parsedAll = true;
+            for (int i = 0; i < tcpConfig.resultUdfFieldTypes.size(); i++) {
+                final String typeString = tcpConfig.resultUdfFieldTypes.get(i);
+                if (typeString == null || typeString.trim().isEmpty()) {
+                    parsedAll = false;
+                    break;
+                }
+                resultReadTypes.add(LogicalTypeParser.parse(typeString, cl));
+            }
+            if (!parsedAll) {
+                resultReadTypes.clear();
+            }
+        }
+        if (resultReadTypes.isEmpty()) {
+            resultReadTypes.addAll(resultFieldTypes);
+        }
         this.resultFieldGetters = new RowData.FieldGetter[resultFieldTypes.size()];
         for (int i = 0; i < resultFieldTypes.size(); i++) {
             resultFieldGetters[i] = RowData.createFieldGetter(resultFieldTypes.get(i), i);
@@ -323,25 +322,19 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         this.socket = connectSocket(proxy.host, port, tcpConfig.connectTimeoutMs);
         this.out = new BufferedOutputStream(socket.getOutputStream(), tcpConfig.bufferSize);
 
-        // 1) preamble: one config JSON message before Arrow starts
+        // 1) preamble: one config JSON message before MsgPack starts
         final String configJson = buildConfigJson(side);
         writeLengthPrefixedJson(out, configJson);
 
-        // 2) Arrow stream starts immediately after preamble bytes
+        // 2) MsgPack stream starts immediately after preamble bytes
         this.batchMaxRows = tcpConfig.batchMaxRows;
         this.batchRowIndex = 0;
         this.nextRowId = 0L;
 
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
+        this.packer = MessagePack.newDefaultPacker(out);
 
-        final Schema arrowSchema =
-                toArrowSchema(payloadFieldNames, payloadWriteTypes, tcpConfig.reorderResponses);
-        this.writeRoot = VectorSchemaRoot.create(arrowSchema, allocator);
-        this.writeVectors = writeRoot.getFieldVectors();
-        this.writeRowIdVector = tcpConfig.reorderResponses ? (BigIntVector) writeVectors.get(1) : null;
-
-        this.writer = new ArrowStreamWriter(writeRoot, /* DictionaryProvider */ null, out);
-        this.writer.start(); // writes schema header
+        this.flushTimerScheduled = false;
+        scheduleFlushTimerIfNeeded();
 
         LOG.info(
                 "ProxyOperator {} connected to {}:{} (rowType={}, batchMaxRows={}, sentConfigBytes={})",
@@ -353,109 +346,121 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 configJson.getBytes(StandardCharsets.UTF_8).length);
     }
 
-    private void appendRowToArrowBatch(RowData row) throws IOException {
+    private void appendRowToMsgPack(RowData row) throws IOException {
         if (batchRowIndex >= batchMaxRows) {
-            flushArrowBatch();
+            flushMsgPackBatch();
         }
 
-        // column 0: op
-        ((IntVector) writeVectors.get(0)).setSafe(batchRowIndex, rowKindToOp(row.getRowKind()));
-
-        final int payloadOffset;
-        if (tcpConfig.reorderResponses) {
-            writeRowIdVector.setSafe(batchRowIndex, nextRowId++);
-            payloadOffset = 2;
-        } else {
-            payloadOffset = 1;
-        }
-
-        // columns payloadOffset..N: fields
-        for (int i = 0; i < fieldTypes.size(); i++) {
-            final int col = i + payloadOffset;
-            final LogicalType targetType = payloadWriteTypes.get(i);
-            final LogicalType sourceType = fieldTypes.get(i);
-            final FieldVector v = writeVectors.get(col);
-            final int sourceIndex = payloadFieldIndices.get(i);
-
-            if (row.isNullAt(sourceIndex)) {
-                v.setNull(batchRowIndex);
-                continue;
-            }
-
-            writeFieldValueWithCast(v, targetType, sourceType, row, sourceIndex, batchRowIndex);
-        }
-
+        packRow(row);
         batchRowIndex++;
 
         // optional per-row flush for minimum latency (not recommended)
         if (tcpConfig.flushOnWrite) {
-            flushArrowBatch();
-        } else if (tcpConfig.flushEvery > 0 && batchRowIndex >= tcpConfig.flushEvery) {
-            flushArrowBatch();
+            flushMsgPackBatch();
         }
     }
 
-    private void flushArrowBatch() throws IOException {
+    private void packRow(RowData row) throws IOException {
+        final int payloadSize = fieldTypes.size();
+        final int arraySize = tcpConfig.reorderResponses ? payloadSize + 2 : payloadSize + 1;
+        packer.packArrayHeader(arraySize);
+
+        // column 0: op
+        packer.packInt(rowKindToOp(row.getRowKind()));
+
+        if (tcpConfig.reorderResponses) {
+            packer.packLong(nextRowId++);
+        }
+
+        for (int i = 0; i < payloadSize; i++) {
+            final int sourceIndex = payloadFieldIndices.get(i);
+            if (row.isNullAt(sourceIndex)) {
+                packer.packNil();
+                continue;
+            }
+            final LogicalType targetType = payloadWriteTypes.get(i);
+            final LogicalType sourceType = fieldTypes.get(i);
+            packFieldValueWithCast(packer, targetType, sourceType, row, sourceIndex);
+        }
+    }
+
+    private void flushMsgPackBatch() throws IOException {
         if (batchRowIndex <= 0) {
             return;
         }
-
-        writeRoot.setRowCount(batchRowIndex);
-        writer.writeBatch();
+        packer.flush();
         out.flush();
-
-        // reset vectors for next batch (cheap; keeps allocated buffers)
-        for (FieldVector v : writeVectors) {
-            v.setValueCount(0);
-        }
         batchRowIndex = 0;
     }
 
     private void closePre() throws IOException {
         IOException error = null;
 
+        flushTimerScheduled = false;
+
         // flush any remaining rows as a final smaller batch
         error = suppress(error, tryFlushRemaining());
 
-        // end stream marker
-        error = suppress(error, closeArrowWriter());
+        error = suppress(error, closePacker());
 
         error = suppress(error, flushAndClose(out));
         out = null;
-
-        error = suppress(error, closeQuietly(writeRoot));
-        writeRoot = null;
-
-        error = suppress(error, closeQuietly(allocator));
-        allocator = null;
 
         if (error != null) {
             throw error;
         }
     }
 
+    private void scheduleFlushTimerIfNeeded() {
+        if (side != Side.PRE) {
+            return;
+        }
+        if (tcpConfig.flushIntervalMs <= 0) {
+            return;
+        }
+        if (flushTimerScheduled) {
+            return;
+        }
+        flushTimerScheduled = true;
+        final long now = getProcessingTimeService().getCurrentProcessingTime();
+        getProcessingTimeService().registerTimer(now + tcpConfig.flushIntervalMs, this::onFlushTimer);
+    }
+
+    private void onFlushTimer(long timestamp) throws Exception {
+        flushTimerScheduled = false;
+        if (side != Side.PRE) {
+            return;
+        }
+        if (packer == null || out == null) {
+            return;
+        }
+        if (batchRowIndex > 0) {
+            flushMsgPackBatch();
+        }
+        scheduleFlushTimerIfNeeded();
+    }
+
     private IOException tryFlushRemaining() {
         try {
-            flushArrowBatch();
+            flushMsgPackBatch();
             return null;
         } catch (IOException e) {
             return e;
         }
     }
 
-    private IOException closeArrowWriter() {
-        if (writer == null) {
+    private IOException closePacker() {
+        if (packer == null) {
             return null;
         }
         try {
-            writer.end();
-            writer.close();
+            packer.flush();
+            packer.close();
             return null;
         } catch (IOException e) {
             return e;
         } finally {
-            writer = null;
-            writeVectors = null;
+            packer = null;
         }
     }
 
@@ -474,24 +479,15 @@ public class ProxyOperator extends TableStreamOperator<RowData>
 
         this.in = new BufferedInputStream(socket.getInputStream(), tcpConfig.bufferSize);
 
-        // POST registers itself with the proxy before Arrow stream starts
+        // POST registers itself with the proxy before MsgPack stream starts
         final BufferedOutputStream postOut = new BufferedOutputStream(socket.getOutputStream(), tcpConfig.bufferSize);
         final String configJson = buildConfigJson(side);
         writeLengthPrefixedJson(postOut, configJson);
 
-        // Arrow stream begins immediately after the preamble
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
-        this.reader = new ArrowStreamReader(in, allocator);
-        this.readRoot = reader.getVectorSchemaRoot();
-        this.readVectors = readRoot.getFieldVectors();
-        this.readBatchRowCount = 0;
-        this.readBatchRowIndex = 0;
-        this.readRowIdVector = tcpConfig.reorderResponses ? (BigIntVector) readVectors.get(1) : null;
+        // MsgPack stream begins immediately after the preamble
+        this.unpacker = MessagePack.newDefaultUnpacker(in);
         this.expectedRowId = 0L;
         this.reorderBuffer = tcpConfig.reorderResponses ? new HashMap<>() : null;
-
-        // prime first batch
-        loadNextBatchOrEof();
 
         LOG.info(
                 "ProxyOperator {} connected to {}:{} (rowType={}, sentConfigBytes={})",
@@ -503,52 +499,50 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     }
 
     private RowData readNextRow(RowKind fallbackKind) throws IOException {
-        if (reader == null) {
-            throw new IOException("ProxyOperator reader not initialized");
-        }
-
-        while (readBatchRowIndex >= readBatchRowCount) {
-            if (!loadNextBatchOrEof()) {
-                throw new EOFException("ProxyOperator reached end of Arrow stream");
-            }
-        }
-
-        final int fieldCount = resultFieldTypes.size();
-        final GenericRowData outRow = new GenericRowData(fieldCount);
-
-        // op is column 0
-        final int op = ((IntVector) readVectors.get(0)).get(readBatchRowIndex);
-        outRow.setRowKind(opToRowKind(op, fallbackKind));
-
-        final int payloadOffset = tcpConfig.reorderResponses ? 2 : 1;
-        for (int i = 0; i < fieldCount; i++) {
-            final int col = i + payloadOffset;
-            final FieldVector v = readVectors.get(col);
-            if (v.isNull(readBatchRowIndex)) {
-                outRow.setField(i, null);
-            } else {
-                outRow.setField(i, readFieldValue(v, resultFieldTypes.get(i), readBatchRowIndex));
-            }
-        }
-
-        readBatchRowIndex++;
-        return outRow;
+        return readNextRowWithId(fallbackKind).row;
     }
 
     private RowWithId readNextRowWithId(RowKind fallbackKind) throws IOException {
-        if (reader == null) {
-            throw new IOException("ProxyOperator reader not initialized");
+        if (unpacker == null) {
+            throw new IOException("ProxyOperator unpacker not initialized");
         }
 
-        while (readBatchRowIndex >= readBatchRowCount) {
-            if (!loadNextBatchOrEof()) {
-                throw new EOFException("ProxyOperator reached end of Arrow stream");
-            }
+        final int fieldCount = resultFieldTypes.size();
+        final int expectedSize = tcpConfig.reorderResponses ? fieldCount + 2 : fieldCount + 1;
+
+        final int arraySize;
+        try {
+            arraySize = unpacker.unpackArrayHeader();
+        } catch (EOFException eof) {
+            throw new EOFException("ProxyOperator reached end of MsgPack stream");
         }
 
-        final long rowId = readRowIdVector.get(readBatchRowIndex);
-        final RowData row = readNextRow(fallbackKind);
-        return new RowWithId(rowId, row);
+        final int op = unpacker.unpackInt();
+        final long rowId = tcpConfig.reorderResponses ? unpacker.unpackLong() : -1L;
+
+        final GenericRowData outRow = new GenericRowData(fieldCount);
+        outRow.setRowKind(opToRowKind(op, fallbackKind));
+
+        if (arraySize < expectedSize) {
+            throw new IOException(
+                    "ProxyOperator received MsgPack row with "
+                            + arraySize
+                            + " fields; expected at least "
+                            + expectedSize);
+        }
+
+        for (int i = 0; i < fieldCount; i++) {
+            final LogicalType readType = resultReadTypes.get(i);
+            final LogicalType targetType = resultFieldTypes.get(i);
+            outRow.setField(i, unpackFieldValueWithCast(unpacker, readType, targetType));
+        }
+
+        // consume any extra fields if present
+        for (int i = expectedSize; i < arraySize; i++) {
+            unpacker.skipValue();
+        }
+
+        return new RowWithId(rowId, outRow);
     }
 
     private RowData readNextOrderedRow(RowKind fallbackKind) throws IOException {
@@ -581,32 +575,14 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         }
     }
 
-    private boolean loadNextBatchOrEof() throws IOException {
-        final boolean ok = reader.loadNextBatch();
-        if (!ok) {
-            return false;
-        }
-        this.readBatchRowCount = readRoot.getRowCount();
-        this.readBatchRowIndex = 0;
-        return true;
-    }
-
     private void closePost() throws IOException {
         IOException error = null;
 
-        error = suppress(error, closeQuietly(reader));
-        reader = null;
-
-        error = suppress(error, closeQuietly(readRoot));
-        readRoot = null;
+        error = suppress(error, closeQuietly(unpacker));
+        unpacker = null;
 
         error = suppress(error, closeQuietly(in));
         in = null;
-
-        error = suppress(error, closeQuietly(allocator));
-        allocator = null;
-
-        readVectors = null;
 
         if (error != null) {
             throw error;
@@ -620,43 +596,14 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     private String buildConfigJson(Side side) {
         // Provided snippet (may need import/package adjustment depending on Flink
         // version)
-        final StreamingRuntimeContext ctx = (StreamingRuntimeContext) getRuntimeContext();
-
-        final TaskInfo taskInfo = getRuntimeContext().getTaskInfo();
-        final int subtask = taskInfo.getIndexOfThisSubtask();
-        final int parallelism = taskInfo.getNumberOfParallelSubtasks();
-        String tmHost = "unknown";
-        String jobId = "unknown";
-
-        try {
-            // these types/methods may differ between Flink versions
-            final Object tm = ctx.getTaskManagerRuntimeInfo();
-            tmHost = (String) tm.getClass().getMethod("getTaskManagerExternalAddress").invoke(tm);
-
-            final Object jobInfo = ctx.getJobInfo();
-            final Object jid = jobInfo.getClass().getMethod("getJobId").invoke(jobInfo);
-            jobId = String.valueOf(jid);
-        } catch (Exception e) {
-            // Fall back to what we can reliably get without version-specific classes
-            LOG.warn("Failed to extract full runtime info for config preamble; using fallbacks", e);
+        if (side == Side.POST && tcpConfig.postRoleOnly) {
+            return "{\"role\":\"post\"}";
         }
 
         // minimal JSON (no dependency). Escape strings.
         final StringBuilder sb = new StringBuilder(128);
         sb.append('{')
-                .append("\"role\":\"").append(side == Side.PRE ? "pre" : "post").append("\",")
-                .append("\"tmHost\":\"").append(jsonEscape(tmHost)).append("\",")
-                .append("\"subtask\":").append(subtask).append(',')
-                .append("\"parallelism\":").append(parallelism).append(',')
-                .append("\"jobId\":\"").append(jsonEscape(jobId)).append('"');
-        if (tcpConfig.calcFieldIndex != null) {
-            sb.append(",\"calcFieldIndex\":").append(tcpConfig.calcFieldIndex);
-        }
-        if (tcpConfig.calcFieldName != null && !tcpConfig.calcFieldName.isEmpty()) {
-            sb.append(",\"calcFieldName\":\"")
-                    .append(jsonEscape(tcpConfig.calcFieldName))
-                    .append('"');
-        }
+                .append("\"role\":\"").append(side == Side.PRE ? "pre" : "post").append('"');
         if (tcpConfig.functionClass != null && !tcpConfig.functionClass.isEmpty()) {
             sb.append(",\"functionClass\":\"")
                     .append(jsonEscape(tcpConfig.functionClass))
@@ -667,12 +614,9 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                     .append(jsonEscape(tcpConfig.functionKind))
                     .append('"');
         }
+        sb.append(",\"reorderResponses\":").append(tcpConfig.reorderResponses);
         appendFunctionArgMetadata(sb);
         appendFunctionResultMetadata(sb);
-        appendRowFieldMetadata(sb);
-        if (tcpConfig.reorderResponses) {
-            sb.append(",\"reorderResponses\":true");
-        }
         sb.append('}');
         return sb.toString();
     }
@@ -691,14 +635,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             }
             sb.append('{');
             boolean wrote = false;
-            if (i < tcpConfig.argFieldIndices.size()) {
-                sb.append("\"index\":").append(tcpConfig.argFieldIndices.get(i));
-                wrote = true;
-            }
             if (i < tcpConfig.argFieldNames.size()) {
-                if (wrote) {
-                    sb.append(',');
-                }
                 sb.append("\"name\":\"")
                         .append(jsonEscape(tcpConfig.argFieldNames.get(i)))
                         .append('"');
@@ -720,7 +657,11 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     private void appendFunctionResultMetadata(StringBuilder sb) {
         final int maxResults = Math.max(
                 tcpConfig.resultFieldIndices.size(),
-                Math.max(tcpConfig.resultFieldNames.size(), tcpConfig.resultFieldTypes.size()));
+                Math.max(
+                        tcpConfig.resultFieldNames.size(),
+                        Math.max(
+                                tcpConfig.resultFieldTypes.size(),
+                                tcpConfig.resultUdfFieldTypes.size())));
         if (maxResults == 0) {
             return;
         }
@@ -731,20 +672,21 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             }
             sb.append('{');
             boolean wrote = false;
-            if (i < tcpConfig.resultFieldIndices.size()) {
-                sb.append("\"outputIndex\":").append(tcpConfig.resultFieldIndices.get(i));
-                wrote = true;
-            }
             if (i < tcpConfig.resultFieldNames.size()) {
-                if (wrote) {
-                    sb.append(',');
-                }
                 sb.append("\"outputName\":\"")
                         .append(jsonEscape(tcpConfig.resultFieldNames.get(i)))
                         .append('"');
                 wrote = true;
             }
-            if (i < tcpConfig.resultFieldTypes.size()) {
+            if (i < tcpConfig.resultUdfFieldTypes.size()) {
+                if (wrote) {
+                    sb.append(',');
+                }
+                sb.append("\"outputType\":\"")
+                        .append(jsonEscape(tcpConfig.resultUdfFieldTypes.get(i)))
+                        .append('"');
+                wrote = true;
+            } else if (i < tcpConfig.resultFieldTypes.size()) {
                 if (wrote) {
                     sb.append(',');
                 }
@@ -768,17 +710,49 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         sb.append(']');
     }
 
-    private void appendRowFieldMetadata(StringBuilder sb) {
+    private void appendPreFieldMetadata(StringBuilder sb) {
         final List<RowType.RowField> fields = inputRowType.getFields();
-        sb.append(",\"fields\":[");
+        sb.append(",\"preFields\":[");
+
+        // index 0: op
+        sb.append("{\"name\":\"__op\",\"type\":\"INT\"}");
+
+        // index 1: rowId (if enabled)
+        if (tcpConfig.reorderResponses) {
+            sb.append(",{\"name\":\"__rowId\",\"type\":\"BIGINT\"}");
+        }
+
+        // payload fields start at index 1 or 2 depending on rowId presence
         for (int i = 0; i < payloadFieldIndices.size(); i++) {
             final int idx = payloadFieldIndices.get(i);
             final RowType.RowField field = fields.get(idx);
-            if (i > 0) {
-                sb.append(',');
-            }
-            sb.append("{\"name\":\"")
+            sb.append(",{\"name\":\"")
                     .append(jsonEscape(resolvePayloadFieldName(i, field)))
+                    .append("\",\"type\":\"")
+                    .append(jsonEscape(field.getType().asSerializableString()))
+                    .append("\"}");
+        }
+        sb.append(']');
+    }
+
+    private void appendPostFieldMetadata(StringBuilder sb) {
+        final List<RowType.RowField> fields = resultRowType.getFields();
+        sb.append(",\"postFields\":[");
+
+        // index 0: op
+        sb.append("{\"name\":\"__op\",\"type\":\"INT\"}");
+
+        // index 1: rowId (if enabled)
+        if (tcpConfig.reorderResponses) {
+            sb.append(",{\"name\":\"__rowId\",\"type\":\"BIGINT\"}");
+        }
+
+        // result fields follow the order of resultFieldIndices / resultFieldTypes
+        for (int i = 0; i < resultFieldIndices.size(); i++) {
+            final int idx = resultFieldIndices.get(i);
+            final RowType.RowField field = fields.get(idx);
+            sb.append(",{\"name\":\"")
+                    .append(jsonEscape(field.getName()))
                     .append("\",\"type\":\"")
                     .append(jsonEscape(field.getType().asSerializableString()))
                     .append("\"}");
@@ -803,7 +777,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         final DataOutputStream dos = new DataOutputStream(out);
         dos.writeInt(bytes.length); // big-endian length
         dos.write(bytes);
-        dos.flush(); // ensure preamble is out before Arrow schema starts
+        dos.flush(); // ensure preamble is out before MsgPack stream starts
     }
 
     private static String jsonEscape(String s) {
@@ -815,76 +789,17 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     }
 
     // ------------------------------------------------------------------------
-    // Arrow schema + value mapping
+    // MsgPack value mapping
     // ------------------------------------------------------------------------
 
-    private static Schema toArrowSchema(
-            List<String> fieldNames, List<LogicalType> fieldTypes, boolean includeRowId) {
-        final List<Field> fields = new ArrayList<>();
-
-        // column 0: op
-        fields.add(new Field("__op", FieldType.notNullable(new ArrowType.Int(32, true)), null));
-
-        if (includeRowId) {
-            // column 1: row id (for reordering)
-            fields.add(new Field("__rid", FieldType.notNullable(new ArrowType.Int(64, true)), null));
-        }
-
-        // columns (1/2)..N: row fields in order
-        for (int i = 0; i < fieldTypes.size(); i++) {
-            final String name =
-                    fieldNames != null && i < fieldNames.size() && fieldNames.get(i) != null
-                            ? fieldNames.get(i)
-                            : "f" + i;
-            final LogicalType t = fieldTypes.get(i);
-            fields.add(new Field(name, FieldType.nullable(toArrowType(t)), /* children */ null));
-        }
-        return new Schema(fields);
-    }
-
-    private static ArrowType toArrowType(LogicalType t) {
-        switch (t.getTypeRoot()) {
-            case BOOLEAN:
-                return ArrowType.Bool.INSTANCE;
-            case INTEGER:
-                return new ArrowType.Int(32, true);
-            case BIGINT:
-                return new ArrowType.Int(64, true);
-            case FLOAT:
-                return new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE);
-            case DOUBLE:
-                return new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
-            case CHAR:
-            case VARCHAR:
-                return ArrowType.Utf8.INSTANCE;
-            case TIMESTAMP_WITHOUT_TIME_ZONE:
-            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                // represent as millis since epoch
-                return new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MILLISECOND, null);
-            case DATE:
-            case TIME_WITHOUT_TIME_ZONE:
-                return new ArrowType.Int(32, true);
-            case BINARY:
-            case VARBINARY:
-                return ArrowType.Binary.INSTANCE;
-            case DECIMAL:
-                final DecimalType dt = (DecimalType) t;
-                return new ArrowType.Decimal(dt.getPrecision(), dt.getScale(), 128);
-            default:
-                // default to Utf8 to avoid hard failures
-                return ArrowType.Utf8.INSTANCE;
-        }
-    }
-
-    private static void writeFieldValueWithCast(
-            FieldVector v,
+    private static void packFieldValueWithCast(
+            MessagePacker packer,
             LogicalType targetType,
             LogicalType sourceType,
             RowData row,
-            int pos,
-            int idx) {
+            int pos) throws IOException {
         if (targetType == null || sourceType == null) {
-            v.setNull(idx);
+            packer.packNil();
             return;
         }
         final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
@@ -894,7 +809,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         if (targetRoot == sourceRoot
                 || (isStringRoot(targetRoot) && isStringRoot(sourceRoot))
                 || (isTimestampRoot(targetRoot) && isTimestampRoot(sourceRoot))) {
-            writeFieldValue(v, targetType, row, pos, idx);
+            packFieldValue(packer, targetType, row, pos);
             return;
         }
 
@@ -907,6 +822,12 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                     break;
                 case INTEGER:
                     bd = BigDecimal.valueOf(row.getInt(pos));
+                    break;
+                case SMALLINT:
+                    bd = BigDecimal.valueOf(row.getShort(pos));
+                    break;
+                case TINYINT:
+                    bd = BigDecimal.valueOf(row.getByte(pos));
                     break;
                 case FLOAT:
                     bd = BigDecimal.valueOf(row.getFloat(pos));
@@ -928,7 +849,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                                     + targetType.asSerializableString());
             }
             final BigDecimal scaled = bd.setScale(dt.getScale(), RoundingMode.HALF_UP);
-            ((org.apache.arrow.vector.DecimalVector) v).setSafe(idx, scaled);
+            packer.packString(scaled.toPlainString());
             return;
         }
 
@@ -948,89 +869,232 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 || root == LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE;
     }
 
-    private static void writeFieldValue(FieldVector v, LogicalType type, RowData row, int pos, int idx) {
+    private static void packFieldValue(MessagePacker packer, LogicalType type, RowData row, int pos)
+            throws IOException {
         switch (type.getTypeRoot()) {
+            case BOOLEAN:
+                packer.packBoolean(row.getBoolean(pos));
+                return;
+            case TINYINT:
+                packer.packByte(row.getByte(pos));
+                return;
+            case SMALLINT:
+                packer.packShort(row.getShort(pos));
+                return;
             case INTEGER:
             case DATE:
             case TIME_WITHOUT_TIME_ZONE:
-                ((IntVector) v).setSafe(idx, row.getInt(pos));
+                packer.packInt(row.getInt(pos));
                 return;
             case BIGINT:
-                ((BigIntVector) v).setSafe(idx, row.getLong(pos));
+                packer.packLong(row.getLong(pos));
                 return;
             case FLOAT:
-                ((Float4Vector) v).setSafe(idx, row.getFloat(pos));
+                packer.packFloat(row.getFloat(pos));
                 return;
             case DOUBLE:
-                ((Float8Vector) v).setSafe(idx, row.getDouble(pos));
+                packer.packDouble(row.getDouble(pos));
                 return;
             case CHAR:
-            case VARCHAR: {
-                final byte[] bytes = row.getString(pos).toString().getBytes(StandardCharsets.UTF_8);
-                ((VarCharVector) v).setSafe(idx, bytes, 0, bytes.length);
+            case VARCHAR:
+                packer.packString(row.getString(pos).toString());
                 return;
-            }
             case TIMESTAMP_WITHOUT_TIME_ZONE: {
-                final long ms = row.getTimestamp(pos, ((TimestampType) type).getPrecision()).getMillisecond();
-                ((TimeStampMilliVector) v).setSafe(idx, ms);
+                final long ms =
+                        row.getTimestamp(pos, ((TimestampType) type).getPrecision()).getMillisecond();
+                packer.packLong(ms);
                 return;
             }
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE: {
-                final long ms = row.getTimestamp(pos, ((LocalZonedTimestampType) type).getPrecision())
-                        .getMillisecond();
-                ((TimeStampMilliVector) v).setSafe(idx, ms);
+                final long ms =
+                        row.getTimestamp(pos, ((LocalZonedTimestampType) type).getPrecision())
+                                .getMillisecond();
+                packer.packLong(ms);
                 return;
             }
             case DECIMAL: {
                 final DecimalType dt = (DecimalType) type;
                 final DecimalData dec = row.getDecimal(pos, dt.getPrecision(), dt.getScale());
-                ((org.apache.arrow.vector.DecimalVector) v).setSafe(idx, dec.toBigDecimal());
+                packer.packString(dec.toString());
                 return;
             }
             case BINARY:
             case VARBINARY: {
                 final byte[] bytes = row.getBinary(pos);
-                ((org.apache.arrow.vector.VarBinaryVector) v).setSafe(idx, bytes);
+                packer.packBinaryHeader(bytes.length);
+                packer.writePayload(bytes);
                 return;
             }
             default:
-                // unsupported => null (already handled before calling)
-                v.setNull(idx);
+                packer.packNil();
         }
     }
 
-    private static Object readFieldValue(FieldVector v, LogicalType type, int idx) {
+    private static Object unpackFieldValue(MessageUnpacker unpacker, LogicalType type) throws IOException {
+        if (unpacker.tryUnpackNil()) {
+            return null;
+        }
+
         switch (type.getTypeRoot()) {
+            case BOOLEAN:
+                return unpacker.unpackBoolean();
+            case TINYINT:
+                return unpacker.unpackByte();
+            case SMALLINT:
+                return unpacker.unpackShort();
             case INTEGER:
             case DATE:
             case TIME_WITHOUT_TIME_ZONE:
-                return ((IntVector) v).get(idx);
+                return unpacker.unpackInt();
             case BIGINT:
-                return ((BigIntVector) v).get(idx);
+                return unpacker.unpackLong();
             case FLOAT:
-                return ((Float4Vector) v).get(idx);
+                return unpacker.unpackFloat();
             case DOUBLE:
-                return ((Float8Vector) v).get(idx);
+                return unpacker.unpackDouble();
             case CHAR:
-            case VARCHAR: {
-                // getObject returns Text/byte[] depending on version; toString is fine here
-                final Object o = v.getObject(idx);
-                return o == null ? null : StringData.fromString(o.toString());
-            }
+            case VARCHAR:
+                return StringData.fromString(unpacker.unpackString());
             case TIMESTAMP_WITHOUT_TIME_ZONE:
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                return TimestampData.fromEpochMillis(((TimeStampMilliVector) v).get(idx));
+                return TimestampData.fromEpochMillis(unpacker.unpackLong());
             case DECIMAL: {
                 final DecimalType dt = (DecimalType) type;
-                final BigDecimal bd = ((org.apache.arrow.vector.DecimalVector) v).getObject(idx);
-                return DecimalData.fromBigDecimal(bd, dt.getPrecision(), dt.getScale());
+                final MessageFormat format = unpacker.getNextFormat();
+                final ValueType valueType = format.getValueType();
+                switch (valueType) {
+                    case STRING:
+                        final DecimalData data = DecimalData.fromBigDecimal(
+                                new BigDecimal(unpacker.unpackString()),
+                                dt.getPrecision(),
+                                dt.getScale());
+                        if (data == null) {
+                            throw new TableException(
+                                    "Failed to deserialize DECIMAL("
+                                            + dt.getPrecision()
+                                            + ", "
+                                            + dt.getScale()
+                                            + ") from string");
+                        }
+                        return data;
+                    default:
+                        throw new TableException(
+                                "DECIMAL values must be encoded as STRING in MsgPack, but got "
+                                        + valueType);
+                }
             }
             case BINARY:
-            case VARBINARY:
-                return ((org.apache.arrow.vector.VarBinaryVector) v).get(idx);
+            case VARBINARY: {
+                final int len = unpacker.unpackBinaryHeader();
+                return unpacker.readPayload(len);
+            }
             default:
+                unpacker.skipValue();
                 return null;
         }
+    }
+
+    private static Object unpackFieldValueWithCast(
+            MessageUnpacker unpacker, LogicalType sourceType, LogicalType targetType)
+            throws IOException {
+        if (sourceType == null) {
+            return unpackFieldValue(unpacker, targetType);
+        }
+        final Object value = unpackFieldValue(unpacker, sourceType);
+        if (value == null || targetType == null) {
+            return value;
+        }
+        final LogicalTypeRoot sourceRoot = sourceType.getTypeRoot();
+        final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
+        if (sourceRoot == targetRoot
+                || (isStringRoot(sourceRoot) && isStringRoot(targetRoot))
+                || (isTimestampRoot(sourceRoot) && isTimestampRoot(targetRoot))) {
+            // Same family; ensure DECIMAL precision/scale normalization if needed.
+            if (sourceRoot == LogicalTypeRoot.DECIMAL) {
+                final DecimalType dt = (DecimalType) targetType;
+                return DecimalDataUtils.castFrom((DecimalData) value, dt.getPrecision(), dt.getScale());
+            }
+            return value;
+        }
+        return castValue(value, sourceType, targetType);
+    }
+
+    private static Object castValue(Object value, LogicalType sourceType, LogicalType targetType) {
+        final LogicalTypeRoot sourceRoot = sourceType.getTypeRoot();
+        final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
+
+        if (targetRoot == LogicalTypeRoot.DECIMAL) {
+            final DecimalType dt = (DecimalType) targetType;
+            if (value instanceof DecimalData) {
+                return DecimalDataUtils.castFrom((DecimalData) value, dt.getPrecision(), dt.getScale());
+            }
+            if (value instanceof StringData) {
+                return DecimalDataUtils.castFrom(
+                        value.toString(), dt.getPrecision(), dt.getScale());
+            }
+            if (value instanceof Number) {
+                if (sourceRoot == LogicalTypeRoot.FLOAT || sourceRoot == LogicalTypeRoot.DOUBLE) {
+                    return DecimalDataUtils.castFrom(
+                            ((Number) value).doubleValue(), dt.getPrecision(), dt.getScale());
+                }
+                return DecimalDataUtils.castFrom(
+                        ((Number) value).longValue(), dt.getPrecision(), dt.getScale());
+            }
+        }
+
+        if (sourceRoot == LogicalTypeRoot.DECIMAL) {
+            final DecimalData dec = (DecimalData) value;
+            final long integral = DecimalDataUtils.castToIntegral(dec);
+            switch (targetRoot) {
+                case BIGINT:
+                    return integral;
+                case INTEGER:
+                    return (int) integral;
+                case SMALLINT:
+                    return (short) integral;
+                case TINYINT:
+                    return (byte) integral;
+                case FLOAT:
+                    return (float) DecimalDataUtils.doubleValue(dec);
+                case DOUBLE:
+                    return DecimalDataUtils.doubleValue(dec);
+                default:
+                    break;
+            }
+        }
+
+        if (value instanceof Number) {
+            final Number number = (Number) value;
+            switch (targetRoot) {
+                case BIGINT:
+                    return number.longValue();
+                case INTEGER:
+                    return number.intValue();
+                case SMALLINT:
+                    return number.shortValue();
+                case TINYINT:
+                    return number.byteValue();
+                case FLOAT:
+                    return number.floatValue();
+                case DOUBLE:
+                    return number.doubleValue();
+                default:
+                    break;
+            }
+        }
+
+        if (isStringRoot(targetRoot)) {
+            if (value instanceof StringData) {
+                return value;
+            }
+            return StringData.fromString(String.valueOf(value));
+        }
+
+        throw new TableException(
+                "ProxyOperator cannot cast "
+                        + sourceType.asSerializableString()
+                        + " to "
+                        + targetType.asSerializableString());
     }
 
     // ------------------------------------------------------------------------
@@ -1130,9 +1194,11 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         private static final int DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
         private static final int DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024;
 
-        // Arrow batching defaults
+        // MsgPack batching defaults
         private static final int DEFAULT_BATCH_MAX_ROWS = 8192;
         private static final int DEFAULT_REORDER_MAX_BUFFER = 10000;
+        private static final int DEFAULT_FLUSH_INTERVAL_MS = 0;
+        private static final boolean DEFAULT_POST_ROLE_ONLY = true;
 
         private final List<ProxyEndpoint> proxies;
         private final ProxyEndpoint selectedProxy;
@@ -1151,13 +1217,15 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         private final List<String> resultFieldNames;
         private final List<String> resultFieldTypes;
         private final List<Integer> resultUdfFieldIndices;
+        private final List<String> resultUdfFieldTypes;
 
-        // re-used knobs (interpreted for Arrow)
+        // batching knobs (interpreted for MsgPack streaming)
         private final boolean flushOnWrite; // if true, flush after each append (low latency, low throughput)
-        private final int flushEvery; // if >0, flush once batch has this many rows (<= batchMaxRows)
         private final int batchMaxRows;
+        private final int flushIntervalMs;
         private final boolean reorderResponses;
         private final int reorderMaxBuffer;
+        private final boolean postRoleOnly;
 
         private ProxyTcpConfig(
                 int bufferSize,
@@ -1165,8 +1233,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 int readTimeoutMs,
                 int maxFrameSize,
                 boolean flushOnWrite,
-                int flushEvery,
                 int batchMaxRows,
+                int flushIntervalMs,
                 Integer calcFieldIndex,
                 String calcFieldName,
                 String functionClass,
@@ -1177,9 +1245,11 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 List<Integer> resultFieldIndices,
                 List<String> resultFieldNames,
                 List<String> resultFieldTypes,
+                List<String> resultUdfFieldTypes,
                 List<Integer> resultUdfFieldIndices,
                 boolean reorderResponses,
                 int reorderMaxBuffer,
+                boolean postRoleOnly,
                 List<ProxyEndpoint> proxies,
                 ProxyEndpoint selectedProxy) {
             this.bufferSize = bufferSize;
@@ -1187,8 +1257,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             this.readTimeoutMs = readTimeoutMs;
             this.maxFrameSize = maxFrameSize;
             this.flushOnWrite = flushOnWrite;
-            this.flushEvery = flushEvery;
             this.batchMaxRows = batchMaxRows;
+            this.flushIntervalMs = flushIntervalMs;
             this.calcFieldIndex = calcFieldIndex;
             this.calcFieldName = calcFieldName;
             this.functionClass = functionClass;
@@ -1200,10 +1270,12 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             this.resultFieldNames = resultFieldNames;
             this.resultFieldTypes = resultFieldTypes;
             this.resultUdfFieldIndices = resultUdfFieldIndices;
+            this.resultUdfFieldTypes = resultUdfFieldTypes;
             this.reorderResponses = reorderResponses;
             this.reorderMaxBuffer = reorderMaxBuffer;
             this.proxies = proxies;
             this.selectedProxy = selectedProxy;
+            this.postRoleOnly = postRoleOnly;
         }
 
         static ProxyTcpConfig from(String conf) {
@@ -1215,8 +1287,9 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             final int maxFrameSize = parseInt(map.get("maxframesize"), DEFAULT_MAX_FRAME_SIZE);
 
             final boolean flushOnWrite = parseBoolean(map.get("flush"), false);
-            final int flushEvery = parseInt(map.get("flushevery"), 0);
             final int batchMaxRows = parseInt(map.get("batchmaxrows"), DEFAULT_BATCH_MAX_ROWS);
+            final int flushIntervalMs =
+                    parseInt(map.get("flushintervalms"), DEFAULT_FLUSH_INTERVAL_MS);
             final Integer calcFieldIndex = parseInt(map.get("calcfieldindex"));
             final String calcFieldName = map.get("calcfieldname");
             final String functionClass = firstNonNull(map, "class", "functionclass");
@@ -1228,8 +1301,11 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             final List<String> resultFieldNames = parseStringList(map.get("resultfieldnames"));
             final List<String> resultFieldTypes = parseStringList(map.get("resultfieldtypes"));
             final List<Integer> resultUdfFieldIndices = parseIntList(map.get("resultudffieldindices"));
+            final List<String> resultUdfFieldTypes = parseStringList(map.get("resultudffieldtypes"));
             final boolean reorderResponses = parseBoolean(firstNonNull(map, "reorder", "correlate"), false);
             final int reorderMaxBuffer = parseInt(map.get("reordermax"), DEFAULT_REORDER_MAX_BUFFER);
+            final boolean postRoleOnly =
+                    parseBoolean(map.get("postroleonly"), DEFAULT_POST_ROLE_ONLY);
 
             final List<ProxyEndpoint> proxies = parseProxies(map.get("proxies"));
             final ProxyEndpoint selectedProxy = proxies.get(0);
@@ -1240,8 +1316,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                     readTimeoutMs,
                     maxFrameSize,
                     flushOnWrite,
-                    flushEvery,
                     batchMaxRows,
+                    flushIntervalMs,
                     calcFieldIndex,
                     calcFieldName,
                     functionClass,
@@ -1252,9 +1328,11 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                     resultFieldIndices,
                     resultFieldNames,
                     resultFieldTypes,
+                    resultUdfFieldTypes,
                     resultUdfFieldIndices,
                     reorderResponses,
                     reorderMaxBuffer,
+                    postRoleOnly,
                     proxies,
                     selectedProxy);
         }

@@ -77,6 +77,8 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
     public static final String FIELD_NAME_PROXY_RESULT_FIELD_INDICES = "proxyResultFieldIndices";
     public static final String FIELD_NAME_PROXY_RESULT_FIELD_NAMES = "proxyResultFieldNames";
     public static final String FIELD_NAME_PROXY_RESULT_FIELD_TYPES = "proxyResultFieldTypes";
+    public static final String FIELD_NAME_PROXY_RESULT_UDF_FIELD_TYPES =
+            "proxyResultUdfFieldTypes";
     public static final String FIELD_NAME_PROXY_RESULT_UDF_FIELD_INDICES =
             "proxyResultUdfFieldIndices";
 
@@ -91,6 +93,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
     private final @Nullable List<Integer> proxyResultFieldIndices;
     private final @Nullable List<String> proxyResultFieldNames;
     private final @Nullable List<String> proxyResultFieldTypes;
+    private final @Nullable List<String> proxyResultUdfFieldTypes;
     private final @Nullable List<Integer> proxyResultUdfFieldIndices;
 
     static {
@@ -108,25 +111,12 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             RowType outputType,
             String description) {
         this(
-                ExecNodeContext.newNodeId(),
-                ExecNodeContext.newContext(StreamExecCalc.class),
-                ExecNodeContext.newPersistedConfig(StreamExecCalc.class, tableConfig),
+                tableConfig,
                 projection,
                 condition,
-                Collections.singletonList(inputProperty),
+                inputProperty,
                 outputType,
                 description,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
                 null);
     }
 
@@ -158,6 +148,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 null,
                 null,
                 null,
+                null,
                 null);
     }
 
@@ -179,6 +170,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             @Nullable List<Integer> proxyResultFieldIndices,
             @Nullable List<String> proxyResultFieldNames,
             @Nullable List<String> proxyResultFieldTypes,
+            @Nullable List<String> proxyResultUdfFieldTypes,
             @Nullable List<Integer> proxyResultUdfFieldIndices) {
         this(
                 ExecNodeContext.newNodeId(),
@@ -200,6 +192,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 proxyResultFieldIndices,
                 proxyResultFieldNames,
                 proxyResultFieldTypes,
+                proxyResultUdfFieldTypes,
                 proxyResultUdfFieldIndices);
     }
 
@@ -230,6 +223,8 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                     @Nullable List<String> proxyResultFieldNames,
             @JsonProperty(FIELD_NAME_PROXY_RESULT_FIELD_TYPES)
                     @Nullable List<String> proxyResultFieldTypes,
+            @JsonProperty(FIELD_NAME_PROXY_RESULT_UDF_FIELD_TYPES)
+                    @Nullable List<String> proxyResultUdfFieldTypes,
             @JsonProperty(FIELD_NAME_PROXY_RESULT_UDF_FIELD_INDICES)
                     @Nullable List<Integer> proxyResultUdfFieldIndices) {
         super(
@@ -254,6 +249,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
         this.proxyResultFieldIndices = proxyResultFieldIndices;
         this.proxyResultFieldNames = proxyResultFieldNames;
         this.proxyResultFieldTypes = proxyResultFieldTypes;
+        this.proxyResultUdfFieldTypes = proxyResultUdfFieldTypes;
         this.proxyResultUdfFieldIndices = proxyResultUdfFieldIndices;
         LOG.info(
                 "StreamExecCalc ctor: id={}, projectionSize={}, conditionPresent={}, proxyConfPresent={}, proxyFieldIndex={}, proxyFieldName={}, proxyFunctionClass={}, proxyFunctionKind={}, proxyArgFieldIndices={}, proxyResultFieldIndices={}",
@@ -337,7 +333,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                     proxyArgFieldTypes != null
                             ? proxyArgFieldTypes
                             : rewriter.getProxyArgFieldTypes();
-            final List<String> resolvedResultFieldNames =
+            List<String> resolvedResultFieldNames =
                     proxyResultFieldNames != null
                             ? proxyResultFieldNames
                             : rewriter.getProxyResultFieldNames();
@@ -349,6 +345,30 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                     proxyResultFieldIndices != null
                             ? proxyResultFieldIndices
                             : rewriter.getProxyResultFieldIndices();
+            if (resolvedResultFieldIndices != null && !resolvedResultFieldIndices.isEmpty()) {
+                // Ensure result metadata is aligned with the current output row type.
+                // This guards against missing or stale result type/name info from the rewriter.
+                final List<String> outputFieldTypes =
+                        resolveFieldTypesFromOutput(outputRowType, resolvedResultFieldIndices);
+                if (resolvedResultFieldTypes == null
+                        || resolvedResultFieldTypes.size() != resolvedResultFieldIndices.size()
+                        || containsNullOrEmpty(resolvedResultFieldTypes)
+                        || !resolvedResultFieldTypes.equals(outputFieldTypes)) {
+                    resolvedResultFieldTypes = outputFieldTypes;
+                }
+                final List<String> outputFieldNames =
+                        resolveFieldNamesFromOutput(outputRowType, resolvedResultFieldIndices);
+                if (resolvedResultFieldNames == null
+                        || resolvedResultFieldNames.size() != resolvedResultFieldIndices.size()
+                        || containsNullOrEmpty(resolvedResultFieldNames)
+                        || !resolvedResultFieldNames.equals(outputFieldNames)) {
+                    resolvedResultFieldNames = outputFieldNames;
+                }
+            }
+            final List<String> resolvedResultUdfFieldTypes =
+                    proxyResultUdfFieldTypes != null
+                            ? proxyResultUdfFieldTypes
+                            : rewriter.getProxyResultUdfFieldTypes();
             final List<Integer> resolvedResultUdfFieldIndices =
                     proxyResultUdfFieldIndices != null
                             ? proxyResultUdfFieldIndices
@@ -387,6 +407,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                             resolvedResultFieldIndices,
                             resolvedResultFieldNames,
                             resolvedResultFieldTypes,
+                            resolvedResultUdfFieldTypes,
                             resolvedResultUdfFieldIndices);
             LOG.info(
                     "Proxy rewrite injecting pre/post operators: functionClass={}, functionKind={}, argFieldIndices={}, resultFieldIndices={}, conf={}",
@@ -449,5 +470,51 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             result = appendConfValue(result, "calcFieldName", fieldName);
         }
         return result;
+    }
+
+    private static boolean containsNullOrEmpty(@Nullable List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return true;
+        }
+        for (String value : values) {
+            if (value == null || value.trim().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<String> resolveFieldTypesFromOutput(
+            RowType outputRowType, List<Integer> fieldIndices) {
+        if (fieldIndices == null || fieldIndices.isEmpty()) {
+            return Collections.emptyList();
+        }
+        final List<RowType.RowField> fields = outputRowType.getFields();
+        final List<String> types = new ArrayList<>(fieldIndices.size());
+        for (Integer idx : fieldIndices) {
+            if (idx == null || idx < 0 || idx >= fields.size()) {
+                types.add(null);
+            } else {
+                types.add(fields.get(idx).getType().asSerializableString());
+            }
+        }
+        return types;
+    }
+
+    private static List<String> resolveFieldNamesFromOutput(
+            RowType outputRowType, List<Integer> fieldIndices) {
+        if (fieldIndices == null || fieldIndices.isEmpty()) {
+            return Collections.emptyList();
+        }
+        final List<RowType.RowField> fields = outputRowType.getFields();
+        final List<String> names = new ArrayList<>(fieldIndices.size());
+        for (Integer idx : fieldIndices) {
+            if (idx == null || idx < 0 || idx >= fields.size()) {
+                names.add(null);
+            } else {
+                names.add(fields.get(idx).getName());
+            }
+        }
+        return names;
     }
 }
