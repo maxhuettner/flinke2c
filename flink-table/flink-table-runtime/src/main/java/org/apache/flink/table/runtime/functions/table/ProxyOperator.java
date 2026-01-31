@@ -105,12 +105,24 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     private transient List<Integer> payloadFieldIndices;
     private transient List<String> payloadFieldNames;
     private transient List<LogicalType> payloadWriteTypes;
+    private transient LogicalTypeRoot[] payloadSourceRoots;
+    private transient LogicalTypeRoot[] payloadTargetRoots;
+    private transient int[] payloadTargetPrecision;
+    private transient int[] payloadTargetScale;
+    private transient int[] payloadSourcePrecision;
+    private transient int[] payloadSourceScale;
+    private transient int[] payloadTimestampPrecision;
     private transient List<Integer> resultFieldIndices;
     private transient List<LogicalType> resultFieldTypes;
     private transient List<LogicalType> resultReadTypes;
     private transient List<LogicalType> postFieldTypes;
     private transient RowData.FieldGetter[] resultFieldGetters;
     private transient RowData.FieldGetter[] fullRowFieldGetters;
+    private transient GenericRowData insertPlaceholder;
+    private transient GenericRowData updateAfterPlaceholder;
+    private transient GenericRowData updateBeforePlaceholder;
+    private transient GenericRowData deletePlaceholder;
+    private transient int inputFieldCount;
 
     // shared socket
     private transient Socket socket;
@@ -160,8 +172,8 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     public void processElement(StreamRecord<RowData> element) throws Exception {
         if (side == Side.PRE) {
             appendRowToMsgPack(element.getValue());
-        final RowData placeholder = createPlaceholderRow(element.getValue().getRowKind());
-        output.collect(element.replace(placeholder));
+            final RowData placeholder = createPlaceholderRow(element.getValue().getRowKind());
+            output.collect(element.replace(placeholder));
         } else {
             final RowData proxyRow;
             if (tcpConfig.reorderResponses) {
@@ -178,6 +190,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         final List<RowType.RowField> inputFields = inputRowType.getFields();
         final List<RowType.RowField> resultFields = resultRowType.getFields();
         final int fieldCount = inputFields.size();
+        this.inputFieldCount = fieldCount;
         final List<Integer> indices = new ArrayList<>();
 
         for (int i = 0; i < fieldCount; i++) {
@@ -244,6 +257,43 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 payloadWriteTypes.add(argType);
             } else {
                 payloadWriteTypes.add(inputFields.get(i).getType());
+            }
+        }
+        final int payloadSize = payloadFieldIndices.size();
+        this.payloadSourceRoots = new LogicalTypeRoot[payloadSize];
+        this.payloadTargetRoots = new LogicalTypeRoot[payloadSize];
+        this.payloadTargetPrecision = new int[payloadSize];
+        this.payloadTargetScale = new int[payloadSize];
+        this.payloadSourcePrecision = new int[payloadSize];
+        this.payloadSourceScale = new int[payloadSize];
+        this.payloadTimestampPrecision = new int[payloadSize];
+        for (int i = 0; i < payloadSize; i++) {
+            final LogicalType sourceType = fieldTypes.get(i);
+            final LogicalType targetType = payloadWriteTypes.get(i);
+            payloadSourceRoots[i] = sourceType.getTypeRoot();
+            payloadTargetRoots[i] = targetType.getTypeRoot();
+            payloadTargetPrecision[i] = -1;
+            payloadTargetScale[i] = -1;
+            payloadSourcePrecision[i] = -1;
+            payloadSourceScale[i] = -1;
+            payloadTimestampPrecision[i] = -1;
+            if (payloadTargetRoots[i] == LogicalTypeRoot.DECIMAL) {
+                final DecimalType dt = (DecimalType) targetType;
+                payloadTargetPrecision[i] = dt.getPrecision();
+                payloadTargetScale[i] = dt.getScale();
+            }
+            if (payloadSourceRoots[i] == LogicalTypeRoot.DECIMAL) {
+                final DecimalType dt = (DecimalType) sourceType;
+                payloadSourcePrecision[i] = dt.getPrecision();
+                payloadSourceScale[i] = dt.getScale();
+            }
+            if (isTimestampRoot(payloadSourceRoots[i])) {
+                if (sourceType instanceof TimestampType) {
+                    payloadTimestampPrecision[i] = ((TimestampType) sourceType).getPrecision();
+                } else if (sourceType instanceof LocalZonedTimestampType) {
+                    payloadTimestampPrecision[i] =
+                            ((LocalZonedTimestampType) sourceType).getPrecision();
+                }
             }
         }
 
@@ -358,10 +408,36 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     }
 
     private RowData createPlaceholderRow(RowKind kind) {
-        final int fieldCount = inputRowType.getFieldCount();
-        final GenericRowData row = new GenericRowData(fieldCount);
-        row.setRowKind(kind);
-        return row;
+        switch (kind) {
+            case INSERT:
+                if (insertPlaceholder == null) {
+                    insertPlaceholder = new GenericRowData(inputFieldCount);
+                    insertPlaceholder.setRowKind(RowKind.INSERT);
+                }
+                return insertPlaceholder;
+            case UPDATE_AFTER:
+                if (updateAfterPlaceholder == null) {
+                    updateAfterPlaceholder = new GenericRowData(inputFieldCount);
+                    updateAfterPlaceholder.setRowKind(RowKind.UPDATE_AFTER);
+                }
+                return updateAfterPlaceholder;
+            case UPDATE_BEFORE:
+                if (updateBeforePlaceholder == null) {
+                    updateBeforePlaceholder = new GenericRowData(inputFieldCount);
+                    updateBeforePlaceholder.setRowKind(RowKind.UPDATE_BEFORE);
+                }
+                return updateBeforePlaceholder;
+            case DELETE:
+                if (deletePlaceholder == null) {
+                    deletePlaceholder = new GenericRowData(inputFieldCount);
+                    deletePlaceholder.setRowKind(RowKind.DELETE);
+                }
+                return deletePlaceholder;
+            default:
+                final GenericRowData row = new GenericRowData(inputFieldCount);
+                row.setRowKind(kind);
+                return row;
+        }
     }
 
     @Override
@@ -454,9 +530,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 packer.packNil();
                 continue;
             }
-            final LogicalType targetType = payloadWriteTypes.get(i);
-            final LogicalType sourceType = fieldTypes.get(i);
-            packFieldValueWithCast(packer, targetType, sourceType, row, sourceIndex);
+            packFieldValueFast(packer, i, row, sourceIndex);
         }
     }
 
@@ -970,7 +1044,10 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                                     + " to "
                                     + targetType.asSerializableString());
             }
-            final BigDecimal scaled = bd.setScale(dt.getScale(), RoundingMode.HALF_UP);
+            final BigDecimal scaled =
+                    bd.scale() == dt.getScale()
+                            ? bd
+                            : bd.setScale(dt.getScale(), RoundingMode.HALF_UP);
             packer.packString(scaled.toPlainString());
             return;
         }
@@ -1043,6 +1120,128 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             case BINARY:
             case VARBINARY: {
                 final byte[] bytes = row.getBinary(pos);
+                packer.packBinaryHeader(bytes.length);
+                packer.writePayload(bytes);
+                return;
+            }
+            default:
+                packer.packNil();
+        }
+    }
+
+    private void packFieldValueFast(
+            MessagePacker packer, int payloadPos, RowData row, int sourceIndex) throws IOException {
+        final LogicalTypeRoot targetRoot = payloadTargetRoots[payloadPos];
+        final LogicalTypeRoot sourceRoot = payloadSourceRoots[payloadPos];
+
+        if (targetRoot == sourceRoot
+                || (isStringRoot(targetRoot) && isStringRoot(sourceRoot))
+                || (isTimestampRoot(targetRoot) && isTimestampRoot(sourceRoot))) {
+            packFieldValueFastByRoot(packer, payloadPos, row, sourceIndex);
+            return;
+        }
+
+        if (targetRoot == LogicalTypeRoot.DECIMAL) {
+            final int precision = payloadTargetPrecision[payloadPos];
+            final int scale = payloadTargetScale[payloadPos];
+            final BigDecimal bd;
+            switch (sourceRoot) {
+                case BIGINT:
+                    bd = BigDecimal.valueOf(row.getLong(sourceIndex));
+                    break;
+                case INTEGER:
+                    bd = BigDecimal.valueOf(row.getInt(sourceIndex));
+                    break;
+                case SMALLINT:
+                    bd = BigDecimal.valueOf(row.getShort(sourceIndex));
+                    break;
+                case TINYINT:
+                    bd = BigDecimal.valueOf(row.getByte(sourceIndex));
+                    break;
+                case FLOAT:
+                    bd = BigDecimal.valueOf(row.getFloat(sourceIndex));
+                    break;
+                case DOUBLE:
+                    bd = BigDecimal.valueOf(row.getDouble(sourceIndex));
+                    break;
+                case DECIMAL: {
+                    final DecimalData dec =
+                            row.getDecimal(
+                                    sourceIndex,
+                                    payloadSourcePrecision[payloadPos],
+                                    payloadSourceScale[payloadPos]);
+                    bd = dec.toBigDecimal();
+                    break;
+                }
+                default:
+                    throw new TableException(
+                            "ProxyOperator cannot cast "
+                                    + sourceRoot
+                                    + " to DECIMAL("
+                                    + precision
+                                    + ", "
+                                    + scale
+                                    + ")");
+            }
+            final BigDecimal scaled =
+                    bd.scale() == scale ? bd : bd.setScale(scale, RoundingMode.HALF_UP);
+            packer.packString(scaled.toPlainString());
+            return;
+        }
+
+        throw new TableException(
+                "ProxyOperator cannot cast " + sourceRoot + " to " + targetRoot);
+    }
+
+    private void packFieldValueFastByRoot(
+            MessagePacker packer, int payloadPos, RowData row, int sourceIndex) throws IOException {
+        switch (payloadTargetRoots[payloadPos]) {
+            case BOOLEAN:
+                packer.packBoolean(row.getBoolean(sourceIndex));
+                return;
+            case TINYINT:
+                packer.packByte(row.getByte(sourceIndex));
+                return;
+            case SMALLINT:
+                packer.packShort(row.getShort(sourceIndex));
+                return;
+            case INTEGER:
+            case DATE:
+            case TIME_WITHOUT_TIME_ZONE:
+                packer.packInt(row.getInt(sourceIndex));
+                return;
+            case BIGINT:
+                packer.packLong(row.getLong(sourceIndex));
+                return;
+            case FLOAT:
+                packer.packFloat(row.getFloat(sourceIndex));
+                return;
+            case DOUBLE:
+                packer.packDouble(row.getDouble(sourceIndex));
+                return;
+            case CHAR:
+            case VARCHAR:
+                packer.packString(row.getString(sourceIndex).toString());
+                return;
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE: {
+                final int precision = payloadTimestampPrecision[payloadPos];
+                final long ms = row.getTimestamp(sourceIndex, precision).getMillisecond();
+                packer.packLong(ms);
+                return;
+            }
+            case DECIMAL: {
+                final DecimalData dec =
+                        row.getDecimal(
+                                sourceIndex,
+                                payloadTargetPrecision[payloadPos],
+                                payloadTargetScale[payloadPos]);
+                packer.packString(dec.toString());
+                return;
+            }
+            case BINARY:
+            case VARBINARY: {
+                final byte[] bytes = row.getBinary(sourceIndex);
                 packer.packBinaryHeader(bytes.length);
                 packer.writePayload(bytes);
                 return;
