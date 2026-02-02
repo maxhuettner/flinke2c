@@ -27,7 +27,6 @@ import org.apache.flink.table.data.DecimalDataUtils;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
-import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.table.runtime.operators.TableStreamOperator;
 import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.LocalZonedTimestampType;
@@ -38,11 +37,7 @@ import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.utils.LogicalTypeParser;
 import org.apache.flink.types.RowKind;
 
-import org.msgpack.core.MessageFormat;
-import org.msgpack.core.MessagePack;
-import org.msgpack.core.MessagePacker;
-import org.msgpack.core.MessageUnpacker;
-import org.msgpack.value.ValueType;
+import org.apache.flink.table.runtime.functions.table.ProxyBinaryCodec.WireType;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,13 +47,9 @@ import javax.annotation.Nullable;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
-import java.io.EOFException;
 import java.io.Flushable;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URLDecoder;
@@ -74,14 +65,12 @@ import java.util.stream.Collectors;
 /**
  * A proxy operator that forwards records through an external TCP process.
  *
- * <p>
- * The PRE side sends input rows, the POST side receives processed rows and
- * emits them
- * downstream.
+ * <p>PRE sends input rows (binary framed format) to an external process.
+ * POST receives processed rows (binary framed format) and emits them downstream.
  *
- * <p>
- * PRE sends a full JSON config preamble (length-prefixed) before the MessagePack
- * stream begins. POST can send a minimal preamble (role only) if configured.
+ * <p>PRE sends a JSON config preamble (length-prefixed, big-endian int32 length)
+ * before the binary framed stream begins. POST can send a minimal preamble (role only)
+ * if configured.
  */
 @Internal
 public class ProxyOperator extends TableStreamOperator<RowData>
@@ -101,23 +90,28 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     private final RowType resultRowType;
 
     private transient ProxyTcpConfig tcpConfig;
-    private transient List<LogicalType> fieldTypes;
+
     private transient List<Integer> payloadFieldIndices;
+    private transient int[] payloadFieldIndicesArray;
     private transient List<String> payloadFieldNames;
     private transient List<LogicalType> payloadWriteTypes;
     private transient LogicalTypeRoot[] payloadSourceRoots;
-    private transient LogicalTypeRoot[] payloadTargetRoots;
     private transient int[] payloadTargetPrecision;
     private transient int[] payloadTargetScale;
     private transient int[] payloadSourcePrecision;
     private transient int[] payloadSourceScale;
     private transient int[] payloadTimestampPrecision;
+    private transient WireType[] payloadWireTypes;
+
     private transient List<Integer> resultFieldIndices;
     private transient List<LogicalType> resultFieldTypes;
     private transient List<LogicalType> resultReadTypes;
     private transient List<LogicalType> postFieldTypes;
+    private transient WireType[] resultWireTypes;
+
     private transient RowData.FieldGetter[] resultFieldGetters;
     private transient RowData.FieldGetter[] fullRowFieldGetters;
+
     private transient GenericRowData insertPlaceholder;
     private transient GenericRowData updateAfterPlaceholder;
     private transient GenericRowData updateBeforePlaceholder;
@@ -127,18 +121,16 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     // shared socket
     private transient Socket socket;
 
-    // PRE (MsgPack writer + batch state)
+    // PRE (binary writer + batch state)
     private transient BufferedOutputStream out;
-    private transient MessagePacker packer;
-
+    private transient ProxyBinaryCodec codec;
     private transient int batchMaxRows;
     private transient int batchRowIndex;
     private transient long nextRowId;
     private transient boolean flushTimerScheduled;
 
-    // POST (MsgPack reader)
+    // POST (binary reader)
     private transient BufferedInputStream in;
-    private transient MessageUnpacker unpacker;
     private transient long expectedRowId;
     private transient Map<Long, RowData> reorderBuffer;
 
@@ -150,8 +142,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         this.conf = conf == null ? "" : conf;
         this.side = side == null ? Side.PRE : side;
         this.inputRowType = Objects.requireNonNull(inputRowType, "inputRowType");
-        this.resultRowType =
-                resultRowType == null ? this.inputRowType : resultRowType;
+        this.resultRowType = resultRowType == null ? this.inputRowType : resultRowType;
     }
 
     @Override
@@ -171,7 +162,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     @Override
     public void processElement(StreamRecord<RowData> element) throws Exception {
         if (side == Side.PRE) {
-            appendRowToMsgPack(element.getValue());
+            appendRowToBinary(element.getValue());
             final RowData placeholder = createPlaceholderRow(element.getValue().getRowKind());
             output.collect(element.replace(placeholder));
         } else {
@@ -181,36 +172,49 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             } else {
                 proxyRow = readNextRow(element.getValue().getRowKind());
             }
-            final RowData outRow = proxyRow;
+
+            // IMPORTANT: merge returned fields into the incoming (placeholder) row
+            // so the output row always matches the full input row arity.
+            final RowData outRow = mergeProxyRow(element.getValue(), proxyRow);
             output.collect(element.replace(outRow));
         }
     }
 
     private void initializePayloadFields() {
+        List<LogicalType> fieldTypes;
+        LogicalTypeRoot[] payloadTargetRoots;
         final List<RowType.RowField> inputFields = inputRowType.getFields();
         final List<RowType.RowField> resultFields = resultRowType.getFields();
         final int fieldCount = inputFields.size();
         this.inputFieldCount = fieldCount;
-        final List<Integer> indices = new ArrayList<>();
 
+        // payload indices (currently: all fields)
+        final List<Integer> indices = new ArrayList<>(fieldCount);
         for (int i = 0; i < fieldCount; i++) {
             indices.add(i);
         }
         this.payloadFieldIndices = indices;
-        this.fieldTypes =
+        this.payloadFieldIndicesArray = toIntArray(indices);
+
+        fieldTypes =
                 indices.stream()
                         .map(i -> inputFields.get(i).getType())
                         .collect(Collectors.toList());
+
         this.payloadFieldNames = new ArrayList<>(indices.size());
         for (int idx : indices) {
             payloadFieldNames.add(inputFields.get(idx).getName());
         }
+
+        // optional override arg types
         final Map<Integer, LogicalType> argTypeByIndex = new HashMap<>();
         if (tcpConfig.argFieldTypes != null && !tcpConfig.argFieldTypes.isEmpty()) {
             final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
+
             if (tcpConfig.argFieldIndices != null
                     && !tcpConfig.argFieldIndices.isEmpty()
                     && tcpConfig.argFieldIndices.size() == tcpConfig.argFieldTypes.size()) {
+
                 for (int i = 0; i < tcpConfig.argFieldIndices.size(); i++) {
                     final Integer idx = tcpConfig.argFieldIndices.get(i);
                     final String typeString = tcpConfig.argFieldTypes.get(i);
@@ -222,9 +226,11 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                     }
                     argTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
                 }
+
             } else if (tcpConfig.argFieldNames != null
                     && !tcpConfig.argFieldNames.isEmpty()
                     && tcpConfig.argFieldNames.size() == tcpConfig.argFieldTypes.size()) {
+
                 final Map<String, Integer> nameToIndex = new HashMap<>();
                 for (int i = 0; i < fieldCount; i++) {
                     final String name = inputFields.get(i).getName();
@@ -232,6 +238,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                         nameToIndex.put(name.toLowerCase(Locale.ROOT), i);
                     }
                 }
+
                 for (int i = 0; i < tcpConfig.argFieldNames.size(); i++) {
                     final String name = tcpConfig.argFieldNames.get(i);
                     final String typeString = tcpConfig.argFieldTypes.get(i);
@@ -259,24 +266,37 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 payloadWriteTypes.add(inputFields.get(i).getType());
             }
         }
+
+        // PRE: wire types for payload fields (excluding __op/__rowId)
         final int payloadSize = payloadFieldIndices.size();
+        final WireType[] payloadWireTypes = new WireType[payloadSize];
+        for (int i = 0; i < payloadSize; i++) {
+            payloadWireTypes[i] = ProxyBinaryCodec.wireTypeFor(payloadWriteTypes.get(i));
+        }
+        this.payloadWireTypes = payloadWireTypes;
+
+        // caches for fast decimal/timestamp paths used by codec writer
         this.payloadSourceRoots = new LogicalTypeRoot[payloadSize];
-        this.payloadTargetRoots = new LogicalTypeRoot[payloadSize];
+        payloadTargetRoots = new LogicalTypeRoot[payloadSize];
         this.payloadTargetPrecision = new int[payloadSize];
         this.payloadTargetScale = new int[payloadSize];
         this.payloadSourcePrecision = new int[payloadSize];
         this.payloadSourceScale = new int[payloadSize];
         this.payloadTimestampPrecision = new int[payloadSize];
+
         for (int i = 0; i < payloadSize; i++) {
             final LogicalType sourceType = fieldTypes.get(i);
             final LogicalType targetType = payloadWriteTypes.get(i);
+
             payloadSourceRoots[i] = sourceType.getTypeRoot();
             payloadTargetRoots[i] = targetType.getTypeRoot();
+
             payloadTargetPrecision[i] = -1;
             payloadTargetScale[i] = -1;
             payloadSourcePrecision[i] = -1;
             payloadSourceScale[i] = -1;
             payloadTimestampPrecision[i] = -1;
+
             if (payloadTargetRoots[i] == LogicalTypeRoot.DECIMAL) {
                 final DecimalType dt = (DecimalType) targetType;
                 payloadTargetPrecision[i] = dt.getPrecision();
@@ -297,6 +317,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             }
         }
 
+        // result fields (POST output schema)
         this.resultFieldIndices = new ArrayList<>(resultFields.size());
         for (int i = 0; i < resultFields.size(); i++) {
             resultFieldIndices.add(i);
@@ -306,9 +327,11 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                         .map(i -> resultFields.get(i).getType())
                         .collect(Collectors.toList());
 
+        // optional override udf types
         final Map<Integer, LogicalType> udfTypeByIndex = new HashMap<>();
         final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
         boolean mappedByIndex = false;
+
         if (tcpConfig.resultFieldIndices != null
                 && !tcpConfig.resultFieldIndices.isEmpty()
                 && tcpConfig.resultUdfFieldTypes != null
@@ -327,8 +350,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             }
         } else if (tcpConfig.resultUdfFieldIndices != null
                 && tcpConfig.resultUdfFieldTypes != null
-                && tcpConfig.resultUdfFieldIndices.size()
-                        == tcpConfig.resultUdfFieldTypes.size()) {
+                && tcpConfig.resultUdfFieldIndices.size() == tcpConfig.resultUdfFieldTypes.size()) {
             for (int i = 0; i < tcpConfig.resultUdfFieldIndices.size(); i++) {
                 final Integer idx = tcpConfig.resultUdfFieldIndices.get(i);
                 final String typeString = tcpConfig.resultUdfFieldTypes.get(i);
@@ -342,6 +364,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 mappedByIndex = true;
             }
         }
+
         if (!mappedByIndex
                 && tcpConfig.resultFieldNames != null
                 && tcpConfig.resultUdfFieldTypes != null
@@ -379,24 +402,37 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 postFieldTypes.add(inputFields.get(i).getType());
             }
         }
-        this.resultReadTypes = new ArrayList<>(postFieldTypes);
 
+        // IMPORTANT: align resultReadTypes with resultFieldIndices
+        this.resultReadTypes = new ArrayList<>(resultFieldIndices.size());
+        for (int i = 0; i < resultFieldIndices.size(); i++) {
+            final int idx = resultFieldIndices.get(i);
+            this.resultReadTypes.add(postFieldTypes.get(idx));
+        }
+
+        // wire types for POST read
+        final WireType[] resultWireTypes = new WireType[resultReadTypes.size()];
+        for (int i = 0; i < resultReadTypes.size(); i++) {
+            resultWireTypes[i] = ProxyBinaryCodec.wireTypeFor(resultReadTypes.get(i));
+        }
+        this.resultWireTypes = resultWireTypes;
+
+        // field getters for merge
         this.resultFieldGetters = new RowData.FieldGetter[resultFieldTypes.size()];
         for (int i = 0; i < resultFieldTypes.size(); i++) {
             resultFieldGetters[i] = RowData.createFieldGetter(resultFieldTypes.get(i), i);
         }
         this.fullRowFieldGetters = new RowData.FieldGetter[fieldCount];
         for (int i = 0; i < fieldCount; i++) {
-            fullRowFieldGetters[i] =
-                    RowData.createFieldGetter(inputFields.get(i).getType(), i);
+            fullRowFieldGetters[i] = RowData.createFieldGetter(inputFields.get(i).getType(), i);
         }
-        return;
     }
 
     private RowData mergeProxyRow(RowData baseRow, RowData proxyRow) {
         final int fieldCount = inputRowType.getFieldCount();
         final GenericRowData outRow = new GenericRowData(fieldCount);
         outRow.setRowKind(proxyRow.getRowKind());
+
         for (int i = 0; i < fieldCount; i++) {
             outRow.setField(i, fullRowFieldGetters[i].getFieldOrNull(baseRow));
         }
@@ -474,72 +510,67 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         this.socket = connectSocket(proxy.host, port, tcpConfig.connectTimeoutMs);
         this.out = new BufferedOutputStream(socket.getOutputStream(), tcpConfig.bufferSize);
 
-        // 1) PREAMBLE: send one config JSON message BEFORE MsgPack starts
+        // preamble
         final String configJson = buildConfigJson(side);
         writeLengthPrefixedJson(out, configJson);
 
-        // 2) MsgPack stream starts immediately after preamble bytes
         this.batchMaxRows = tcpConfig.batchMaxRows;
         this.batchRowIndex = 0;
         this.nextRowId = 0L;
 
-        this.packer = MessagePack.newDefaultPacker(out);
+        // codec (writer configured; reader null)
+        this.codec = new ProxyBinaryCodec(
+                tcpConfig.reorderResponses,
+                tcpConfig.maxFrameSize,
+                payloadWireTypes,
+                payloadWriteTypes.toArray(new LogicalType[0]),
+                payloadSourceRoots,
+                payloadTargetPrecision,
+                payloadTargetScale,
+                payloadSourcePrecision,
+                payloadSourceScale,
+                payloadTimestampPrecision,
+                null, null, null);
 
         this.flushTimerScheduled = false;
         scheduleFlushTimerIfNeeded();
 
         LOG.info(
                 "ProxyOperator {} connected to {}:{} (rowType={}, batchMaxRows={}, sentConfigBytes={})",
-                side,
-                proxy.host,
-                port,
-                inputRowType,
-                batchMaxRows,
+                side, proxy.host, port, inputRowType, batchMaxRows,
                 configJson.getBytes(StandardCharsets.UTF_8).length);
     }
 
-    private void appendRowToMsgPack(RowData row) throws IOException {
+    private void appendRowToBinary(RowData row) throws IOException {
         if (batchRowIndex >= batchMaxRows) {
-            flushMsgPackBatch();
+            flushBinaryBatch();
         }
 
-        packRow(row);
+        // framed row
+        codec.writeFramedRow(out, row, payloadFieldIndicesArray, nextRowId);
+        if (tcpConfig.reorderResponses) {
+            nextRowId++;
+        }
+
         batchRowIndex++;
 
-        // optional: flush per-row if you really want minimum latency (not recommended
-        // generally)
         if (tcpConfig.flushOnWrite) {
-            flushMsgPackBatch();
+            flushBinaryBatch();
         }
     }
 
-    private void packRow(RowData row) throws IOException {
-        final int payloadSize = fieldTypes.size();
-        final int arraySize = tcpConfig.reorderResponses ? payloadSize + 2 : payloadSize + 1;
-        packer.packArrayHeader(arraySize);
-
-        // column 0: op
-        packer.packInt(rowKindToOp(row.getRowKind()));
-
-        if (tcpConfig.reorderResponses) {
-            packer.packLong(nextRowId++);
+    private static int[] toIntArray(List<Integer> ints) {
+        final int[] out = new int[ints.size()];
+        for (int i = 0; i < ints.size(); i++) {
+            out[i] = ints.get(i);
         }
-
-        for (int i = 0; i < payloadSize; i++) {
-            final int sourceIndex = payloadFieldIndices.get(i);
-            if (row.isNullAt(sourceIndex)) {
-                packer.packNil();
-                continue;
-            }
-            packFieldValueFast(packer, i, row, sourceIndex);
-        }
+        return out;
     }
 
-    private void flushMsgPackBatch() throws IOException {
+    private void flushBinaryBatch() throws IOException {
         if (batchRowIndex <= 0) {
             return;
         }
-        packer.flush();
         out.flush();
         batchRowIndex = 0;
     }
@@ -548,17 +579,24 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         IOException error = null;
 
         flushTimerScheduled = false;
-
-        // flush any remaining rows as a final smaller batch
         error = suppress(error, tryFlushRemaining());
-
-        error = suppress(error, closePacker());
 
         error = suppress(error, flushAndClose(out));
         out = null;
 
+        codec = null;
+
         if (error != null) {
             throw error;
+        }
+    }
+
+    private IOException tryFlushRemaining() {
+        try {
+            flushBinaryBatch();
+            return null;
+        } catch (IOException e) {
+            return e;
         }
     }
 
@@ -582,37 +620,13 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         if (side != Side.PRE) {
             return;
         }
-        if (packer == null || out == null) {
+        if (out == null || codec == null) {
             return;
         }
         if (batchRowIndex > 0) {
-            flushMsgPackBatch();
+            flushBinaryBatch();
         }
         scheduleFlushTimerIfNeeded();
-    }
-
-    private IOException tryFlushRemaining() {
-        try {
-            flushMsgPackBatch();
-            return null;
-        } catch (IOException e) {
-            return e;
-        }
-    }
-
-    private IOException closePacker() {
-        if (packer == null) {
-            return null;
-        }
-        try {
-            packer.flush();
-            packer.close();
-            return null;
-        } catch (IOException e) {
-            return e;
-        } finally {
-            packer = null;
-        }
     }
 
     // ------------------------------------------------------------------------
@@ -630,22 +644,27 @@ public class ProxyOperator extends TableStreamOperator<RowData>
 
         this.in = new BufferedInputStream(socket.getInputStream(), tcpConfig.bufferSize);
 
-        // POST registers itself with the proxy before MsgPack stream starts
-        final BufferedOutputStream postOut = new BufferedOutputStream(socket.getOutputStream(), tcpConfig.bufferSize);
+        // send preamble
+        final BufferedOutputStream postOut =
+                new BufferedOutputStream(socket.getOutputStream(), tcpConfig.bufferSize);
         final String configJson = buildConfigJson(side);
         writeLengthPrefixedJson(postOut, configJson);
 
-        // MsgPack stream begins immediately after the preamble
-        this.unpacker = MessagePack.newDefaultUnpacker(in);
+        // codec (reader configured; writer null)
+        this.codec = new ProxyBinaryCodec(
+                tcpConfig.reorderResponses,
+                tcpConfig.maxFrameSize,
+                null, null, null, null, null, null, null, null,
+                resultWireTypes,
+                resultReadTypes.toArray(new LogicalType[0]),
+                resultFieldTypes.toArray(new LogicalType[0]));
+
         this.expectedRowId = 0L;
         this.reorderBuffer = tcpConfig.reorderResponses ? new HashMap<>() : null;
 
         LOG.info(
                 "ProxyOperator {} connected to {}:{} (rowType={}, sentConfigBytes={})",
-                side,
-                proxy.host,
-                port,
-                inputRowType,
+                side, proxy.host, port, inputRowType,
                 configJson.getBytes(StandardCharsets.UTF_8).length);
     }
 
@@ -654,46 +673,21 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     }
 
     private RowWithId readNextRowWithId(RowKind fallbackKind) throws IOException {
-        if (unpacker == null) {
-            throw new IOException("ProxyOperator unpacker not initialized");
+        if (codec == null || in == null) {
+            throw new IOException("ProxyOperator codec not initialized");
         }
+
+        final ProxyBinaryCodec.RowWithId decoded = codec.readFramedRow(in, fallbackKind);
 
         final int fieldCount = resultFieldTypes.size();
-        final int expectedSize = tcpConfig.reorderResponses ? fieldCount + 2 : fieldCount + 1;
-
-        final int arraySize;
-        try {
-            arraySize = unpacker.unpackArrayHeader();
-        } catch (EOFException eof) {
-            throw new EOFException("ProxyOperator reached end of MsgPack stream");
-        }
-
-        final int op = unpacker.unpackInt();
-        final long rowId = tcpConfig.reorderResponses ? unpacker.unpackLong() : -1L;
-
         final GenericRowData outRow = new GenericRowData(fieldCount);
-        outRow.setRowKind(opToRowKind(op, fallbackKind));
-
-        if (arraySize < expectedSize) {
-            throw new IOException(
-                    "ProxyOperator received MsgPack row with "
-                            + arraySize
-                            + " fields; expected at least "
-                            + expectedSize);
-        }
+        outRow.setRowKind(decoded.kind);
 
         for (int i = 0; i < fieldCount; i++) {
-            final LogicalType readType = resultReadTypes.get(i);
-            final LogicalType targetType = resultFieldTypes.get(i);
-            outRow.setField(i, unpackFieldValueWithCast(unpacker, readType, targetType));
+            outRow.setField(i, decoded.fields[i]);
         }
 
-        // consume any extra fields if present
-        for (int i = expectedSize; i < arraySize; i++) {
-            unpacker.skipValue();
-        }
-
-        return new RowWithId(rowId, outRow);
+        return new RowWithId(decoded.rowId, outRow);
     }
 
     private RowData readNextOrderedRow(RowKind fallbackKind) throws IOException {
@@ -729,8 +723,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     private void closePost() throws IOException {
         IOException error = null;
 
-        error = suppress(error, closeQuietly(unpacker));
-        unpacker = null;
+        codec = null;
 
         error = suppress(error, closeQuietly(in));
         in = null;
@@ -741,12 +734,10 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     }
 
     // ------------------------------------------------------------------------
-    // PRE config JSON preamble
+    // Config JSON preamble
     // ------------------------------------------------------------------------
 
     private String buildConfigJson(Side side) {
-        // Provided snippet (may need import/package adjustment depending on Flink
-        // version)
         if (side == Side.POST && tcpConfig.postRoleOnly) {
             return "{\"role\":\"post\"}";
         }
@@ -876,7 +867,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             sb.append(",{\"name\":\"__rowId\",\"wireType\":\"INT64\"}");
         }
 
-        // payload fields start at index 1 or 2 depending on rowId presence
+        // payload fields
         for (int i = 0; i < payloadFieldIndices.size(); i++) {
             final int idx = payloadFieldIndices.get(i);
             final RowType.RowField field = fields.get(idx);
@@ -958,12 +949,14 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 return "STRING";
             case TIMESTAMP_WITHOUT_TIME_ZONE:
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                return "INT64";
-            case DECIMAL:
-                return "STRING";
+                return "TIMESTAMP_MILLIS";
+            case DECIMAL: {
+                final DecimalType dt = (DecimalType) type;
+                return dt.getPrecision() <= 18 ? "DECIMAL_UNSCALED_I64" : "DECIMAL_UNSCALED_BYTES";
+            }
             case BINARY:
             case VARBINARY:
-                return "BIN";
+                return "BYTES";
             default:
                 return "NIL";
         }
@@ -974,91 +967,19 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         final DataOutputStream dos = new DataOutputStream(out);
         dos.writeInt(bytes.length); // big-endian length
         dos.write(bytes);
-        dos.flush(); // ensure preamble is out before MsgPack stream starts
+        dos.flush();
     }
 
     private static String jsonEscape(String s) {
         if (s == null) {
             return "";
         }
-        // small escape set is enough here
         return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     // ------------------------------------------------------------------------
-    // MsgPack value mapping
+    // Type helpers + casting used by ProxyBinaryCodec decode path
     // ------------------------------------------------------------------------
-
-    private static void packFieldValueWithCast(
-            MessagePacker packer,
-            LogicalType targetType,
-            LogicalType sourceType,
-            RowData row,
-            int pos) throws IOException {
-        if (targetType == null || sourceType == null) {
-            packer.packNil();
-            return;
-        }
-        final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
-        final LogicalTypeRoot sourceRoot = sourceType.getTypeRoot();
-
-        // fast path: same root (or compatible string/timestamp families)
-        if (targetRoot == sourceRoot
-                || (isStringRoot(targetRoot) && isStringRoot(sourceRoot))
-                || (isTimestampRoot(targetRoot) && isTimestampRoot(sourceRoot))) {
-            packFieldValue(packer, targetType, row, pos);
-            return;
-        }
-
-        if (targetRoot == LogicalTypeRoot.DECIMAL) {
-            final DecimalType dt = (DecimalType) targetType;
-            final BigDecimal bd;
-            switch (sourceRoot) {
-                case BIGINT:
-                    bd = BigDecimal.valueOf(row.getLong(pos));
-                    break;
-                case INTEGER:
-                    bd = BigDecimal.valueOf(row.getInt(pos));
-                    break;
-                case SMALLINT:
-                    bd = BigDecimal.valueOf(row.getShort(pos));
-                    break;
-                case TINYINT:
-                    bd = BigDecimal.valueOf(row.getByte(pos));
-                    break;
-                case FLOAT:
-                    bd = BigDecimal.valueOf(row.getFloat(pos));
-                    break;
-                case DOUBLE:
-                    bd = BigDecimal.valueOf(row.getDouble(pos));
-                    break;
-                case DECIMAL: {
-                    final DecimalType st = (DecimalType) sourceType;
-                    final DecimalData dec = row.getDecimal(pos, st.getPrecision(), st.getScale());
-                    bd = dec.toBigDecimal();
-                    break;
-                }
-                default:
-                    throw new TableException(
-                            "ProxyOperator cannot cast "
-                                    + sourceType.asSerializableString()
-                                    + " to "
-                                    + targetType.asSerializableString());
-            }
-            final BigDecimal scaled =
-                    bd.scale() == dt.getScale()
-                            ? bd
-                            : bd.setScale(dt.getScale(), RoundingMode.HALF_UP);
-            packer.packString(scaled.toPlainString());
-            return;
-        }
-
-        throw new TableException(
-                "ProxyOperator cannot cast "
-                        + sourceType.asSerializableString()
-                        + " to "
-                        + targetType.asSerializableString());
-    }
 
     private static boolean isStringRoot(LogicalTypeRoot root) {
         return root == LogicalTypeRoot.CHAR || root == LogicalTypeRoot.VARCHAR;
@@ -1069,279 +990,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 || root == LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE;
     }
 
-    private static void packFieldValue(MessagePacker packer, LogicalType type, RowData row, int pos)
-            throws IOException {
-        switch (type.getTypeRoot()) {
-            case BOOLEAN:
-                packer.packBoolean(row.getBoolean(pos));
-                return;
-            case TINYINT:
-                packer.packByte(row.getByte(pos));
-                return;
-            case SMALLINT:
-                packer.packShort(row.getShort(pos));
-                return;
-            case INTEGER:
-            case DATE:
-            case TIME_WITHOUT_TIME_ZONE:
-                packer.packInt(row.getInt(pos));
-                return;
-            case BIGINT:
-                packer.packLong(row.getLong(pos));
-                return;
-            case FLOAT:
-                packer.packFloat(row.getFloat(pos));
-                return;
-            case DOUBLE:
-                packer.packDouble(row.getDouble(pos));
-                return;
-            case CHAR:
-            case VARCHAR:
-                packer.packString(row.getString(pos).toString());
-                return;
-            case TIMESTAMP_WITHOUT_TIME_ZONE: {
-                final long ms =
-                        row.getTimestamp(pos, ((TimestampType) type).getPrecision()).getMillisecond();
-                packer.packLong(ms);
-                return;
-            }
-            case TIMESTAMP_WITH_LOCAL_TIME_ZONE: {
-                final long ms =
-                        row.getTimestamp(pos, ((LocalZonedTimestampType) type).getPrecision())
-                                .getMillisecond();
-                packer.packLong(ms);
-                return;
-            }
-            case DECIMAL: {
-                final DecimalType dt = (DecimalType) type;
-                final DecimalData dec = row.getDecimal(pos, dt.getPrecision(), dt.getScale());
-                packer.packString(dec.toString());
-                return;
-            }
-            case BINARY:
-            case VARBINARY: {
-                final byte[] bytes = row.getBinary(pos);
-                packer.packBinaryHeader(bytes.length);
-                packer.writePayload(bytes);
-                return;
-            }
-            default:
-                packer.packNil();
-        }
-    }
-
-    private void packFieldValueFast(
-            MessagePacker packer, int payloadPos, RowData row, int sourceIndex) throws IOException {
-        final LogicalTypeRoot targetRoot = payloadTargetRoots[payloadPos];
-        final LogicalTypeRoot sourceRoot = payloadSourceRoots[payloadPos];
-
-        if (targetRoot == sourceRoot
-                || (isStringRoot(targetRoot) && isStringRoot(sourceRoot))
-                || (isTimestampRoot(targetRoot) && isTimestampRoot(sourceRoot))) {
-            packFieldValueFastByRoot(packer, payloadPos, row, sourceIndex);
-            return;
-        }
-
-        if (targetRoot == LogicalTypeRoot.DECIMAL) {
-            final int precision = payloadTargetPrecision[payloadPos];
-            final int scale = payloadTargetScale[payloadPos];
-            final BigDecimal bd;
-            switch (sourceRoot) {
-                case BIGINT:
-                    bd = BigDecimal.valueOf(row.getLong(sourceIndex));
-                    break;
-                case INTEGER:
-                    bd = BigDecimal.valueOf(row.getInt(sourceIndex));
-                    break;
-                case SMALLINT:
-                    bd = BigDecimal.valueOf(row.getShort(sourceIndex));
-                    break;
-                case TINYINT:
-                    bd = BigDecimal.valueOf(row.getByte(sourceIndex));
-                    break;
-                case FLOAT:
-                    bd = BigDecimal.valueOf(row.getFloat(sourceIndex));
-                    break;
-                case DOUBLE:
-                    bd = BigDecimal.valueOf(row.getDouble(sourceIndex));
-                    break;
-                case DECIMAL: {
-                    final DecimalData dec =
-                            row.getDecimal(
-                                    sourceIndex,
-                                    payloadSourcePrecision[payloadPos],
-                                    payloadSourceScale[payloadPos]);
-                    bd = dec.toBigDecimal();
-                    break;
-                }
-                default:
-                    throw new TableException(
-                            "ProxyOperator cannot cast "
-                                    + sourceRoot
-                                    + " to DECIMAL("
-                                    + precision
-                                    + ", "
-                                    + scale
-                                    + ")");
-            }
-            final BigDecimal scaled =
-                    bd.scale() == scale ? bd : bd.setScale(scale, RoundingMode.HALF_UP);
-            packer.packString(scaled.toPlainString());
-            return;
-        }
-
-        throw new TableException(
-                "ProxyOperator cannot cast " + sourceRoot + " to " + targetRoot);
-    }
-
-    private void packFieldValueFastByRoot(
-            MessagePacker packer, int payloadPos, RowData row, int sourceIndex) throws IOException {
-        switch (payloadTargetRoots[payloadPos]) {
-            case BOOLEAN:
-                packer.packBoolean(row.getBoolean(sourceIndex));
-                return;
-            case TINYINT:
-                packer.packByte(row.getByte(sourceIndex));
-                return;
-            case SMALLINT:
-                packer.packShort(row.getShort(sourceIndex));
-                return;
-            case INTEGER:
-            case DATE:
-            case TIME_WITHOUT_TIME_ZONE:
-                packer.packInt(row.getInt(sourceIndex));
-                return;
-            case BIGINT:
-                packer.packLong(row.getLong(sourceIndex));
-                return;
-            case FLOAT:
-                packer.packFloat(row.getFloat(sourceIndex));
-                return;
-            case DOUBLE:
-                packer.packDouble(row.getDouble(sourceIndex));
-                return;
-            case CHAR:
-            case VARCHAR:
-                packer.packString(row.getString(sourceIndex).toString());
-                return;
-            case TIMESTAMP_WITHOUT_TIME_ZONE:
-            case TIMESTAMP_WITH_LOCAL_TIME_ZONE: {
-                final int precision = payloadTimestampPrecision[payloadPos];
-                final long ms = row.getTimestamp(sourceIndex, precision).getMillisecond();
-                packer.packLong(ms);
-                return;
-            }
-            case DECIMAL: {
-                final DecimalData dec =
-                        row.getDecimal(
-                                sourceIndex,
-                                payloadTargetPrecision[payloadPos],
-                                payloadTargetScale[payloadPos]);
-                packer.packString(dec.toString());
-                return;
-            }
-            case BINARY:
-            case VARBINARY: {
-                final byte[] bytes = row.getBinary(sourceIndex);
-                packer.packBinaryHeader(bytes.length);
-                packer.writePayload(bytes);
-                return;
-            }
-            default:
-                packer.packNil();
-        }
-    }
-
-    private static Object unpackFieldValue(MessageUnpacker unpacker, LogicalType type) throws IOException {
-        if (unpacker.tryUnpackNil()) {
-            return null;
-        }
-
-        switch (type.getTypeRoot()) {
-            case BOOLEAN:
-                return unpacker.unpackBoolean();
-            case TINYINT:
-                return unpacker.unpackByte();
-            case SMALLINT:
-                return unpacker.unpackShort();
-            case INTEGER:
-            case DATE:
-            case TIME_WITHOUT_TIME_ZONE:
-                return unpacker.unpackInt();
-            case BIGINT:
-                return unpacker.unpackLong();
-            case FLOAT:
-                return unpacker.unpackFloat();
-            case DOUBLE:
-                return unpacker.unpackDouble();
-            case CHAR:
-            case VARCHAR:
-                return StringData.fromString(unpacker.unpackString());
-            case TIMESTAMP_WITHOUT_TIME_ZONE:
-            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                return TimestampData.fromEpochMillis(unpacker.unpackLong());
-            case DECIMAL: {
-                final DecimalType dt = (DecimalType) type;
-                final MessageFormat format = unpacker.getNextFormat();
-                final ValueType valueType = format.getValueType();
-                switch (valueType) {
-                    case STRING:
-                        final DecimalData data = DecimalData.fromBigDecimal(
-                                new BigDecimal(unpacker.unpackString()),
-                                dt.getPrecision(),
-                                dt.getScale());
-                        if (data == null) {
-                            throw new TableException(
-                                    "Failed to deserialize DECIMAL("
-                                            + dt.getPrecision()
-                                            + ", "
-                                            + dt.getScale()
-                                            + ") from string");
-                        }
-                        return data;
-                    default:
-                        throw new TableException(
-                                "DECIMAL values must be encoded as STRING in MsgPack, but got "
-                                        + valueType);
-                }
-            }
-            case BINARY:
-            case VARBINARY: {
-                final int len = unpacker.unpackBinaryHeader();
-                return unpacker.readPayload(len);
-            }
-            default:
-                unpacker.skipValue();
-                return null;
-        }
-    }
-
-    private static Object unpackFieldValueWithCast(
-            MessageUnpacker unpacker, LogicalType sourceType, LogicalType targetType)
-            throws IOException {
-        if (sourceType == null) {
-            return unpackFieldValue(unpacker, targetType);
-        }
-        final Object value = unpackFieldValue(unpacker, sourceType);
-        if (value == null || targetType == null) {
-            return value;
-        }
-        final LogicalTypeRoot sourceRoot = sourceType.getTypeRoot();
-        final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
-        if (sourceRoot == targetRoot
-                || (isStringRoot(sourceRoot) && isStringRoot(targetRoot))
-                || (isTimestampRoot(sourceRoot) && isTimestampRoot(targetRoot))) {
-            // Same family; ensure DECIMAL precision/scale normalization if needed.
-            if (sourceRoot == LogicalTypeRoot.DECIMAL) {
-                final DecimalType dt = (DecimalType) targetType;
-                return DecimalDataUtils.castFrom((DecimalData) value, dt.getPrecision(), dt.getScale());
-            }
-            return value;
-        }
-        return castValue(value, sourceType, targetType);
-    }
-
-    private static Object castValue(Object value, LogicalType sourceType, LogicalType targetType) {
+    static Object castValue(Object value, LogicalType sourceType, LogicalType targetType) {
         final LogicalTypeRoot sourceRoot = sourceType.getTypeRoot();
         final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
 
@@ -1351,16 +1000,13 @@ public class ProxyOperator extends TableStreamOperator<RowData>
                 return DecimalDataUtils.castFrom((DecimalData) value, dt.getPrecision(), dt.getScale());
             }
             if (value instanceof StringData) {
-                return DecimalDataUtils.castFrom(
-                        value.toString(), dt.getPrecision(), dt.getScale());
+                return DecimalDataUtils.castFrom(value.toString(), dt.getPrecision(), dt.getScale());
             }
             if (value instanceof Number) {
                 if (sourceRoot == LogicalTypeRoot.FLOAT || sourceRoot == LogicalTypeRoot.DOUBLE) {
-                    return DecimalDataUtils.castFrom(
-                            ((Number) value).doubleValue(), dt.getPrecision(), dt.getScale());
+                    return DecimalDataUtils.castFrom(((Number) value).doubleValue(), dt.getPrecision(), dt.getScale());
                 }
-                return DecimalDataUtils.castFrom(
-                        ((Number) value).longValue(), dt.getPrecision(), dt.getScale());
+                return DecimalDataUtils.castFrom(((Number) value).longValue(), dt.getPrecision(), dt.getScale());
             }
         }
 
@@ -1420,45 +1066,10 @@ public class ProxyOperator extends TableStreamOperator<RowData>
     }
 
     // ------------------------------------------------------------------------
-    // RowKind <-> op
-    // ------------------------------------------------------------------------
-
-    private static int rowKindToOp(RowKind kind) {
-        switch (kind) {
-            case INSERT:
-                return 0;
-            case UPDATE_AFTER:
-                return 1;
-            case UPDATE_BEFORE:
-                return 2;
-            case DELETE:
-                return 3;
-            default:
-                return 127;
-        }
-    }
-
-    private static RowKind opToRowKind(int op, RowKind fallback) {
-        switch (op) {
-            case 0:
-                return RowKind.INSERT;
-            case 1:
-                return RowKind.UPDATE_AFTER;
-            case 2:
-                return RowKind.UPDATE_BEFORE;
-            case 3:
-                return RowKind.DELETE;
-            default:
-                return fallback;
-        }
-    }
-
-    // ------------------------------------------------------------------------
     // IO helpers
     // ------------------------------------------------------------------------
 
-    private static Socket connectSocket(String host, int port, int connectTimeoutMs)
-            throws IOException {
+    private static Socket connectSocket(String host, int port, int connectTimeoutMs) throws IOException {
         final Socket socket = new Socket();
         socket.setTcpNoDelay(true);
         socket.connect(new InetSocketAddress(host, port), connectTimeoutMs);
@@ -1516,7 +1127,7 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         private static final int DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
         private static final int DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024;
 
-        // MsgPack batching defaults (you can tune)
+        // batching defaults (you can tune)
         private static final int DEFAULT_BATCH_MAX_ROWS = 8192;
         private static final int DEFAULT_REORDER_MAX_BUFFER = 10000;
         private static final int DEFAULT_FLUSH_INTERVAL_MS = 0;
@@ -1528,25 +1139,31 @@ public class ProxyOperator extends TableStreamOperator<RowData>
         private final int connectTimeoutMs;
         private final int readTimeoutMs;
         private final int maxFrameSize;
+
         private final Integer calcFieldIndex;
         private final String calcFieldName;
         private final String functionClass;
         private final String functionKind;
+
         private final List<Integer> argFieldIndices;
         private final List<String> argFieldNames;
         private final List<String> argFieldTypes;
+
         private final List<Integer> resultFieldIndices;
         private final List<String> resultFieldNames;
         private final List<String> resultFieldTypes;
+
         private final List<Integer> resultUdfFieldIndices;
         private final List<String> resultUdfFieldTypes;
 
-        // batching knobs (interpreted for MsgPack streaming)
-        private final boolean flushOnWrite; // if true, flush after each append (low latency, low throughput)
+        // batching knobs
+        private final boolean flushOnWrite;
         private final int batchMaxRows;
         private final int flushIntervalMs;
+
         private final boolean reorderResponses;
         private final int reorderMaxBuffer;
+
         private final boolean postRoleOnly;
 
         private ProxyTcpConfig(
@@ -1578,25 +1195,33 @@ public class ProxyOperator extends TableStreamOperator<RowData>
             this.connectTimeoutMs = connectTimeoutMs;
             this.readTimeoutMs = readTimeoutMs;
             this.maxFrameSize = maxFrameSize;
+
             this.flushOnWrite = flushOnWrite;
             this.batchMaxRows = batchMaxRows;
             this.flushIntervalMs = flushIntervalMs;
+
             this.calcFieldIndex = calcFieldIndex;
             this.calcFieldName = calcFieldName;
             this.functionClass = functionClass;
             this.functionKind = functionKind;
+
             this.argFieldIndices = argFieldIndices;
             this.argFieldNames = argFieldNames;
             this.argFieldTypes = argFieldTypes;
+
             this.resultFieldIndices = resultFieldIndices;
             this.resultFieldNames = resultFieldNames;
             this.resultFieldTypes = resultFieldTypes;
+
             this.resultUdfFieldIndices = resultUdfFieldIndices;
             this.resultUdfFieldTypes = resultUdfFieldTypes;
+
             this.reorderResponses = reorderResponses;
             this.reorderMaxBuffer = reorderMaxBuffer;
+
             this.proxies = proxies;
             this.selectedProxy = selectedProxy;
+
             this.postRoleOnly = postRoleOnly;
         }
 
@@ -1610,24 +1235,29 @@ public class ProxyOperator extends TableStreamOperator<RowData>
 
             final boolean flushOnWrite = parseBoolean(map.get("flush"), false);
             final int batchMaxRows = parseInt(map.get("batchmaxrows"), DEFAULT_BATCH_MAX_ROWS);
-            final int flushIntervalMs =
-                    parseInt(map.get("flushintervalms"), DEFAULT_FLUSH_INTERVAL_MS);
+            final int flushIntervalMs = parseInt(map.get("flushintervalms"), DEFAULT_FLUSH_INTERVAL_MS);
+
             final Integer calcFieldIndex = parseInt(map.get("calcfieldindex"));
             final String calcFieldName = map.get("calcfieldname");
+
             final String functionClass = firstNonNull(map, "class", "functionclass");
             final String functionKind = firstNonNull(map, "type", "functionkind");
+
             final List<Integer> argFieldIndices = parseIntList(map.get("argfieldindices"));
             final List<String> argFieldNames = parseStringList(map.get("argfieldnames"));
             final List<String> argFieldTypes = parseStringList(map.get("argfieldtypes"));
+
             final List<Integer> resultFieldIndices = parseIntList(map.get("resultfieldindices"));
             final List<String> resultFieldNames = parseStringList(map.get("resultfieldnames"));
             final List<String> resultFieldTypes = parseStringList(map.get("resultfieldtypes"));
+
             final List<Integer> resultUdfFieldIndices = parseIntList(map.get("resultudffieldindices"));
             final List<String> resultUdfFieldTypes = parseStringList(map.get("resultudffieldtypes"));
+
             final boolean reorderResponses = parseBoolean(firstNonNull(map, "reorder", "correlate"), false);
             final int reorderMaxBuffer = parseInt(map.get("reordermax"), DEFAULT_REORDER_MAX_BUFFER);
-            final boolean postRoleOnly =
-                    parseBoolean(map.get("postroleonly"), DEFAULT_POST_ROLE_ONLY);
+
+            final boolean postRoleOnly = parseBoolean(map.get("postroleonly"), DEFAULT_POST_ROLE_ONLY);
 
             final List<ProxyEndpoint> proxies = parseProxies(map.get("proxies"));
             final ProxyEndpoint selectedProxy = proxies.get(0);
