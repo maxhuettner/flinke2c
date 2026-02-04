@@ -44,7 +44,8 @@ import org.apache.flink.table.planner.plan.nodes.exec.InputProperty;
 import org.apache.flink.table.planner.plan.nodes.exec.SingleTransformationTranslator;
 import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodeUtil;
 import org.apache.flink.table.planner.utils.JavaScalaConversionUtil;
-import org.apache.flink.table.runtime.functions.table.ProxyOperator;
+import org.apache.flink.table.runtime.functions.table.proxy.ProxyPostOperator;
+import org.apache.flink.table.runtime.functions.table.proxy.ProxyPreOperator;
 import org.apache.flink.table.runtime.operators.CodeGenOperatorFactory;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -245,15 +246,13 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                         JavaScalaConversionUtil.toScala(Optional.ofNullable(effectiveCondition)),
                         retainHeader,
                         getClass().getSimpleName());
-        final Transformation<RowData> calcTransform =
-                ExecNodeUtil.createOneInputTransformation(
+        return ExecNodeUtil.createOneInputTransformation(
                         proxyInputTransform,
                         createTransformationMeta(CALC_TRANSFORMATION, config),
                         substituteStreamOperator,
                         InternalTypeInfo.of(getOutputType()),
                         proxyInputTransform.getParallelism(),
                         false);
-        return calcTransform;
     }
 
     protected Transformation<RowData> createProxyChain(
@@ -267,7 +266,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                 ExecNodeUtil.createOneInputTransformation(
                         input,
                         createTransformationMeta("proxy-pre", "ProxyPre", "ProxyPre", config),
-                        new ProxyOperator(conf, ProxyOperator.Side.PRE, inputRowType, inputRowType),
+                        new ProxyPreOperator(conf, inputRowType),
                         input.getOutputType(),
                         input.getParallelism(),
                         input.isParallelismConfigured());
@@ -281,7 +280,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                 ExecNodeUtil.createOneInputTransformation(
                         pre,
                         createTransformationMeta("proxy-post", "ProxyPost", "ProxyPost", config),
-                        new ProxyOperator(conf, ProxyOperator.Side.POST, inputRowType, outputRowType),
+                        new ProxyPostOperator(conf, inputRowType, outputRowType),
                         InternalTypeInfo.of(outputRowType),
                         pre.getParallelism(),
                         pre.isParallelismConfigured());

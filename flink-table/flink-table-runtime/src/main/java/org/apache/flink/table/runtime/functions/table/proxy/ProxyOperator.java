@@ -1,0 +1,850 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.table.runtime.functions.table.proxy;
+
+import org.apache.flink.annotation.Internal;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
+import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.table.api.TableException;
+import org.apache.flink.table.data.DecimalData;
+import org.apache.flink.table.data.DecimalDataUtils;
+import org.apache.flink.table.data.GenericRowData;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.StringData;
+import org.apache.flink.table.runtime.functions.table.proxy.ProxyBinaryCodec.WireType;
+import org.apache.flink.table.runtime.operators.TableStreamOperator;
+import org.apache.flink.table.types.logical.DecimalType;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
+import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.table.types.logical.TimestampType;
+import org.apache.flink.table.types.logical.utils.LogicalTypeParser;
+import org.apache.flink.types.RowKind;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataOutputStream;
+import java.io.Flushable;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
+/**
+ * Shared base class for PRE and POST proxy operators.
+ *
+ * <p>
+ * PRE writes framed rows to an external TCP process and emits placeholders
+ * downstream.
+ * POST reads framed rows from an external TCP process and merges returned
+ * fields into incoming rows.
+ */
+@Internal
+abstract class ProxyOperator extends TableStreamOperator<RowData>
+        implements OneInputStreamOperator<RowData, RowData> {
+
+    protected static final Logger LOG = LoggerFactory.getLogger(ProxyOperator.class);
+    private static final long serialVersionUID = 1L;
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    protected enum Role {
+        PRE,
+        POST
+    }
+
+    protected final String conf;
+    protected final RowType inputRowType;
+    protected final RowType resultRowType;
+
+    // parsed config
+    protected transient ProxyTcpConfig tcpConfig;
+
+    // payload fields (PRE encoding)
+    protected transient List<Integer> payloadFieldIndices;
+    protected transient int[] payloadFieldIndicesArray;
+    protected transient List<String> payloadFieldNames;
+    protected transient List<LogicalType> payloadWriteTypes;
+    protected transient LogicalTypeRoot[] payloadSourceRoots;
+    protected transient int[] payloadTargetPrecision;
+    protected transient int[] payloadTargetScale;
+    protected transient int[] payloadSourcePrecision;
+    protected transient int[] payloadSourceScale;
+    protected transient int[] payloadTimestampPrecision;
+    protected transient WireType[] payloadWireTypes;
+
+    // result fields (POST decoding + merge)
+    protected transient List<Integer> resultFieldIndices;
+    protected transient List<LogicalType> resultFieldTypes;
+    protected transient List<LogicalType> resultReadTypes;
+    protected transient List<LogicalType> postFieldTypes;
+    protected transient WireType[] resultWireTypes;
+
+    protected transient RowData.FieldGetter[] resultFieldGetters;
+    protected transient RowData.FieldGetter[] fullRowFieldGetters;
+
+    // placeholders (PRE)
+    protected transient GenericRowData insertPlaceholder;
+    protected transient GenericRowData updateAfterPlaceholder;
+    protected transient GenericRowData updateBeforePlaceholder;
+    protected transient GenericRowData deletePlaceholder;
+    protected transient int inputFieldCount;
+
+    // shared socket (each side uses one direction + may write preamble)
+    protected transient Socket socket;
+
+    // codec (PRE uses writer-configured; POST uses reader-configured)
+    protected transient ProxyBinaryCodec codec;
+
+    protected ProxyOperator(String conf, RowType rowType) {
+        this(conf, rowType, rowType);
+    }
+
+    protected ProxyOperator(String conf, RowType inputRowType, @Nullable RowType resultRowType) {
+        this.conf = conf == null ? "" : conf;
+        this.inputRowType = Objects.requireNonNull(inputRowType, "inputRowType");
+        this.resultRowType = resultRowType == null ? this.inputRowType : resultRowType;
+    }
+
+    // ------------------------------------------------------------------------
+    // Lifecycle
+    // ------------------------------------------------------------------------
+
+    @Override
+    public final void open() throws Exception {
+        super.open();
+        this.tcpConfig = ProxyTcpConfig.from(conf);
+        initializePayloadFields();
+        openInternal();
+    }
+
+    @Override
+    public final void processElement(StreamRecord<RowData> element) throws Exception {
+        final RowData outRow = processRow(element.getValue());
+        output.collect(element.replace(outRow));
+    }
+
+    @Override
+    public final void close() throws Exception {
+        IOException error = null;
+        try {
+            closeInternal();
+        } catch (IOException e) {
+            error = e;
+        }
+
+        error = suppress(error, closeQuietly(socket));
+        socket = null;
+
+        super.close();
+
+        if (error != null) {
+            throw error;
+        }
+    }
+
+    protected abstract Role role();
+
+    protected abstract void openInternal() throws Exception;
+
+    protected abstract RowData processRow(RowData inRow) throws Exception;
+
+    protected abstract void closeInternal() throws Exception;
+
+    // ------------------------------------------------------------------------
+    // Shared schema + metadata initialization
+    // ------------------------------------------------------------------------
+
+    protected final void initializePayloadFields() {
+        List<LogicalType> fieldTypes;
+        LogicalTypeRoot[] payloadTargetRoots;
+
+        final List<RowType.RowField> inputFields = inputRowType.getFields();
+        final List<RowType.RowField> resultFields = resultRowType.getFields();
+        final int fieldCount = inputFields.size();
+        this.inputFieldCount = fieldCount;
+
+        // payload indices (currently: all fields)
+        final List<Integer> indices = new ArrayList<>(fieldCount);
+        for (int i = 0; i < fieldCount; i++) {
+            indices.add(i);
+        }
+        this.payloadFieldIndices = indices;
+        this.payloadFieldIndicesArray = toIntArray(indices);
+
+        fieldTypes = indices.stream()
+                .map(i -> inputFields.get(i).getType())
+                .collect(Collectors.toList());
+
+        this.payloadFieldNames = new ArrayList<>(indices.size());
+        for (int idx : indices) {
+            payloadFieldNames.add(inputFields.get(idx).getName());
+        }
+
+        // optional override arg types
+        final Map<Integer, LogicalType> argTypeByIndex = new HashMap<>();
+        if (tcpConfig.getArgFieldTypes() != null && !tcpConfig.getArgFieldTypes().isEmpty()) {
+            final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
+
+            if (tcpConfig.getArgFieldIndices() != null
+                    && !tcpConfig.getArgFieldIndices().isEmpty()
+                    && tcpConfig.getArgFieldIndices().size() == tcpConfig.getArgFieldTypes().size()) {
+
+                for (int i = 0; i < tcpConfig.getArgFieldIndices().size(); i++) {
+                    final Integer idx = tcpConfig.getArgFieldIndices().get(i);
+                    final String typeString = tcpConfig.getArgFieldTypes().get(i);
+                    if (idx == null || idx < 0 || idx >= fieldCount || typeString == null
+                            || typeString.trim().isEmpty()) {
+                        continue;
+                    }
+                    argTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
+                }
+
+            } else if (tcpConfig.getArgFieldNames() != null
+                    && !tcpConfig.getArgFieldNames().isEmpty()
+                    && tcpConfig.getArgFieldNames().size() == tcpConfig.getArgFieldTypes().size()) {
+
+                final Map<String, Integer> nameToIndex = new HashMap<>();
+                for (int i = 0; i < fieldCount; i++) {
+                    final String name = inputFields.get(i).getName();
+                    if (name != null) {
+                        nameToIndex.put(name.toLowerCase(Locale.ROOT), i);
+                    }
+                }
+
+                for (int i = 0; i < tcpConfig.getArgFieldNames().size(); i++) {
+                    final String name = tcpConfig.getArgFieldNames().get(i);
+                    final String typeString = tcpConfig.getArgFieldTypes().get(i);
+                    if (name == null || name.trim().isEmpty()) {
+                        continue;
+                    }
+                    final Integer idx = nameToIndex.get(name.toLowerCase(Locale.ROOT));
+                    if (idx == null || idx < 0 || idx >= fieldCount || typeString == null
+                            || typeString.trim().isEmpty()) {
+                        continue;
+                    }
+                    argTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
+                }
+            }
+        }
+
+        this.payloadWriteTypes = new ArrayList<>(fieldCount);
+        for (int i = 0; i < fieldCount; i++) {
+            final LogicalType argType = argTypeByIndex.get(i);
+            if (argType != null) {
+                payloadWriteTypes.add(argType);
+            } else {
+                payloadWriteTypes.add(inputFields.get(i).getType());
+            }
+        }
+
+        // PRE: wire types for payload fields (excluding __op/__rowId)
+        final int payloadSize = payloadFieldIndices.size();
+        final WireType[] payloadWireTypes = new WireType[payloadSize];
+        for (int i = 0; i < payloadSize; i++) {
+            payloadWireTypes[i] = ProxyBinaryCodec.wireTypeFor(payloadWriteTypes.get(i));
+        }
+        this.payloadWireTypes = payloadWireTypes;
+
+        // caches for fast decimal/timestamp paths used by codec writer
+        this.payloadSourceRoots = new LogicalTypeRoot[payloadSize];
+        payloadTargetRoots = new LogicalTypeRoot[payloadSize];
+        this.payloadTargetPrecision = new int[payloadSize];
+        this.payloadTargetScale = new int[payloadSize];
+        this.payloadSourcePrecision = new int[payloadSize];
+        this.payloadSourceScale = new int[payloadSize];
+        this.payloadTimestampPrecision = new int[payloadSize];
+
+        for (int i = 0; i < payloadSize; i++) {
+            final LogicalType sourceType = fieldTypes.get(i);
+            final LogicalType targetType = payloadWriteTypes.get(i);
+
+            payloadSourceRoots[i] = sourceType.getTypeRoot();
+            payloadTargetRoots[i] = targetType.getTypeRoot();
+
+            payloadTargetPrecision[i] = -1;
+            payloadTargetScale[i] = -1;
+            payloadSourcePrecision[i] = -1;
+            payloadSourceScale[i] = -1;
+            payloadTimestampPrecision[i] = -1;
+
+            if (payloadTargetRoots[i] == LogicalTypeRoot.DECIMAL) {
+                final DecimalType dt = (DecimalType) targetType;
+                payloadTargetPrecision[i] = dt.getPrecision();
+                payloadTargetScale[i] = dt.getScale();
+            }
+            if (payloadSourceRoots[i] == LogicalTypeRoot.DECIMAL) {
+                final DecimalType dt = (DecimalType) sourceType;
+                payloadSourcePrecision[i] = dt.getPrecision();
+                payloadSourceScale[i] = dt.getScale();
+            }
+            if (isTimestampRoot(payloadSourceRoots[i])) {
+                if (sourceType instanceof TimestampType) {
+                    payloadTimestampPrecision[i] = ((TimestampType) sourceType).getPrecision();
+                } else if (sourceType instanceof LocalZonedTimestampType) {
+                    payloadTimestampPrecision[i] = ((LocalZonedTimestampType) sourceType).getPrecision();
+                }
+            }
+        }
+
+        // result fields (POST output schema)
+        this.resultFieldIndices = new ArrayList<>(resultFields.size());
+        for (int i = 0; i < resultFields.size(); i++) {
+            resultFieldIndices.add(i);
+        }
+        this.resultFieldTypes = resultFieldIndices.stream()
+                .map(i -> resultFields.get(i).getType())
+                .collect(Collectors.toList());
+
+        // optional override udf types
+        final Map<Integer, LogicalType> udfTypeByIndex = new HashMap<>();
+        final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
+        boolean mappedByIndex = false;
+
+        if (tcpConfig.getResultFieldIndices() != null
+                && !tcpConfig.getResultFieldIndices().isEmpty()
+                && tcpConfig.getResultUdfFieldTypes() != null
+                && tcpConfig.getResultFieldIndices().size() == tcpConfig.getResultUdfFieldTypes().size()) {
+            for (int i = 0; i < tcpConfig.getResultFieldIndices().size(); i++) {
+                final Integer idx = tcpConfig.getResultFieldIndices().get(i);
+                final String typeString = tcpConfig.getResultUdfFieldTypes().get(i);
+                if (idx == null || idx < 0 || idx >= fieldCount) {
+                    continue;
+                }
+                if (typeString == null || typeString.trim().isEmpty()) {
+                    continue;
+                }
+                udfTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
+                mappedByIndex = true;
+            }
+        } else if (tcpConfig.getResultUdfFieldIndices() != null
+                && tcpConfig.getResultUdfFieldTypes() != null
+                && tcpConfig.getResultUdfFieldIndices().size() == tcpConfig.getResultUdfFieldTypes().size()) {
+            for (int i = 0; i < tcpConfig.getResultUdfFieldIndices().size(); i++) {
+                final Integer idx = tcpConfig.getResultUdfFieldIndices().get(i);
+                final String typeString = tcpConfig.getResultUdfFieldTypes().get(i);
+                if (idx == null || idx < 0 || idx >= fieldCount) {
+                    continue;
+                }
+                if (typeString == null || typeString.trim().isEmpty()) {
+                    continue;
+                }
+                udfTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
+                mappedByIndex = true;
+            }
+        }
+
+        if (!mappedByIndex
+                && tcpConfig.getResultFieldNames() != null
+                && tcpConfig.getResultUdfFieldTypes() != null
+                && tcpConfig.getResultFieldNames().size() == tcpConfig.getResultUdfFieldTypes().size()) {
+            final Map<String, Integer> nameToIndex = new HashMap<>();
+            for (int i = 0; i < fieldCount; i++) {
+                final String name = inputFields.get(i).getName();
+                if (name != null) {
+                    nameToIndex.put(name.toLowerCase(Locale.ROOT), i);
+                }
+            }
+            for (int i = 0; i < tcpConfig.getResultFieldNames().size(); i++) {
+                final String name = tcpConfig.getResultFieldNames().get(i);
+                final String typeString = tcpConfig.getResultUdfFieldTypes().get(i);
+                if (name == null || name.trim().isEmpty()) {
+                    continue;
+                }
+                final Integer idx = nameToIndex.get(name.toLowerCase(Locale.ROOT));
+                if (idx == null || idx < 0 || idx >= fieldCount || typeString == null || typeString.trim().isEmpty()) {
+                    continue;
+                }
+                udfTypeByIndex.put(idx, LogicalTypeParser.parse(typeString, cl));
+            }
+        }
+
+        this.postFieldTypes = new ArrayList<>(fieldCount);
+        for (int i = 0; i < fieldCount; i++) {
+            final LogicalType udfType = udfTypeByIndex.get(i);
+            if (udfType != null) {
+                postFieldTypes.add(udfType);
+            } else {
+                postFieldTypes.add(inputFields.get(i).getType());
+            }
+        }
+
+        // IMPORTANT: align resultReadTypes with resultFieldIndices
+        this.resultReadTypes = new ArrayList<>(resultFieldIndices.size());
+        for (int i = 0; i < resultFieldIndices.size(); i++) {
+            final int idx = resultFieldIndices.get(i);
+            this.resultReadTypes.add(postFieldTypes.get(idx));
+        }
+
+        // wire types for POST read
+        final WireType[] resultWireTypes = new WireType[resultReadTypes.size()];
+        for (int i = 0; i < resultReadTypes.size(); i++) {
+            resultWireTypes[i] = ProxyBinaryCodec.wireTypeFor(resultReadTypes.get(i));
+        }
+        this.resultWireTypes = resultWireTypes;
+
+        // field getters for merge
+        this.resultFieldGetters = new RowData.FieldGetter[resultFieldTypes.size()];
+        for (int i = 0; i < resultFieldTypes.size(); i++) {
+            resultFieldGetters[i] = RowData.createFieldGetter(resultFieldTypes.get(i), i);
+        }
+        this.fullRowFieldGetters = new RowData.FieldGetter[fieldCount];
+        for (int i = 0; i < fieldCount; i++) {
+            fullRowFieldGetters[i] = RowData.createFieldGetter(inputFields.get(i).getType(), i);
+        }
+    }
+
+    protected final RowData mergeProxyRow(RowData baseRow, RowData proxyRow) {
+        final int fieldCount = inputRowType.getFieldCount();
+        final GenericRowData outRow = new GenericRowData(fieldCount);
+        outRow.setRowKind(proxyRow.getRowKind());
+
+        for (int i = 0; i < fieldCount; i++) {
+            outRow.setField(i, fullRowFieldGetters[i].getFieldOrNull(baseRow));
+        }
+        for (int i = 0; i < resultFieldIndices.size(); i++) {
+            final int targetIndex = resultFieldIndices.get(i);
+            outRow.setField(targetIndex, resultFieldGetters[i].getFieldOrNull(proxyRow));
+        }
+        return outRow;
+    }
+
+    protected final RowData createPlaceholderRow(RowKind kind) {
+        switch (kind) {
+            case INSERT:
+                if (insertPlaceholder == null) {
+                    insertPlaceholder = new GenericRowData(inputFieldCount);
+                    insertPlaceholder.setRowKind(RowKind.INSERT);
+                }
+                return insertPlaceholder;
+            case UPDATE_AFTER:
+                if (updateAfterPlaceholder == null) {
+                    updateAfterPlaceholder = new GenericRowData(inputFieldCount);
+                    updateAfterPlaceholder.setRowKind(RowKind.UPDATE_AFTER);
+                }
+                return updateAfterPlaceholder;
+            case UPDATE_BEFORE:
+                if (updateBeforePlaceholder == null) {
+                    updateBeforePlaceholder = new GenericRowData(inputFieldCount);
+                    updateBeforePlaceholder.setRowKind(RowKind.UPDATE_BEFORE);
+                }
+                return updateBeforePlaceholder;
+            case DELETE:
+                if (deletePlaceholder == null) {
+                    deletePlaceholder = new GenericRowData(inputFieldCount);
+                    deletePlaceholder.setRowKind(RowKind.DELETE);
+                }
+                return deletePlaceholder;
+            default:
+                final GenericRowData row = new GenericRowData(inputFieldCount);
+                row.setRowKind(kind);
+                return row;
+        }
+    }
+
+    protected static int[] toIntArray(List<Integer> ints) {
+        final int[] out = new int[ints.size()];
+        for (int i = 0; i < ints.size(); i++) {
+            out[i] = ints.get(i);
+        }
+        return out;
+    }
+
+    protected final String buildConfigJson() {
+        if (role() == Role.POST && tcpConfig.isPostRoleOnly()) {
+            return "{\"role\":\"post\"}";
+        }
+
+        final Map<String, Object> root = new LinkedHashMap<>();
+        root.put("role", role() == Role.PRE ? "pre" : "post");
+
+        if (notEmpty(tcpConfig.getFunctionClass())) {
+            root.put("functionClass", tcpConfig.getFunctionClass());
+        }
+        if (notEmpty(tcpConfig.getFunctionKind())) {
+            root.put("functionKind", tcpConfig.getFunctionKind());
+        }
+
+        root.put("externalOnly", true);
+        root.put("reorderResponses", tcpConfig.isReorderResponses());
+
+        final List<Map<String, Object>> functionArgs = buildFunctionArgs();
+        if (!functionArgs.isEmpty()) {
+            root.put("functionArgs", functionArgs);
+        }
+
+        final List<Map<String, Object>> functionResults = buildFunctionResults();
+        if (!functionResults.isEmpty()) {
+            root.put("functionResults", functionResults);
+        }
+
+        // Always include fields (matches your current behavior).
+        root.put("preFields", buildPreFields());
+        root.put("postFields", buildPostFields());
+
+        try {
+            return MAPPER.writeValueAsString(root);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Failed to serialize proxy config JSON", e);
+        }
+    }
+
+    private static boolean notEmpty(String s) {
+        return s != null && !s.isEmpty();
+    }
+
+    private List<Map<String, Object>> buildFunctionArgs() {
+        final int maxArgs = Math.max(
+                tcpConfig.getArgFieldIndices().size(),
+                Math.max(tcpConfig.getArgFieldNames().size(), tcpConfig.getArgFieldTypes().size()));
+        if (maxArgs == 0) {
+            return List.of();
+        }
+
+        final List<Map<String, Object>> out = new ArrayList<>(maxArgs);
+        for (int i = 0; i < maxArgs; i++) {
+            final Map<String, Object> arg = new LinkedHashMap<>(2);
+            if (i < tcpConfig.getArgFieldNames().size()) {
+                arg.put("name", tcpConfig.getArgFieldNames().get(i));
+            }
+            if (i < tcpConfig.getArgFieldTypes().size()) {
+                arg.put("type", tcpConfig.getArgFieldTypes().get(i));
+            }
+            out.add(arg);
+        }
+        return out;
+    }
+
+    private List<Map<String, Object>> buildFunctionResults() {
+        final int maxResults = Math.max(
+                tcpConfig.getResultFieldIndices().size(),
+                Math.max(
+                        tcpConfig.getResultFieldNames().size(),
+                        Math.max(
+                                tcpConfig.getResultFieldTypes().size(),
+                                tcpConfig.getResultUdfFieldTypes().size())));
+        if (maxResults == 0) {
+            return List.of();
+        }
+
+        final List<Map<String, Object>> out = new ArrayList<>(maxResults);
+        for (int i = 0; i < maxResults; i++) {
+            final Map<String, Object> res = new LinkedHashMap<>(3);
+
+            if (i < tcpConfig.getResultFieldNames().size()) {
+                res.put("outputName", tcpConfig.getResultFieldNames().get(i));
+            }
+
+            if (i < tcpConfig.getResultUdfFieldTypes().size()) {
+                res.put("outputType", tcpConfig.getResultUdfFieldTypes().get(i));
+            } else if (i < tcpConfig.getResultFieldTypes().size()) {
+                res.put("outputType", tcpConfig.getResultFieldTypes().get(i));
+            }
+
+            final int udfFieldIndex = i < tcpConfig.getResultUdfFieldIndices().size()
+                    ? tcpConfig.getResultUdfFieldIndices().get(i)
+                    : -1;
+            if (udfFieldIndex >= 0) {
+                res.put("udfFieldIndex", udfFieldIndex);
+            }
+
+            out.add(res);
+        }
+        return out;
+    }
+
+    private List<Map<String, Object>> buildPreFields() {
+        final List<RowType.RowField> fields = inputRowType.getFields();
+        final int extra = tcpConfig.isReorderResponses() ? 2 : 1; // __op + optional __rowId
+        final List<Map<String, Object>> out = new ArrayList<>(
+                extra + (payloadFieldIndices == null ? 0 : payloadFieldIndices.size()));
+
+        // index 0: op
+        out.add(fieldEntry("__op", "INT32"));
+
+        // index 1: rowId (if enabled)
+        if (tcpConfig.isReorderResponses()) {
+            out.add(fieldEntry("__rowId", "INT64"));
+        }
+
+        // payload fields
+        for (int i = 0; i < payloadFieldIndices.size(); i++) {
+            final int idx = payloadFieldIndices.get(i);
+            final RowType.RowField field = fields.get(idx);
+            final LogicalType wireType = payloadWriteTypes != null && idx < payloadWriteTypes.size()
+                    ? payloadWriteTypes.get(idx)
+                    : field.getType();
+
+            final String name = resolvePayloadFieldName(i, field);
+            out.add(fieldEntry(name, wireTypeFor(wireType)));
+        }
+
+        return out;
+    }
+
+    private List<Map<String, Object>> buildPostFields() {
+        final List<RowType.RowField> fields = inputRowType.getFields();
+        final int extra = tcpConfig.isReorderResponses() ? 2 : 1; // __op + optional __rowId
+        final List<Map<String, Object>> out = new ArrayList<>(
+                extra + (resultFieldIndices == null ? 0 : resultFieldIndices.size()));
+
+        // index 0: op
+        out.add(fieldEntry("__op", "INT32"));
+
+        // index 1: rowId (if enabled)
+        if (tcpConfig.isReorderResponses()) {
+            out.add(fieldEntry("__rowId", "INT64"));
+        }
+
+        // result fields follow the order of resultFieldIndices / resultFieldTypes
+        for (int i = 0; i < resultFieldIndices.size(); i++) {
+            final int idx = resultFieldIndices.get(i);
+            final RowType.RowField field = fields.get(idx);
+            final LogicalType postType = postFieldTypes != null && idx < postFieldTypes.size()
+                    ? postFieldTypes.get(idx)
+                    : field.getType();
+
+            out.add(fieldEntry(field.getName(), wireTypeFor(postType)));
+        }
+
+        return out;
+    }
+
+    private static Map<String, Object> fieldEntry(String name, String wireType) {
+        final Map<String, Object> m = new LinkedHashMap<>(2);
+        m.put("name", name);
+        m.put("wireType", wireType);
+        return m;
+    }
+
+    private String resolvePayloadFieldName(int payloadIndex, RowType.RowField fallbackField) {
+        if (payloadFieldNames != null
+                && payloadIndex >= 0
+                && payloadIndex < payloadFieldNames.size()) {
+            final String name = payloadFieldNames.get(payloadIndex);
+            if (name != null && !name.isEmpty()) {
+                return name;
+            }
+        }
+        return fallbackField.getName();
+    }
+
+    protected static String wireTypeFor(LogicalType type) {
+        if (type == null) {
+            return "NIL";
+        }
+        switch (type.getTypeRoot()) {
+            case BOOLEAN:
+                return "BOOL";
+            case TINYINT:
+            case SMALLINT:
+            case INTEGER:
+            case DATE:
+            case TIME_WITHOUT_TIME_ZONE:
+                return "INT32";
+            case BIGINT:
+                return "INT64";
+            case FLOAT:
+                return "FLOAT32";
+            case DOUBLE:
+                return "FLOAT64";
+            case CHAR:
+            case VARCHAR:
+                return "STRING";
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                return "TIMESTAMP_MILLIS";
+            case DECIMAL: {
+                final DecimalType dt = (DecimalType) type;
+                return dt.getPrecision() <= 18 ? "DECIMAL_UNSCALED_I64" : "DECIMAL_UNSCALED_BYTES";
+            }
+            case BINARY:
+            case VARBINARY:
+                return "BYTES";
+            default:
+                return "NIL";
+        }
+    }
+
+    protected static void writeLengthPrefixedJson(OutputStream out, String json) throws IOException {
+        final byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+        final DataOutputStream dos = new DataOutputStream(out);
+        dos.writeInt(bytes.length);
+        dos.write(bytes);
+        dos.flush();
+    }
+
+    protected static String jsonEscape(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    protected static boolean isStringRoot(LogicalTypeRoot root) {
+        return root == LogicalTypeRoot.CHAR || root == LogicalTypeRoot.VARCHAR;
+    }
+
+    protected static boolean isTimestampRoot(LogicalTypeRoot root) {
+        return root == LogicalTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE
+                || root == LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE;
+    }
+
+    static Object castValue(Object value, LogicalType sourceType, LogicalType targetType) {
+        final LogicalTypeRoot sourceRoot = sourceType.getTypeRoot();
+        final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
+
+        if (targetRoot == LogicalTypeRoot.DECIMAL) {
+            final DecimalType dt = (DecimalType) targetType;
+            if (value instanceof DecimalData) {
+                return DecimalDataUtils.castFrom((DecimalData) value, dt.getPrecision(), dt.getScale());
+            }
+            if (value instanceof StringData) {
+                return DecimalDataUtils.castFrom(value.toString(), dt.getPrecision(), dt.getScale());
+            }
+            if (value instanceof Number) {
+                if (sourceRoot == LogicalTypeRoot.FLOAT || sourceRoot == LogicalTypeRoot.DOUBLE) {
+                    return DecimalDataUtils.castFrom(((Number) value).doubleValue(), dt.getPrecision(), dt.getScale());
+                }
+                return DecimalDataUtils.castFrom(((Number) value).longValue(), dt.getPrecision(), dt.getScale());
+            }
+        }
+
+        if (sourceRoot == LogicalTypeRoot.DECIMAL) {
+            final DecimalData dec = (DecimalData) value;
+            final long integral = DecimalDataUtils.castToIntegral(dec);
+            switch (targetRoot) {
+                case BIGINT:
+                    return integral;
+                case INTEGER:
+                    return (int) integral;
+                case SMALLINT:
+                    return (short) integral;
+                case TINYINT:
+                    return (byte) integral;
+                case FLOAT:
+                    return (float) DecimalDataUtils.doubleValue(dec);
+                case DOUBLE:
+                    return DecimalDataUtils.doubleValue(dec);
+                default:
+                    break;
+            }
+        }
+
+        if (value instanceof Number) {
+            final Number number = (Number) value;
+            switch (targetRoot) {
+                case BIGINT:
+                    return number.longValue();
+                case INTEGER:
+                    return number.intValue();
+                case SMALLINT:
+                    return number.shortValue();
+                case TINYINT:
+                    return number.byteValue();
+                case FLOAT:
+                    return number.floatValue();
+                case DOUBLE:
+                    return number.doubleValue();
+                default:
+                    break;
+            }
+        }
+
+        if (isStringRoot(targetRoot)) {
+            if (value instanceof StringData) {
+                return value;
+            }
+            return StringData.fromString(String.valueOf(value));
+        }
+
+        throw new TableException(
+                "ProxyOperator cannot cast "
+                        + sourceType.asSerializableString()
+                        + " to "
+                        + targetType.asSerializableString());
+    }
+
+    protected static Socket connectSocket(String host, int port, int connectTimeoutMs) throws IOException {
+        final Socket socket = new Socket();
+        socket.setTcpNoDelay(true);
+        socket.connect(new InetSocketAddress(host, port), connectTimeoutMs);
+        return socket;
+    }
+
+    protected static IOException closeQuietly(AutoCloseable c) {
+        if (c == null) {
+            return null;
+        }
+        try {
+            c.close();
+            return null;
+        } catch (IOException e) {
+            return e;
+        } catch (Exception e) {
+            return new IOException(e);
+        }
+    }
+
+    protected static IOException flushAndClose(Object o) {
+        if (o == null) {
+            return null;
+        }
+        IOException err = null;
+        try {
+            if (o instanceof Flushable) {
+                ((Flushable) o).flush();
+            }
+        } catch (IOException e) {
+            err = e;
+        }
+        if (o instanceof AutoCloseable) {
+            err = suppress(err, closeQuietly((AutoCloseable) o));
+        }
+        return err;
+    }
+
+    protected static IOException suppress(IOException existing, IOException next) {
+        if (existing == null) {
+            return next;
+        }
+        if (next != null) {
+            existing.addSuppressed(next);
+        }
+        return existing;
+    }
+}
