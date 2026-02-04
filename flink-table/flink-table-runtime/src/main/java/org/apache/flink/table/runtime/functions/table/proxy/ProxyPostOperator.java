@@ -26,6 +26,8 @@ public final class ProxyPostOperator extends ProxyOperator {
     private transient BufferedInputStream in;
     private transient long expectedRowId;
     private transient Map<Long, RowData> reorderBuffer;
+    private transient boolean reuseObjects;
+    private transient GenericRowData reuseRow;
 
     public ProxyPostOperator(String conf, RowType rowType) {
         this(conf, rowType, rowType);
@@ -58,6 +60,9 @@ public final class ProxyPostOperator extends ProxyOperator {
         final String configJson = buildConfigJson();
         writeLengthPrefixedJson(postOut, configJson);
 
+        this.reuseObjects =
+                getRuntimeContext().isObjectReuseEnabled() && !tcpConfig.isReorderResponses();
+
         // codec (reader configured; writer null)
         this.codec =
                 new ProxyBinaryCodec(
@@ -70,7 +75,12 @@ public final class ProxyPostOperator extends ProxyOperator {
                         null,
                         resultWireTypes,
                         resultReadTypes.toArray(new LogicalType[0]),
-                        resultFieldTypes.toArray(new LogicalType[0]));
+                        resultFieldTypes.toArray(new LogicalType[0]),
+                        reuseObjects);
+
+        if (reuseObjects) {
+            this.reuseRow = new GenericRowData(resultFieldTypes.size());
+        }
 
         this.expectedRowId = 0L;
         this.reorderBuffer = tcpConfig.isReorderResponses() ? new HashMap<>() : null;
@@ -104,17 +114,8 @@ public final class ProxyPostOperator extends ProxyOperator {
             throw new IOException("ProxyPostOperator codec not initialized");
         }
 
-        final ProxyBinaryCodec.RowWithId decoded = codec.readFramedRow(in, fallbackKind);
-
-        final int fieldCount = resultFieldTypes.size();
-        final GenericRowData outRow = new GenericRowData(fieldCount);
-        outRow.setRowKind(decoded.kind);
-
-        for (int i = 0; i < fieldCount; i++) {
-            outRow.setField(i, decoded.fields[i]);
-        }
-
-        return new RowWithId(decoded.rowId, outRow);
+        final ProxyBinaryCodec.RowWithId decoded = codec.readFramedRow(in, fallbackKind, reuseRow);
+        return new RowWithId(decoded.rowId, decoded.row);
     }
 
     private RowData readNextOrderedRow(RowKind fallbackKind) throws IOException {
@@ -152,6 +153,7 @@ public final class ProxyPostOperator extends ProxyOperator {
         IOException error = null;
 
         codec = null;
+        reuseRow = null;
 
         error = suppress(error, closeQuietly(in));
         in = null;
@@ -159,5 +161,24 @@ public final class ProxyPostOperator extends ProxyOperator {
         if (error != null) {
             throw error;
         }
+    }
+
+    private final RowData mergeProxyRow(RowData baseRow, RowData proxyRow) {
+        if (resultReplacesAllFields) {
+            return proxyRow;
+        }
+        final int fieldCount = inputRowType.getFieldCount();
+        final GenericRowData outRow = new GenericRowData(fieldCount);
+        outRow.setRowKind(proxyRow.getRowKind());
+
+        for (int i = 0; i < fieldCount; i++) {
+            final int resultPos = resultPosByInputIndex[i];
+            if (resultPos >= 0) {
+                outRow.setField(i, resultFieldGetters[resultPos].getFieldOrNull(proxyRow));
+            } else {
+                outRow.setField(i, fullRowFieldGetters[i].getFieldOrNull(baseRow));
+            }
+        }
+        return outRow;
     }
 }

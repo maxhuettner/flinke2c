@@ -56,6 +56,7 @@ import java.net.Socket;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -116,6 +117,8 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
 
     protected transient RowData.FieldGetter[] resultFieldGetters;
     protected transient RowData.FieldGetter[] fullRowFieldGetters;
+    protected transient int[] resultPosByInputIndex;
+    protected transient boolean resultReplacesAllFields;
 
     // placeholders (PRE)
     protected transient GenericRowData insertPlaceholder;
@@ -426,54 +429,23 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
         for (int i = 0; i < fieldCount; i++) {
             fullRowFieldGetters[i] = RowData.createFieldGetter(inputFields.get(i).getType(), i);
         }
-    }
 
-    protected final RowData mergeProxyRow(RowData baseRow, RowData proxyRow) {
-        final int fieldCount = inputRowType.getFieldCount();
-        final GenericRowData outRow = new GenericRowData(fieldCount);
-        outRow.setRowKind(proxyRow.getRowKind());
-
-        for (int i = 0; i < fieldCount; i++) {
-            outRow.setField(i, fullRowFieldGetters[i].getFieldOrNull(baseRow));
-        }
+        // fast merge metadata
+        this.resultPosByInputIndex = new int[fieldCount];
+        Arrays.fill(resultPosByInputIndex, -1);
+        boolean replacesAll = resultFieldIndices.size() == fieldCount;
         for (int i = 0; i < resultFieldIndices.size(); i++) {
-            final int targetIndex = resultFieldIndices.get(i);
-            outRow.setField(targetIndex, resultFieldGetters[i].getFieldOrNull(proxyRow));
+            final int idx = resultFieldIndices.get(i);
+            if (idx < 0 || idx >= fieldCount) {
+                replacesAll = false;
+                continue;
+            }
+            resultPosByInputIndex[idx] = i;
+            if (replacesAll && idx != i) {
+                replacesAll = false;
+            }
         }
-        return outRow;
-    }
-
-    protected final RowData createPlaceholderRow(RowKind kind) {
-        switch (kind) {
-            case INSERT:
-                if (insertPlaceholder == null) {
-                    insertPlaceholder = new GenericRowData(inputFieldCount);
-                    insertPlaceholder.setRowKind(RowKind.INSERT);
-                }
-                return insertPlaceholder;
-            case UPDATE_AFTER:
-                if (updateAfterPlaceholder == null) {
-                    updateAfterPlaceholder = new GenericRowData(inputFieldCount);
-                    updateAfterPlaceholder.setRowKind(RowKind.UPDATE_AFTER);
-                }
-                return updateAfterPlaceholder;
-            case UPDATE_BEFORE:
-                if (updateBeforePlaceholder == null) {
-                    updateBeforePlaceholder = new GenericRowData(inputFieldCount);
-                    updateBeforePlaceholder.setRowKind(RowKind.UPDATE_BEFORE);
-                }
-                return updateBeforePlaceholder;
-            case DELETE:
-                if (deletePlaceholder == null) {
-                    deletePlaceholder = new GenericRowData(inputFieldCount);
-                    deletePlaceholder.setRowKind(RowKind.DELETE);
-                }
-                return deletePlaceholder;
-            default:
-                final GenericRowData row = new GenericRowData(inputFieldCount);
-                row.setRowKind(kind);
-                return row;
-        }
+        this.resultReplacesAllFields = replacesAll;
     }
 
     protected static int[] toIntArray(List<Integer> ints) {
@@ -722,81 +694,6 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
     protected static boolean isTimestampRoot(LogicalTypeRoot root) {
         return root == LogicalTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE
                 || root == LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE;
-    }
-
-    static Object castValue(Object value, LogicalType sourceType, LogicalType targetType) {
-        final LogicalTypeRoot sourceRoot = sourceType.getTypeRoot();
-        final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
-
-        if (targetRoot == LogicalTypeRoot.DECIMAL) {
-            final DecimalType dt = (DecimalType) targetType;
-            if (value instanceof DecimalData) {
-                return DecimalDataUtils.castFrom((DecimalData) value, dt.getPrecision(), dt.getScale());
-            }
-            if (value instanceof StringData) {
-                return DecimalDataUtils.castFrom(value.toString(), dt.getPrecision(), dt.getScale());
-            }
-            if (value instanceof Number) {
-                if (sourceRoot == LogicalTypeRoot.FLOAT || sourceRoot == LogicalTypeRoot.DOUBLE) {
-                    return DecimalDataUtils.castFrom(((Number) value).doubleValue(), dt.getPrecision(), dt.getScale());
-                }
-                return DecimalDataUtils.castFrom(((Number) value).longValue(), dt.getPrecision(), dt.getScale());
-            }
-        }
-
-        if (sourceRoot == LogicalTypeRoot.DECIMAL) {
-            final DecimalData dec = (DecimalData) value;
-            final long integral = DecimalDataUtils.castToIntegral(dec);
-            switch (targetRoot) {
-                case BIGINT:
-                    return integral;
-                case INTEGER:
-                    return (int) integral;
-                case SMALLINT:
-                    return (short) integral;
-                case TINYINT:
-                    return (byte) integral;
-                case FLOAT:
-                    return (float) DecimalDataUtils.doubleValue(dec);
-                case DOUBLE:
-                    return DecimalDataUtils.doubleValue(dec);
-                default:
-                    break;
-            }
-        }
-
-        if (value instanceof Number) {
-            final Number number = (Number) value;
-            switch (targetRoot) {
-                case BIGINT:
-                    return number.longValue();
-                case INTEGER:
-                    return number.intValue();
-                case SMALLINT:
-                    return number.shortValue();
-                case TINYINT:
-                    return number.byteValue();
-                case FLOAT:
-                    return number.floatValue();
-                case DOUBLE:
-                    return number.doubleValue();
-                default:
-                    break;
-            }
-        }
-
-        if (isStringRoot(targetRoot)) {
-            if (value instanceof StringData) {
-                return value;
-            }
-            return StringData.fromString(String.valueOf(value));
-        }
-
-        throw new TableException(
-                "ProxyOperator cannot cast "
-                        + sourceType.asSerializableString()
-                        + " to "
-                        + targetType.asSerializableString());
     }
 
     protected static Socket connectSocket(String host, int port, int connectTimeoutMs) throws IOException {

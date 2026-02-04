@@ -3,6 +3,7 @@ package org.apache.flink.table.runtime.functions.table.proxy;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.data.DecimalDataUtils;
+import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.table.data.RowData;
@@ -34,11 +35,11 @@ final class ProxyBinaryCodec {
         FLOAT32,
         FLOAT64,
         BOOL,
-        STRING,                 // [int32_be len][utf8]
-        BYTES,                  // [int32_be len][raw]
-        TIMESTAMP_MILLIS,       // int64 epoch millis
-        DECIMAL_UNSCALED_I64,   // int64 unscaled (precision <= 18)
-        DECIMAL_UNSCALED_BYTES  // [int32_be len][two's complement bytes] (precision > 18)
+        STRING, // [int32_be len][utf8]
+        BYTES, // [int32_be len][raw]
+        TIMESTAMP_MILLIS, // int64 epoch millis
+        DECIMAL_UNSCALED_I64, // int64 unscaled (precision <= 18)
+        DECIMAL_UNSCALED_BYTES // [int32_be len][two's complement bytes] (precision > 18)
     }
 
     private static final int DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024; // 64 MB
@@ -57,11 +58,12 @@ final class ProxyBinaryCodec {
     private final WireType[] readWireTypes;
     private final LogicalType[] readSourceTypes;
     private final LogicalType[] readTargetTypes;
+    private final boolean reuseObjects;
+    private final byte[][] reuseBytes;
 
     // reusable buffers
     private final GrowableBuffer outBuf = new GrowableBuffer(8 * 1024);
     private byte[] frameReadBuf = new byte[8 * 1024];
-    private Object[] readFieldBuffer;
 
     private static final long[] POW10 = initPow10();
 
@@ -75,14 +77,15 @@ final class ProxyBinaryCodec {
             @Nullable int[] writeTimestampPrecision,
             @Nullable WireType[] readWireTypes,
             @Nullable LogicalType[] readSourceTypes,
-            @Nullable LogicalType[] readTargetTypes) {
+            @Nullable LogicalType[] readTargetTypes,
+            boolean reuseObjects) {
 
         this.includeRowId = includeRowId;
 
         this.writeWireTypes = writeWireTypes;
         this.writeTargetTypes = writeTargetTypes;
         this.writeSourceRoots = writeSourceRoots;
-        
+
         this.writeSourcePrecision = writeSourcePrecision;
         this.writeSourceScale = writeSourceScale;
         this.writeTimestampPrecision = writeTimestampPrecision;
@@ -90,10 +93,9 @@ final class ProxyBinaryCodec {
         this.readWireTypes = readWireTypes;
         this.readSourceTypes = readSourceTypes;
         this.readTargetTypes = readTargetTypes;
-
-        if (readWireTypes != null) {
-            this.readFieldBuffer = new Object[readWireTypes.length];
-        }
+        this.reuseObjects = reuseObjects;
+        this.reuseBytes =
+                reuseObjects && readWireTypes != null ? new byte[readWireTypes.length][] : null;
     }
 
     // ---------------------------------------------------------------------
@@ -215,7 +217,8 @@ final class ProxyBinaryCodec {
                     outBuf.putIntBE(bytes.length);
                     outBuf.putBytes(bytes);
                 } else {
-                    final BigInteger unscaled = toUnscaledBigInt(row, sourceIndex, sourceRoot, dt.getPrecision(), dt.getScale(),
+                    final BigInteger unscaled = toUnscaledBigInt(row, sourceIndex, sourceRoot, dt.getPrecision(),
+                            dt.getScale(),
                             srcPrecision, srcScale);
                     final byte[] bytes = unscaled.toByteArray(); // two's complement big-endian
                     outBuf.putIntBE(bytes.length);
@@ -228,7 +231,8 @@ final class ProxyBinaryCodec {
         }
     }
 
-    RowWithId readFramedRow(InputStream in, RowKind fallbackKind) throws IOException {
+    RowWithId readFramedRow(
+            InputStream in, RowKind fallbackKind, @Nullable GenericRowData reuseRow) throws IOException {
         if (readWireTypes == null) {
             throw new IOException("ProxyBinaryCodec not configured for reading");
         }
@@ -264,76 +268,112 @@ final class ProxyBinaryCodec {
         final int nullBitmapPos = p;
         p += nullBytes;
 
-        final Object[] outFields = readFieldBuffer;
+        final GenericRowData outRow =
+                reuseRow != null && reuseRow.getArity() == nFields
+                        ? reuseRow
+                        : new GenericRowData(nFields);
         for (int i = 0; i < nFields; i++) {
             if (isNullBitSet(frameReadBuf, nullBitmapPos, i)) {
-                outFields[i] = null;
+                outRow.setField(i, null);
                 continue;
             }
-            p = readValueInto(i, frameReadBuf, p, frameLen, outFields);
+            p = readValueIntoRow(i, frameReadBuf, p, frameLen, outRow);
         }
 
         final RowKind kind = opToRowKind(op, fallbackKind);
-        return new RowWithId(rowId, kind, outFields);
+        outRow.setRowKind(kind);
+        return new RowWithId(rowId, outRow);
     }
 
-    private int readValueInto(int i, byte[] buf, int p, int limit, Object[] outFields) throws IOException {
+    private int readValueIntoRow(int i, byte[] buf, int p, int limit, GenericRowData outRow)
+            throws IOException {
         final WireType wt = readWireTypes[i];
 
         switch (wt) {
             case BOOL:
-                if (p + 1 > limit) throw new IOException("Truncated BOOL");
-                outFields[i] = castIfNeeded(buf[p] != 0, readSourceTypes[i], readTargetTypes[i]);
+                if (p + 1 > limit)
+                    throw new IOException("Truncated BOOL");
+                outRow.setField(
+                        i, castIfNeeded(buf[p] != 0, readSourceTypes[i], readTargetTypes[i]));
                 return p + 1;
             case INT32:
-                if (p + 4 > limit) throw new IOException("Truncated INT32");
-                outFields[i] = castIfNeeded(readIntBE(buf, p), readSourceTypes[i], readTargetTypes[i]);
+                if (p + 4 > limit)
+                    throw new IOException("Truncated INT32");
+                outRow.setField(
+                        i,
+                        castIfNeeded(
+                                readIntBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
                 return p + 4;
             case INT64:
             case TIMESTAMP_MILLIS:
-                if (p + 8 > limit) throw new IOException("Truncated INT64");
-                outFields[i] = castIfNeeded(readLongBE(buf, p), readSourceTypes[i], readTargetTypes[i]);
+                if (p + 8 > limit)
+                    throw new IOException("Truncated INT64");
+                outRow.setField(
+                        i,
+                        castIfNeeded(
+                                readLongBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
                 return p + 8;
             case FLOAT32:
-                if (p + 4 > limit) throw new IOException("Truncated FLOAT32");
-                outFields[i] = castIfNeeded(Float.intBitsToFloat(readIntBE(buf, p)), readSourceTypes[i], readTargetTypes[i]);
+                if (p + 4 > limit)
+                    throw new IOException("Truncated FLOAT32");
+                outRow.setField(
+                        i,
+                        castIfNeeded(
+                                Float.intBitsToFloat(readIntBE(buf, p)),
+                                readSourceTypes[i],
+                                readTargetTypes[i]));
                 return p + 4;
             case FLOAT64:
-                if (p + 8 > limit) throw new IOException("Truncated FLOAT64");
-                outFields[i] = castIfNeeded(Double.longBitsToDouble(readLongBE(buf, p)), readSourceTypes[i], readTargetTypes[i]);
+                if (p + 8 > limit)
+                    throw new IOException("Truncated FLOAT64");
+                outRow.setField(
+                        i,
+                        castIfNeeded(
+                                Double.longBitsToDouble(readLongBE(buf, p)),
+                                readSourceTypes[i],
+                                readTargetTypes[i]));
                 return p + 8;
             case STRING: {
-                if (p + 4 > limit) throw new IOException("Truncated STRING len");
+                if (p + 4 > limit)
+                    throw new IOException("Truncated STRING len");
                 final int len = readIntBE(buf, p);
                 p += 4;
-                if (len < 0 || p + len > limit) throw new IOException("Invalid STRING len: " + len);
-                outFields[i] = castIfNeeded(StringData.fromBytes(buf, p, len), readSourceTypes[i], readTargetTypes[i]);
+                if (len < 0 || p + len > limit)
+                    throw new IOException("Invalid STRING len: " + len);
+                final StringData sd =
+                        reuseObjects
+                                ? StringData.fromBytes(buf, p, len)
+                                : StringData.fromBytes(copyBytes(i, buf, p, len), 0, len);
+                outRow.setField(i, castIfNeeded(sd, readSourceTypes[i], readTargetTypes[i]));
                 return p + len;
             }
             case BYTES: {
-                if (p + 4 > limit) throw new IOException("Truncated BYTES len");
+                if (p + 4 > limit)
+                    throw new IOException("Truncated BYTES len");
                 final int len = readIntBE(buf, p);
                 p += 4;
-                if (len < 0 || p + len > limit) throw new IOException("Invalid BYTES len: " + len);
-                final byte[] out = new byte[len];
-                System.arraycopy(buf, p, out, 0, len);
-                outFields[i] = castIfNeeded(out, readSourceTypes[i], readTargetTypes[i]);
+                if (len < 0 || p + len > limit)
+                    throw new IOException("Invalid BYTES len: " + len);
+                final byte[] out = copyBytes(i, buf, p, len);
+                outRow.setField(i, castIfNeeded(out, readSourceTypes[i], readTargetTypes[i]));
                 return p + len;
             }
             case DECIMAL_UNSCALED_I64: {
-                if (p + 8 > limit) throw new IOException("Truncated DECIMAL_UNSCALED_I64");
+                if (p + 8 > limit)
+                    throw new IOException("Truncated DECIMAL_UNSCALED_I64");
                 final long unscaled = readLongBE(buf, p);
-                outFields[i] = castIfNeeded(unscaled, readSourceTypes[i], readTargetTypes[i]);
+                outRow.setField(i, castIfNeeded(unscaled, readSourceTypes[i], readTargetTypes[i]));
                 return p + 8;
             }
             case DECIMAL_UNSCALED_BYTES: {
-                if (p + 4 > limit) throw new IOException("Truncated DECIMAL_UNSCALED_BYTES len");
+                if (p + 4 > limit)
+                    throw new IOException("Truncated DECIMAL_UNSCALED_BYTES len");
                 final int len = readIntBE(buf, p);
                 p += 4;
-                if (len < 0 || p + len > limit) throw new IOException("Invalid DECIMAL bytes len: " + len);
-                final byte[] bi = new byte[len];
-                System.arraycopy(buf, p, bi, 0, len);
-                outFields[i] = castIfNeeded(bi, readSourceTypes[i], readTargetTypes[i]);
+                if (len < 0 || p + len > limit)
+                    throw new IOException("Invalid DECIMAL bytes len: " + len);
+                final byte[] bi = copyBytes(i, buf, p, len);
+                outRow.setField(i, castIfNeeded(bi, readSourceTypes[i], readTargetTypes[i]));
                 return p + len;
             }
             default:
@@ -366,7 +406,82 @@ final class ProxyBinaryCodec {
             return materializeFromWire(value, targetType);
         }
 
-        return ProxyOperator.castValue(materializeFromWire(value, sourceType), sourceType, targetType);
+        return castValue(materializeFromWire(value, sourceType), sourceType, targetType);
+    }
+
+    private static Object castValue(Object value, LogicalType sourceType, LogicalType targetType) {
+        final LogicalTypeRoot sourceRoot = sourceType.getTypeRoot();
+        final LogicalTypeRoot targetRoot = targetType.getTypeRoot();
+
+        if (targetRoot == LogicalTypeRoot.DECIMAL) {
+            final DecimalType dt = (DecimalType) targetType;
+            if (value instanceof DecimalData) {
+                return DecimalDataUtils.castFrom((DecimalData) value, dt.getPrecision(), dt.getScale());
+            }
+            if (value instanceof StringData) {
+                return DecimalDataUtils.castFrom(value.toString(), dt.getPrecision(), dt.getScale());
+            }
+            if (value instanceof Number) {
+                if (sourceRoot == LogicalTypeRoot.FLOAT || sourceRoot == LogicalTypeRoot.DOUBLE) {
+                    return DecimalDataUtils.castFrom(((Number) value).doubleValue(), dt.getPrecision(), dt.getScale());
+                }
+                return DecimalDataUtils.castFrom(((Number) value).longValue(), dt.getPrecision(), dt.getScale());
+            }
+        }
+
+        if (sourceRoot == LogicalTypeRoot.DECIMAL) {
+            final DecimalData dec = (DecimalData) value;
+            final long integral = DecimalDataUtils.castToIntegral(dec);
+            switch (targetRoot) {
+                case BIGINT:
+                    return integral;
+                case INTEGER:
+                    return (int) integral;
+                case SMALLINT:
+                    return (short) integral;
+                case TINYINT:
+                    return (byte) integral;
+                case FLOAT:
+                    return (float) DecimalDataUtils.doubleValue(dec);
+                case DOUBLE:
+                    return DecimalDataUtils.doubleValue(dec);
+                default:
+                    break;
+            }
+        }
+
+        if (value instanceof Number) {
+            final Number number = (Number) value;
+            switch (targetRoot) {
+                case BIGINT:
+                    return number.longValue();
+                case INTEGER:
+                    return number.intValue();
+                case SMALLINT:
+                    return number.shortValue();
+                case TINYINT:
+                    return number.byteValue();
+                case FLOAT:
+                    return number.floatValue();
+                case DOUBLE:
+                    return number.doubleValue();
+                default:
+                    break;
+            }
+        }
+
+        if (isStringRoot(targetRoot)) {
+            if (value instanceof StringData) {
+                return value;
+            }
+            return StringData.fromString(String.valueOf(value));
+        }
+
+        throw new TableException(
+                "ProxyOperator cannot cast "
+                        + sourceType.asSerializableString()
+                        + " to "
+                        + targetType.asSerializableString());
     }
 
     private static Object materializeFromWire(Object value, LogicalType type) {
@@ -389,7 +504,8 @@ final class ProxyBinaryCodec {
                     final BigDecimal bd = new BigDecimal(bi, dt.getScale());
                     final DecimalData dd = DecimalData.fromBigDecimal(bd, dt.getPrecision(), dt.getScale());
                     if (dd == null) {
-                        throw new TableException("Failed to deserialize DECIMAL(" + dt.getPrecision() + "," + dt.getScale() + ")");
+                        throw new TableException(
+                                "Failed to deserialize DECIMAL(" + dt.getPrecision() + "," + dt.getScale() + ")");
                     }
                     return dd;
                 }
@@ -437,7 +553,8 @@ final class ProxyBinaryCodec {
             case VARBINARY:
                 return WireType.BYTES;
             default:
-                throw new TableException("Unsupported logical type for proxy wire format: " + type.asSerializableString());
+                throw new TableException(
+                        "Unsupported logical type for proxy wire format: " + type.asSerializableString());
         }
     }
 
@@ -452,21 +569,31 @@ final class ProxyBinaryCodec {
 
     static int rowKindToOp(RowKind kind) {
         switch (kind) {
-            case INSERT: return 0;
-            case UPDATE_AFTER: return 1;
-            case UPDATE_BEFORE: return 2;
-            case DELETE: return 3;
-            default: return 127;
+            case INSERT:
+                return 0;
+            case UPDATE_AFTER:
+                return 1;
+            case UPDATE_BEFORE:
+                return 2;
+            case DELETE:
+                return 3;
+            default:
+                return 127;
         }
     }
 
     static RowKind opToRowKind(int op, RowKind fallback) {
         switch (op) {
-            case 0: return RowKind.INSERT;
-            case 1: return RowKind.UPDATE_AFTER;
-            case 2: return RowKind.UPDATE_BEFORE;
-            case 3: return RowKind.DELETE;
-            default: return fallback;
+            case 0:
+                return RowKind.INSERT;
+            case 1:
+                return RowKind.UPDATE_AFTER;
+            case 2:
+                return RowKind.UPDATE_BEFORE;
+            case 3:
+                return RowKind.DELETE;
+            default:
+                return fallback;
         }
     }
 
@@ -489,10 +616,9 @@ final class ProxyBinaryCodec {
                 return rescaleLong(unscaled, targetScale - sourceScale);
             } catch (ArithmeticException e) {
                 final BigDecimal bd = dec.toBigDecimal();
-                final BigDecimal scaled =
-                        bd.scale() == targetScale
-                                ? bd
-                                : bd.setScale(targetScale, RoundingMode.HALF_UP);
+                final BigDecimal scaled = bd.scale() == targetScale
+                        ? bd
+                        : bd.setScale(targetScale, RoundingMode.HALF_UP);
                 return scaled.unscaledValue().longValueExact();
             }
         }
@@ -513,7 +639,8 @@ final class ProxyBinaryCodec {
             case DOUBLE:
                 return bigDecimalToUnscaledLong(BigDecimal.valueOf(row.getDouble(pos)), targetScale);
             default:
-                throw new TableException("Cannot cast " + sourceRoot + " to DECIMAL(" + targetPrecision + "," + targetScale + ")");
+                throw new TableException(
+                        "Cannot cast " + sourceRoot + " to DECIMAL(" + targetPrecision + "," + targetScale + ")");
         }
     }
 
@@ -551,26 +678,43 @@ final class ProxyBinaryCodec {
             case DOUBLE:
                 return bigDecimalToUnscaledBigInt(BigDecimal.valueOf(row.getDouble(pos)), targetScale);
             default:
-                throw new TableException("Cannot cast " + sourceRoot + " to DECIMAL(" + targetPrecision + "," + targetScale + ")");
+                throw new TableException(
+                        "Cannot cast " + sourceRoot + " to DECIMAL(" + targetPrecision + "," + targetScale + ")");
         }
     }
 
     static final class RowWithId {
         final long rowId;
-        final RowKind kind;
-        final Object[] fields;
+        final RowData row;
 
-        RowWithId(long rowId, RowKind kind, Object[] fields) {
+        RowWithId(long rowId, RowData row) {
             this.rowId = rowId;
-            this.kind = kind;
-            this.fields = fields;
+            this.row = row;
         }
     }
 
+    private byte[] copyBytes(int fieldIndex, byte[] buf, int p, int len) {
+        final byte[] out;
+        if (reuseObjects) {
+            byte[] existing = reuseBytes[fieldIndex];
+            if (existing == null || existing.length != len) {
+                existing = new byte[len];
+                reuseBytes[fieldIndex] = existing;
+            }
+            out = existing;
+        } else {
+            out = new byte[len];
+        }
+        System.arraycopy(buf, p, out, 0, len);
+        return out;
+    }
+
     private void ensureReadBuf(int len) {
-        if (frameReadBuf.length >= len) return;
+        if (frameReadBuf.length >= len)
+            return;
         int n = frameReadBuf.length;
-        while (n < len) n <<= 1;
+        while (n < len)
+            n <<= 1;
         frameReadBuf = new byte[n];
     }
 
@@ -672,8 +816,7 @@ final class ProxyBinaryCodec {
         long quotient = abs / divisor;
         final long remainder = abs - quotient * divisor;
         final long half = divisor >>> 1;
-        final boolean increment =
-                remainder > half || (remainder == half && (divisor & 1L) == 0);
+        final boolean increment = remainder > half || (remainder == half && (divisor & 1L) == 0);
         if (increment) {
             quotient++;
         }
@@ -737,9 +880,11 @@ final class ProxyBinaryCodec {
 
         void ensureCapacity(int additional) {
             final int need = pos + additional;
-            if (need <= buf.length) return;
+            if (need <= buf.length)
+                return;
             int n = buf.length;
-            while (n < need) n <<= 1;
+            while (n < need)
+                n <<= 1;
             final byte[] nb = new byte[n];
             System.arraycopy(buf, 0, nb, 0, pos);
             buf = nb;
