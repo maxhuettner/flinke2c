@@ -1,4 +1,4 @@
-package org.apache.flink.table.runtime.functions.table;
+package org.apache.flink.table.runtime.functions.table.proxy;
 
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.DecimalData;
@@ -41,15 +41,14 @@ final class ProxyBinaryCodec {
         DECIMAL_UNSCALED_BYTES  // [int32_be len][two's complement bytes] (precision > 18)
     }
 
+    private static final int DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024; // 64 MB
+
     private final boolean includeRowId;
-    private final int maxFrameSize;
 
     // PRE write schema
     private final WireType[] writeWireTypes;
     private final LogicalType[] writeTargetTypes;
     private final LogicalTypeRoot[] writeSourceRoots;
-    private final int[] writeTargetPrecision;
-    private final int[] writeTargetScale;
     private final int[] writeSourcePrecision;
     private final int[] writeSourceScale;
     private final int[] writeTimestampPrecision;
@@ -68,12 +67,9 @@ final class ProxyBinaryCodec {
 
     ProxyBinaryCodec(
             boolean includeRowId,
-            int maxFrameSize,
             @Nullable WireType[] writeWireTypes,
             @Nullable LogicalType[] writeTargetTypes,
             @Nullable LogicalTypeRoot[] writeSourceRoots,
-            @Nullable int[] writeTargetPrecision,
-            @Nullable int[] writeTargetScale,
             @Nullable int[] writeSourcePrecision,
             @Nullable int[] writeSourceScale,
             @Nullable int[] writeTimestampPrecision,
@@ -82,13 +78,11 @@ final class ProxyBinaryCodec {
             @Nullable LogicalType[] readTargetTypes) {
 
         this.includeRowId = includeRowId;
-        this.maxFrameSize = maxFrameSize;
 
         this.writeWireTypes = writeWireTypes;
         this.writeTargetTypes = writeTargetTypes;
         this.writeSourceRoots = writeSourceRoots;
-        this.writeTargetPrecision = writeTargetPrecision;
-        this.writeTargetScale = writeTargetScale;
+        
         this.writeSourcePrecision = writeSourcePrecision;
         this.writeSourceScale = writeSourceScale;
         this.writeTimestampPrecision = writeTimestampPrecision;
@@ -129,7 +123,7 @@ final class ProxyBinaryCodec {
             outBuf.putLongBE(rowId);
         }
 
-        // null bitmap placeholder (filled later)
+        // null bitmap placeholder
         final int nullBitmapPos = outBuf.position();
         outBuf.ensureCapacity(nullBytes);
         for (int i = 0; i < nullBytes; i++) {
@@ -147,9 +141,6 @@ final class ProxyBinaryCodec {
         }
 
         final int payloadLen = outBuf.position();
-        if (payloadLen > maxFrameSize) {
-            throw new IOException("Row payload exceeds maxFrameSize: " + payloadLen + " > " + maxFrameSize);
-        }
 
         // frame: [len][payload]
         writeIntBE(out, payloadLen);
@@ -166,7 +157,6 @@ final class ProxyBinaryCodec {
                 outBuf.putByte((byte) (row.getBoolean(sourceIndex) ? 1 : 0));
                 return;
             case INT32:
-                // Flink may store smaller ints; treat them as int32 on wire
                 switch (sourceRoot) {
                     case TINYINT:
                         outBuf.putIntBE(row.getByte(sourceIndex));
@@ -238,17 +228,13 @@ final class ProxyBinaryCodec {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // POST: read one framed row -> fields (with casts to target types)
-    // ---------------------------------------------------------------------
-
     RowWithId readFramedRow(InputStream in, RowKind fallbackKind) throws IOException {
         if (readWireTypes == null) {
             throw new IOException("ProxyBinaryCodec not configured for reading");
         }
 
         final int frameLen = readIntBE(in);
-        if (frameLen < 0 || frameLen > maxFrameSize) {
+        if (frameLen < 0 || frameLen > DEFAULT_MAX_FRAME_SIZE) {
             throw new IOException("Invalid frame length: " + frameLen);
         }
 
@@ -367,7 +353,7 @@ final class ProxyBinaryCodec {
         final LogicalTypeRoot sr = sourceType.getTypeRoot();
         final LogicalTypeRoot tr = targetType.getTypeRoot();
 
-        // same family => just normalize decimals if needed
+        // normalize decimals if needed
         if (sr == tr
                 || (isStringRoot(sr) && isStringRoot(tr))
                 || (isTimestampRoot(sr) && isTimestampRoot(tr))) {
@@ -380,7 +366,6 @@ final class ProxyBinaryCodec {
             return materializeFromWire(value, targetType);
         }
 
-        // general cast
         return ProxyOperator.castValue(materializeFromWire(value, sourceType), sourceType, targetType);
     }
 
@@ -390,7 +375,6 @@ final class ProxyBinaryCodec {
         switch (root) {
             case TIMESTAMP_WITHOUT_TIME_ZONE:
             case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-                // value is long epoch millis
                 return TimestampData.fromEpochMillis((Long) value);
             case DECIMAL: {
                 final DecimalType dt = (DecimalType) type;
@@ -420,13 +404,9 @@ final class ProxyBinaryCodec {
         return value;
     }
 
-    // ---------------------------------------------------------------------
-    // Helpers: mapping + numeric conversions
-    // ---------------------------------------------------------------------
-
     static WireType wireTypeFor(LogicalType type) {
         if (type == null) {
-            return WireType.INT32; // unreachable; caller should not use null
+            throw new TableException("Cannot determine wire type for null logical type");
         }
         switch (type.getTypeRoot()) {
             case BOOLEAN:
@@ -499,7 +479,6 @@ final class ProxyBinaryCodec {
             int sourcePrecision,
             int sourceScale) {
 
-        // fast path: source is DECIMAL already
         if (sourceRoot == LogicalTypeRoot.DECIMAL) {
             final DecimalData dec = row.getDecimal(pos, sourcePrecision, sourceScale);
             if (sourceScale == targetScale) {
@@ -518,7 +497,6 @@ final class ProxyBinaryCodec {
             }
         }
 
-        // numeric -> decimal
         switch (sourceRoot) {
             case BIGINT:
                 return rescaleLongExact(row.getLong(pos), targetScale);
@@ -577,10 +555,6 @@ final class ProxyBinaryCodec {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Framing + bitmap + endian helpers
-    // ---------------------------------------------------------------------
-
     static final class RowWithId {
         final long rowId;
         final RowKind kind;
@@ -609,7 +583,8 @@ final class ProxyBinaryCodec {
     private static boolean isNullBitSet(byte[] payload, int bitmapPos, int fieldIndex) {
         final int byteIndex = bitmapPos + (fieldIndex >>> 3);
         final int bit = fieldIndex & 7;
-        return (payload[byteIndex] & (1 << bit)) != 0;
+        final int b = payload[byteIndex] & 0xFF;
+        return (b & (1 << bit)) != 0;
     }
 
     private static void readFully(InputStream in, byte[] b, int off, int len) throws IOException {
@@ -649,7 +624,7 @@ final class ProxyBinaryCodec {
                 | ((long) (buf[p + 4] & 0xff) << 24)
                 | ((long) (buf[p + 5] & 0xff) << 16)
                 | ((long) (buf[p + 6] & 0xff) << 8)
-                | ((long) (buf[p + 7] & 0xff));
+                | (buf[p + 7] & 0xff);
     }
 
     private static void writeIntBE(OutputStream out, int v) throws IOException {
