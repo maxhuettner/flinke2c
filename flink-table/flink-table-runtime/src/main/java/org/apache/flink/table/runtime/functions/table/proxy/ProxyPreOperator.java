@@ -1,9 +1,11 @@
 package org.apache.flink.table.runtime.functions.table.proxy;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.types.RowKind;
 
 import java.io.BufferedOutputStream;
 import java.io.IOException;
@@ -53,7 +55,8 @@ public final class ProxyPreOperator extends ProxyOperator {
                         payloadTimestampPrecision,
                         null,
                         null,
-                        null);
+                        null,
+                        false);
 
         LOG.info(
                 "ProxyPreOperator connected to {}:{} (rowType={}, sentConfigBytes={})",
@@ -98,6 +101,39 @@ public final class ProxyPreOperator extends ProxyOperator {
 
         if (error != null) {
             throw error;
+        }
+    }
+
+    private final RowData createPlaceholderRow(RowKind kind) {
+        switch (kind) {
+            case INSERT:
+                if (insertPlaceholder == null) {
+                    insertPlaceholder = new GenericRowData(inputFieldCount);
+                    insertPlaceholder.setRowKind(RowKind.INSERT);
+                }
+                return insertPlaceholder;
+            case UPDATE_AFTER:
+                if (updateAfterPlaceholder == null) {
+                    updateAfterPlaceholder = new GenericRowData(inputFieldCount);
+                    updateAfterPlaceholder.setRowKind(RowKind.UPDATE_AFTER);
+                }
+                return updateAfterPlaceholder;
+            case UPDATE_BEFORE:
+                if (updateBeforePlaceholder == null) {
+                    updateBeforePlaceholder = new GenericRowData(inputFieldCount);
+                    updateBeforePlaceholder.setRowKind(RowKind.UPDATE_BEFORE);
+                }
+                return updateBeforePlaceholder;
+            case DELETE:
+                if (deletePlaceholder == null) {
+                    deletePlaceholder = new GenericRowData(inputFieldCount);
+                    deletePlaceholder.setRowKind(RowKind.DELETE);
+                }
+                return deletePlaceholder;
+            default:
+                final GenericRowData row = new GenericRowData(inputFieldCount);
+                row.setRowKind(kind);
+                return row;
         }
     }
 }
