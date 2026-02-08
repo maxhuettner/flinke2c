@@ -105,6 +105,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                     .booleanType()
                     .defaultValue(false);
     public static final String PROXY_FUNCTION_KIND_SCALAR = "scalar";
+    public static final String PROXY_FUNCTION_KIND_FILTER = "filter";
 
     public static final String FIELD_NAME_PROJECTION = "projection";
     public static final String FIELD_NAME_CONDITION = "condition";
@@ -647,6 +648,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         private final RowType inputRowType;
         private final RowType outputRowType;
         private boolean proxyFunctionFound;
+        private String proxyFunctionKind = PROXY_FUNCTION_KIND_SCALAR;
         private @Nullable String proxyConf;
         private boolean loggedFirstCall;
         private int currentOutputFieldIndex = -1;
@@ -767,6 +769,9 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             }
             proxyFunctionFound = true;
             proxyConf = mergeProxyConf(proxyConf, extractProxyConf(operands));
+            if (currentOutputFieldIndex < 0) {
+                proxyFunctionKind = PROXY_FUNCTION_KIND_FILTER;
+            }
             boolean foundFieldArg = false;
             RexNode firstFieldOperand = null;
             @Nullable Integer firstFieldIndex = null;
@@ -794,6 +799,9 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                 throw new TableException(
                         "Proxy scalar function requires at least one column reference argument.");
             }
+            if (currentOutputFieldIndex < 0) {
+                return call;
+            }
             final String udfReturnType = resolveUdfReturnType(call, currentUdfFieldIndexOverride);
             addResultField(currentUdfFieldIndexOverride, firstFieldIndex, udfReturnType);
             return firstFieldOperand.accept(this);
@@ -812,7 +820,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         }
 
         public String getProxyFunctionKind() {
-            return PROXY_FUNCTION_KIND_SCALAR;
+            return proxyFunctionKind;
         }
 
         public List<Integer> getProxyArgFieldIndices() {

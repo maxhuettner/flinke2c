@@ -304,6 +304,10 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 condition == null ? null : condition.accept(rewriter);
 
         final boolean hasProxyFunction = rewriter.hasProxyFunction();
+        final boolean proxyFilter =
+                hasProxyFunction
+                        && CommonExecCalc.PROXY_FUNCTION_KIND_FILTER.equals(
+                                rewriter.getProxyFunctionKind());
         final boolean useProxyOperators = hasProxyFunction || proxyConf != null;
         LOG.info(
                 "StreamExecCalc proxy rewrite: hasProxyFunction={}, proxyConfPresent={}, useProxyOperators={}",
@@ -314,7 +318,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
         final List<RexNode> effectiveProjection =
                 hasProxyFunction ? rewrittenProjection : projection;
         final @Nullable RexNode effectiveCondition =
-                hasProxyFunction ? rewrittenCondition : condition;
+                proxyFilter ? null : (hasProxyFunction ? rewrittenCondition : condition);
         final @Nullable String resolvedProxyConf;
         @Nullable List<String> resolvedResultFieldTypes = null;
         @Nullable List<Integer> resolvedResultFieldIndices = null;

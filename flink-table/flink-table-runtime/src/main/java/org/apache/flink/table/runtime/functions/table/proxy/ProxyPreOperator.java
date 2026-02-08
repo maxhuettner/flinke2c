@@ -46,7 +46,7 @@ public final class ProxyPreOperator extends ProxyOperator {
         // codec (writer configured; reader null)
         this.codec =
                 new ProxyBinaryCodec(
-                        tcpConfig.isReorderResponses(),
+                        true,
                         payloadWireTypes,
                         payloadWriteTypes.toArray(new LogicalType[0]),
                         payloadSourceRoots,
@@ -74,9 +74,7 @@ public final class ProxyPreOperator extends ProxyOperator {
 
     private void appendRowToBinary(RowData row) throws IOException {
         codec.writeFramedRow(out, row, payloadFieldIndicesArray, nextRowId);
-        if (tcpConfig.isReorderResponses()) {
-            nextRowId++;
-        }
+        nextRowId++;
     }
 
     private IOException tryFlushRemaining() {

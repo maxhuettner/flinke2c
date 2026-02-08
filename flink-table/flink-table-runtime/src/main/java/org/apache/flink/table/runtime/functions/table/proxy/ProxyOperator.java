@@ -157,6 +157,10 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
 
     @Override
     public final void processElement(StreamRecord<RowData> element) throws Exception {
+        processElementInternal(element);
+    }
+
+    protected void processElementInternal(StreamRecord<RowData> element) throws Exception {
         final RowData outRow = processRow(element.getValue());
         output.collect(element.replace(outRow));
     }
@@ -473,6 +477,7 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
 
         root.put("externalOnly", true);
         root.put("reorderResponses", tcpConfig.isReorderResponses());
+        root.put("countedResponses", true);
 
         final List<Map<String, Object>> functionArgs = buildFunctionArgs();
         if (!functionArgs.isEmpty()) {
@@ -487,6 +492,7 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
         // Always include fields (matches your current behavior).
         root.put("preFields", buildPreFields());
         root.put("postFields", buildPostFields());
+        root.put("postHeaderFields", buildPostHeaderFields());
 
         try {
             return MAPPER.writeValueAsString(root);
@@ -561,17 +567,15 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
 
     private List<Map<String, Object>> buildPreFields() {
         final List<RowType.RowField> fields = inputRowType.getFields();
-        final int extra = tcpConfig.isReorderResponses() ? 2 : 1; // __op + optional __rowId
+        final int extra = 2; // __op + __rowId
         final List<Map<String, Object>> out = new ArrayList<>(
                 extra + (payloadFieldIndices == null ? 0 : payloadFieldIndices.size()));
 
         // index 0: op
         out.add(fieldEntry("__op", "INT32"));
 
-        // index 1: rowId (if enabled)
-        if (tcpConfig.isReorderResponses()) {
-            out.add(fieldEntry("__rowId", "INT64"));
-        }
+        // index 1: rowId
+        out.add(fieldEntry("__rowId", "INT64"));
 
         // payload fields
         for (int i = 0; i < payloadFieldIndices.size(); i++) {
@@ -590,17 +594,15 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
 
     private List<Map<String, Object>> buildPostFields() {
         final List<RowType.RowField> fields = inputRowType.getFields();
-        final int extra = tcpConfig.isReorderResponses() ? 2 : 1; // __op + optional __rowId
+        final int extra = 2; // __op + __rowId
         final List<Map<String, Object>> out = new ArrayList<>(
                 extra + (resultFieldIndices == null ? 0 : resultFieldIndices.size()));
 
         // index 0: op
         out.add(fieldEntry("__op", "INT32"));
 
-        // index 1: rowId (if enabled)
-        if (tcpConfig.isReorderResponses()) {
-            out.add(fieldEntry("__rowId", "INT64"));
-        }
+        // index 1: rowId
+        out.add(fieldEntry("__rowId", "INT64"));
 
         // result fields follow the order of resultFieldIndices / resultFieldTypes
         for (int i = 0; i < resultFieldIndices.size(); i++) {
@@ -612,6 +614,17 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
 
             out.add(fieldEntry(field.getName(), wireTypeFor(postType)));
         }
+
+        return out;
+    }
+
+    private List<Map<String, Object>> buildPostHeaderFields() {
+        final int extra = 2; // __op + __rowId
+        final List<Map<String, Object>> out = new ArrayList<>(extra + 1);
+
+        out.add(fieldEntry("__op", "INT32"));
+        out.add(fieldEntry("__rowId", "INT64"));
+        out.add(fieldEntry("__count", "INT32"));
 
         return out;
     }

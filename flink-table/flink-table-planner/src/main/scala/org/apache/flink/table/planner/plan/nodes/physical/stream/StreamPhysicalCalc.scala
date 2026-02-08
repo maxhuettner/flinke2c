@@ -84,6 +84,13 @@ class StreamPhysicalCalc(
     } else {
       null
     }
+    val effectiveCondition =
+      if (rewriter.hasProxyFunction &&
+        CommonExecCalc.PROXY_FUNCTION_KIND_FILTER == rewriter.getProxyFunctionKind) {
+        null
+      } else {
+        rewrittenCondition
+      }
     StreamPhysicalCalc.LOG.info(
       s"StreamPhysicalCalc proxy rewrite: hasProxyFunction=${rewriter.hasProxyFunction}, " +
         s"proxyConfPresent=${!rewriter.getProxyConf.isEmpty}, " +
@@ -105,7 +112,7 @@ class StreamPhysicalCalc(
       new StreamExecCalc(
         unwrapTableConfig(this),
         rewrittenProjection,
-        rewrittenCondition,
+        effectiveCondition,
         InputProperty.DEFAULT,
         FlinkTypeFactory.toLogicalRowType(getRowType),
         getRelDetailedDescription,
@@ -332,7 +339,7 @@ private object StreamPhysicalCalc {
     private var proxyFieldIndex: Integer = null
     private var proxyFieldName: String = null
     private var proxyFunctionClass: String = null
-    private var proxyFunctionKind: String = null
+    private var proxyFunctionKind: String = CommonExecCalc.PROXY_FUNCTION_KIND_SCALAR
     private var currentOutputFieldIndex: Int = -1
     private var currentUdfFieldIndexOverride: Integer = null
     private val proxyArgFieldIndices = new java.util.ArrayList[Integer]()
@@ -374,7 +381,9 @@ private object StreamPhysicalCalc {
       proxyFunctionFound = true
       proxyConf = mergeProxyConf(proxyConf, extractProxyConf(operands))
       proxyFunctionClass = targetClassName
-      proxyFunctionKind = CommonExecCalc.PROXY_FUNCTION_KIND_SCALAR
+      if (currentOutputFieldIndex < 0) {
+        proxyFunctionKind = CommonExecCalc.PROXY_FUNCTION_KIND_FILTER
+      }
       var foundFieldArg = false
       var firstFieldOperand: RexNode = null
       var firstFieldIndex: Integer = null
@@ -409,6 +418,9 @@ private object StreamPhysicalCalc {
       if (!foundFieldArg) {
         throw new TableException(
           "Proxy scalar function requires at least one column reference argument.")
+      }
+      if (currentOutputFieldIndex < 0) {
+        return call
       }
       val udfReturnType = resolveUdfReturnType(call, currentUdfFieldIndexOverride)
       addResultField(currentUdfFieldIndexOverride, firstFieldIndex, udfReturnType)
