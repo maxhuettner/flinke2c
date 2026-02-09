@@ -34,13 +34,13 @@ import java.util.Optional;
 import static org.apache.flink.table.annotation.ArgumentTrait.ROW_SEMANTIC_TABLE;
 
 /**
- * Proxy marker PTF that preserves input schema.
+ * External runtime marker PTF that preserves input schema.
  *
  * <p>This function is used as a hook for planner rewrites and is not expected to run
  * in production.
  */
 @Internal
-public class ProxyTableFunction extends ProcessTableFunction<Row> {
+public class ExternalRuntimeTableFunction extends ProcessTableFunction<Row> {
 
     public void eval(
             @ArgumentHint(value = ROW_SEMANTIC_TABLE, name = "r") Row r,

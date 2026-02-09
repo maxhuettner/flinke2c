@@ -44,8 +44,8 @@ import org.apache.flink.table.planner.plan.nodes.exec.InputProperty;
 import org.apache.flink.table.planner.plan.nodes.exec.SingleTransformationTranslator;
 import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodeUtil;
 import org.apache.flink.table.planner.utils.JavaScalaConversionUtil;
-import org.apache.flink.table.runtime.functions.table.proxy.ProxyPostOperator;
-import org.apache.flink.table.runtime.functions.table.proxy.ProxyPreOperator;
+import org.apache.flink.table.runtime.functions.table.externalruntime.ExternalRuntimePostOperator;
+import org.apache.flink.table.runtime.functions.table.externalruntime.ExternalRuntimePreOperator;
 import org.apache.flink.table.runtime.operators.CodeGenOperatorFactory;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -87,9 +87,6 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
     private static final Logger LOG = LoggerFactory.getLogger(CommonExecCalc.class);
 
     public static final String CALC_TRANSFORMATION = "calc";
-
-    public static final String CUSTOM_PROXY_FUNCTION_NAME =
-            "CurrencyConversionFunction";
 
     public static final String CUSTOM_PROXY_FUNCTION_CLASS_NAME =
             "org.example.flinke2c.CurrencyConversionFunction";
@@ -153,11 +150,13 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         final ExecEdge inputEdge = getInputEdges().get(0);
         final Transformation<RowData> inputTransform =
                 (Transformation<RowData>) inputEdge.translateToPlan(planner);
-        LOG.info(
-                "CommonExecCalc translateToPlanInternal: id={}, projectionSize={}, conditionPresent={}",
-                getId(),
-                projection.size(),
-                condition != null);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                    "CommonExecCalc translateToPlanInternal: id={}, projectionSize={}, conditionPresent={}",
+                    getId(),
+                    projection.size(),
+                    condition != null);
+        }
 
         final RowType inputRowType = extractRowType(inputTransform);
         final RowType outputRowType = (RowType) getOutputType();
@@ -209,12 +208,13 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                             rewriter.getProxyResultFieldTypes(),
                             rewriter.getProxyResultUdfFieldTypes(),
                             rewriter.getProxyResultUdfFieldIndices());
-            LOG.info(
-                    "Proxy rewrite injecting pre/post operators for scalar UDF: functionClass={}, functionKind={}, resultFieldIndices={}, conf={}",
-                    rewriter.getProxyFunctionClass(),
-                    rewriter.getProxyFunctionKind(),
-                    rewriter.getProxyResultFieldIndices(),
-                    proxyConf);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Proxy rewrite injecting pre/post operators: functionClass={}, functionKind={}, resultFieldIndices={}",
+                        rewriter.getProxyFunctionClass(),
+                        rewriter.getProxyFunctionKind(),
+                        rewriter.getProxyResultFieldIndices());
+            }
             resolvedProxyConf = proxyConf;
         } else {
             resolvedProxyConf = null;
@@ -266,8 +266,12 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         final OneInputTransformation<RowData, RowData> pre =
                 ExecNodeUtil.createOneInputTransformation(
                         input,
-                        createTransformationMeta("proxy-pre", "ProxyPre", "ProxyPre", config),
-                        new ProxyPreOperator(conf, inputRowType),
+                        createTransformationMeta(
+                                "external-runtime-pre",
+                                "ExternalRuntimePre",
+                                "ExternalRuntimePre",
+                                config),
+                        new ExternalRuntimePreOperator(conf, inputRowType),
                         input.getOutputType(),
                         input.getParallelism(),
                         input.isParallelismConfigured());
@@ -280,8 +284,12 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         final OneInputTransformation<RowData, RowData> post =
                 ExecNodeUtil.createOneInputTransformation(
                         pre,
-                        createTransformationMeta("proxy-post", "ProxyPost", "ProxyPost", config),
-                        new ProxyPostOperator(conf, inputRowType, outputRowType),
+                        createTransformationMeta(
+                                "external-runtime-post",
+                                "ExternalRuntimePost",
+                                "ExternalRuntimePost",
+                                config),
+                        new ExternalRuntimePostOperator(conf, inputRowType, outputRowType),
                         InternalTypeInfo.of(outputRowType),
                         pre.getParallelism(),
                         pre.isParallelismConfigured());
@@ -319,7 +327,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             return ((InternalTypeInfo<RowData>) input.getOutputType()).toRowType();
         }
         throw new TableException(
-                "ProxyOperator requires InternalTypeInfo output type, but was "
+                "ExternalRuntimeOperator requires InternalTypeInfo output type, but was "
                         + input.getOutputType());
     }
 
@@ -650,7 +658,6 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         private boolean proxyFunctionFound;
         private String proxyFunctionKind = PROXY_FUNCTION_KIND_SCALAR;
         private @Nullable String proxyConf;
-        private boolean loggedFirstCall;
         private int currentOutputFieldIndex = -1;
         private @Nullable Integer currentUdfFieldIndexOverride;
         private final List<Integer> proxyArgFieldIndices = new ArrayList<>();
@@ -683,8 +690,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             final int udfFieldIndex = fieldAccess.getField().getIndex();
             currentUdfFieldIndexOverride = udfFieldIndex;
             try {
-                // Drop the field access from the rewritten expression. The external proxy
-                // will extract the correct field based on the recorded udfFieldIndex.
+                // Drop the field access; the proxy uses the recorded udfFieldIndex.
                 return proxyCall.accept(this);
             } finally {
                 currentUdfFieldIndexOverride = null;
@@ -693,75 +699,11 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
 
         @Override
         public RexNode visitCall(RexCall call) {
-            if (!loggedFirstCall) {
-                loggedFirstCall = true;
-                final SqlOperator operator = call.getOperator();
-                final String opName = operator == null ? "<null>" : operator.getName();
-                final String opClass =
-                        operator == null ? "<null>" : operator.getClass().getName();
-                LOG.info(
-                        "Proxy rewrite first RexCall: opName={}, opClass={}, kind={}, operands={}",
-                        opName,
-                        opClass,
-                        call.getKind(),
-                        call.getOperands().size());
-                if (operator instanceof BridgingSqlFunction) {
-                    final BridgingSqlFunction bridging = (BridgingSqlFunction) operator;
-                    final String identifierName =
-                            bridging.getResolvedFunction()
-                                    .getIdentifier()
-                                    .map(FunctionIdentifier::getFunctionName)
-                                    .orElse(null);
-                    final FunctionDefinition definition = bridging.getDefinition();
-                    LOG.info(
-                            "Proxy rewrite first RexCall bridging: identifierName={}, definition={}",
-                            identifierName,
-                            definition == null ? "<null>" : definition.getClass().getName());
-                } else if (operator instanceof ScalarSqlFunction) {
-                    final ScalarSqlFunction scalar = (ScalarSqlFunction) operator;
-                    LOG.info(
-                            "Proxy rewrite first RexCall scalar: functionClass={}",
-                            scalar.scalarFunction().getClass().getName());
-                }
-            }
-            if (LOG.isDebugEnabled()) {
-                final SqlOperator operator = call.getOperator();
-                final String opName = operator == null ? "<null>" : operator.getName();
-                final String opClass = operator == null ? "<null>" : operator.getClass().getName();
-                LOG.debug(
-                        "Proxy rewrite visiting RexCall: opName={}, opClass={}, kind={}, operands={}",
-                        opName,
-                        opClass,
-                        call.getKind(),
-                        call.getOperands().size());
-                if (operator instanceof BridgingSqlFunction) {
-                    final BridgingSqlFunction bridging = (BridgingSqlFunction) operator;
-                    final String identifierName =
-                            bridging.getResolvedFunction()
-                                    .getIdentifier()
-                                    .map(FunctionIdentifier::getFunctionName)
-                                    .orElse(null);
-                    final FunctionDefinition definition = bridging.getDefinition();
-                    LOG.debug(
-                            "Proxy rewrite BridgingSqlFunction details: identifierName={}, definition={}",
-                            identifierName,
-                            definition == null ? "<null>" : definition.getClass().getName());
-                } else if (operator instanceof ScalarSqlFunction) {
-                    final ScalarSqlFunction scalar = (ScalarSqlFunction) operator;
-                    LOG.debug(
-                            "Proxy rewrite ScalarSqlFunction details: functionClass={}",
-                            scalar.scalarFunction().getClass().getName());
-                }
-            }
             if (!isProxyScalarFunction(call, targetClassName, targetSimpleName)) {
                 return super.visitCall(call);
             }
             if (LOG.isDebugEnabled()) {
-                LOG.debug(
-                        "Proxy rewrite matched scalar UDF call: opName={}, opClass={}, targetClass={}",
-                        call.getOperator().getName(),
-                        call.getOperator().getClass().getName(),
-                        targetClassName);
+                LOG.debug("Proxy rewrite matched UDF: {}", targetClassName);
             }
             final List<RexNode> operands = call.getOperands();
             if (operands.isEmpty()) {

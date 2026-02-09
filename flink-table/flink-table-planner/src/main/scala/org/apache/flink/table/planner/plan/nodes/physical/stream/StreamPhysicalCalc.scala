@@ -58,10 +58,12 @@ class StreamPhysicalCalc(
     } else {
       null
     }
-    StreamPhysicalCalc.LOG.info(
-      "StreamPhysicalCalc translateToExecNode: projectionSize={}, conditionPresent={}",
-      projection.size,
-      condition != null)
+    if (StreamPhysicalCalc.LOG.isDebugEnabled) {
+      StreamPhysicalCalc.LOG.debug(
+        "StreamPhysicalCalc translateToExecNode: projectionSize={}, conditionPresent={}",
+        projection.size,
+        condition != null)
+    }
 
     val tableConfig = unwrapTableConfig(this)
     val proxyFunctionClass =
@@ -91,26 +93,21 @@ class StreamPhysicalCalc(
       } else {
         rewrittenCondition
       }
-    StreamPhysicalCalc.LOG.info(
-      s"StreamPhysicalCalc proxy rewrite: hasProxyFunction=${rewriter.hasProxyFunction}, " +
-        s"proxyConfPresent=${!rewriter.getProxyConf.isEmpty}, " +
-        s"proxyFieldIndex=${rewriter.getProxyFieldIndex.orNull}, " +
-        s"proxyFieldName=${rewriter.getProxyFieldName}, " +
-        s"proxyFunctionClass=${rewriter.getProxyFunctionClass}, " +
-        s"proxyFunctionKind=${rewriter.getProxyFunctionKind}, " +
-        s"proxyArgFieldIndices=${rewriter.getProxyArgFieldIndices}, " +
-        s"proxyResultFieldIndices=${rewriter.getProxyResultFieldIndices}")
+    if (StreamPhysicalCalc.LOG.isDebugEnabled) {
+      StreamPhysicalCalc.LOG.debug(
+        s"StreamPhysicalCalc proxy rewrite: hasProxyFunction=${rewriter.hasProxyFunction}, " +
+          s"functionKind=${rewriter.getProxyFunctionKind}")
+    }
 
     if (rewriter.hasProxyFunction) {
-      StreamPhysicalCalc.LOG.info(
-        "Proxy rewrite matched function in StreamPhysicalCalc: functionClass={}, functionKind={}, argFieldIndices={}, resultFieldIndices={}, conf={}",
-        rewriter.getProxyFunctionClass,
-        rewriter.getProxyFunctionKind,
-        rewriter.getProxyArgFieldIndices,
-        rewriter.getProxyResultFieldIndices,
-        rewriter.getProxyConf)
+      if (StreamPhysicalCalc.LOG.isDebugEnabled) {
+        StreamPhysicalCalc.LOG.debug(
+          "Proxy rewrite matched function: class={}, kind={}",
+          rewriter.getProxyFunctionClass,
+          rewriter.getProxyFunctionKind)
+      }
       new StreamExecCalc(
-        unwrapTableConfig(this),
+        tableConfig,
         rewrittenProjection,
         effectiveCondition,
         InputProperty.DEFAULT,
@@ -131,7 +128,7 @@ class StreamPhysicalCalc(
         rewriter.getProxyResultUdfFieldIndices)
     } else {
       new StreamExecCalc(
-        unwrapTableConfig(this),
+        tableConfig,
         projection,
         condition,
         InputProperty.DEFAULT,
@@ -143,9 +140,6 @@ class StreamPhysicalCalc(
 
 private object StreamPhysicalCalc {
   private val LOG = LoggerFactory.getLogger(classOf[StreamPhysicalCalc])
-  private val source = String.valueOf(classOf[StreamPhysicalCalc].getProtectionDomain.getCodeSource)
-  LOG.warn("StreamPhysicalCalc object loaded from {}", source)
-  System.err.println("StreamPhysicalCalc object loaded from " + source)
 
   private def matchesOperatorName(name: String, targetSimpleName: String): Boolean = {
     if (name == null) {
@@ -362,8 +356,7 @@ private object StreamPhysicalCalc {
       }
       currentUdfFieldIndexOverride = fieldAccess.getField.getIndex
       try {
-        // Drop the field access from the rewritten expression. The external proxy
-        // will extract the correct field based on the recorded udfFieldIndex.
+        // Drop the field access; the proxy uses the recorded udfFieldIndex.
         proxyCall.accept(this)
       } finally {
         currentUdfFieldIndexOverride = null

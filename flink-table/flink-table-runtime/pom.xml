@@ -99,7 +99,7 @@ under the License.
 			<optional>${flink.markBundledAsOptional}</optional>
 		</dependency>
 
-		<!-- MsgPack for ProxyOperator TCP serialization -->
+		<!-- MsgPack for ExternalRuntimeOperator TCP serialization -->
 		<dependency>
 			<groupId>org.msgpack</groupId>
 			<artifactId>msgpack-core</artifactId>
