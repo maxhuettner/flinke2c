@@ -36,7 +36,7 @@ import org.apache.flink.table.planner.plan.nodes.logical.FlinkLogicalTableFuncti
 import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
 import org.apache.flink.table.planner.utils.JavaScalaConversionUtil;
 import org.apache.flink.table.planner.utils.ShortcutUtils;
-import org.apache.flink.table.runtime.functions.table.ProxyTableFunction;
+import org.apache.flink.table.runtime.functions.table.ExternalRuntimeTableFunction;
 import org.apache.flink.table.types.inference.CallContext;
 import org.apache.flink.table.types.inference.StaticArgument;
 import org.apache.flink.table.types.inference.StaticArgumentTrait;
@@ -164,7 +164,7 @@ public class StreamPhysicalProcessTableFunction extends AbstractRelNode
     private static boolean isProxyFunction(RexCall udfCall) {
         final BridgingSqlFunction bridging = ShortcutUtils.unwrapBridgingSqlFunction(udfCall);
         if (bridging == null) {
-            LOG.info("Proxy watermark check: bridging is null");
+            LOG.info("ExternalRuntime watermark check: bridging is null");
             return false;
         }
         final String identifier =
@@ -173,34 +173,34 @@ public class StreamPhysicalProcessTableFunction extends AbstractRelNode
                         .map(FunctionIdentifier::getFunctionName)
                         .orElse("<anonymous>");
         final Object definition = bridging.getDefinition();
-        if (definition instanceof ProxyTableFunction) {
+        if (definition instanceof ExternalRuntimeTableFunction) {
             LOG.info(
-                    "Proxy watermark check matched (instanceof): defClass={}, defCl={}, ident={}",
+                    "ExternalRuntime watermark check matched (instanceof): defClass={}, defCl={}, ident={}",
                     definition.getClass().getName(),
                     definition.getClass().getClassLoader(),
                     identifier);
             return true;
         }
         if (definition == null) {
-            LOG.info("Proxy watermark check: definition is null (ident={})", identifier);
+            LOG.info("ExternalRuntime watermark check: definition is null (ident={})", identifier);
             return false;
         }
         final String defClassName = definition.getClass().getName();
-        if (ProxyTableFunction.class.getName().equals(defClassName)) {
+        if (ExternalRuntimeTableFunction.class.getName().equals(defClassName)) {
             LOG.info(
-                    "Proxy watermark check matched (name): defClass={}, defCl={}, proxyCl={}, ident={}",
+                    "ExternalRuntime watermark check matched (name): defClass={}, defCl={}, proxyCl={}, ident={}",
                     defClassName,
                     definition.getClass().getClassLoader(),
-                    ProxyTableFunction.class.getClassLoader(),
+                    ExternalRuntimeTableFunction.class.getClassLoader(),
                     identifier);
             return true;
         }
-        if (defClassName.endsWith("ProxyTableFunction")) {
+        if (defClassName.endsWith("ExternalRuntimeTableFunction")) {
             LOG.info(
-                    "Proxy watermark check not matched: defClass={}, defCl={}, proxyCl={}, ident={}",
+                    "ExternalRuntime watermark check not matched: defClass={}, defCl={}, proxyCl={}, ident={}",
                     defClassName,
                     definition.getClass().getClassLoader(),
-                    ProxyTableFunction.class.getClassLoader(),
+                    ExternalRuntimeTableFunction.class.getClassLoader(),
                     identifier);
         }
         return false;

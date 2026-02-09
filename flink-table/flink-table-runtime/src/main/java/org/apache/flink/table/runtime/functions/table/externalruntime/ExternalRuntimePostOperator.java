@@ -1,4 +1,4 @@
-package org.apache.flink.table.runtime.functions.table.proxy;
+package org.apache.flink.table.runtime.functions.table.externalruntime;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
@@ -8,7 +8,7 @@ import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.types.RowKind;
-import org.apache.flink.table.runtime.functions.table.proxy.ProxyBinaryCodec.WireType;
+import org.apache.flink.table.runtime.functions.table.externalruntime.ExternalRuntimeBinaryCodec.WireType;
 
 import javax.annotation.Nullable;
 
@@ -21,27 +21,26 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-/** POST: receives processed framed rows from external process and merges them into incoming rows. */
+/** POST: receives processed rows from the external runtime and merges them into incoming rows. */
 @Internal
-public final class ProxyPostOperator extends ProxyOperator {
+public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
 
     private static final long serialVersionUID = 1L;
 
-    // POST (binary reader)
     private transient BufferedInputStream in;
     private transient long expectedRowId;
     private transient Map<Long, ResponseBlock> reorderBlockBuffer;
     private transient boolean reuseObjects;
     private transient GenericRowData reuseRow;
-    private transient ProxyBinaryCodec headerCodec;
+    private transient ExternalRuntimeBinaryCodec headerCodec;
     private transient GenericRowData reuseHeaderRow;
     private transient RowData.FieldGetter countGetter;
 
-    public ProxyPostOperator(String conf, RowType rowType) {
+    public ExternalRuntimePostOperator(String conf, RowType rowType) {
         this(conf, rowType, rowType);
     }
 
-    public ProxyPostOperator(String conf, RowType inputRowType, @Nullable RowType resultRowType) {
+    public ExternalRuntimePostOperator(String conf, RowType inputRowType, @Nullable RowType resultRowType) {
         super(conf, inputRowType, resultRowType);
     }
 
@@ -52,7 +51,7 @@ public final class ProxyPostOperator extends ProxyOperator {
 
     @Override
     protected void openInternal() throws Exception {
-        final ProxyTcpConfig.ProxyEndpoint proxy = tcpConfig.getSelectedProxy();
+        final ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint proxy = tcpConfig.getSelectedProxy();
         final int port = proxy.getReceivePort();
         this.socket = connectSocket(proxy.getHost(), port, tcpConfig.getConnectTimeoutMs());
 
@@ -62,7 +61,6 @@ public final class ProxyPostOperator extends ProxyOperator {
 
         this.in = new BufferedInputStream(socket.getInputStream(), tcpConfig.getBufferSize());
 
-        // send preamble
         final BufferedOutputStream postOut =
                 new BufferedOutputStream(socket.getOutputStream(), tcpConfig.getBufferSize());
         final String configJson = buildConfigJson();
@@ -71,9 +69,8 @@ public final class ProxyPostOperator extends ProxyOperator {
         this.reuseObjects =
                 getRuntimeContext().isObjectReuseEnabled() && !tcpConfig.isReorderResponses();
 
-        // codec (reader configured; writer null)
         this.codec =
-                new ProxyBinaryCodec(
+                new ExternalRuntimeBinaryCodec(
                         true,
                         null,
                         null,
@@ -93,7 +90,7 @@ public final class ProxyPostOperator extends ProxyOperator {
         final WireType[] headerWireTypes = new WireType[] {WireType.INT32};
         final LogicalType[] headerTypes = new LogicalType[] {new IntType()};
         this.headerCodec =
-                new ProxyBinaryCodec(
+                new ExternalRuntimeBinaryCodec(
                         true,
                         null,
                         null,
@@ -118,7 +115,7 @@ public final class ProxyPostOperator extends ProxyOperator {
         }
 
         LOG.info(
-                "ProxyPostOperator connected to {}:{} (rowType={}, sentConfigBytes={})",
+                "ExternalRuntimePostOperator connected to {}:{} (rowType={}, sentConfigBytes={})",
                 proxy.getHost(),
                 port,
                 inputRowType,
@@ -128,7 +125,7 @@ public final class ProxyPostOperator extends ProxyOperator {
     @Override
     protected RowData processRow(RowData inRow) throws Exception {
         throw new UnsupportedOperationException(
-                "ProxyPostOperator emits counted responses via processElementInternal.");
+                "ExternalRuntimePostOperator emits counted responses via processElementInternal.");
     }
 
     @Override
@@ -143,7 +140,7 @@ public final class ProxyPostOperator extends ProxyOperator {
         if (!tcpConfig.isReorderResponses()) {
             if (block.rowId != expectedRowId) {
                 throw new IOException(
-                        "ProxyPostOperator expected rowId "
+                        "ExternalRuntimePostOperator expected rowId "
                                 + expectedRowId
                                 + " but received "
                                 + block.rowId);
@@ -159,22 +156,23 @@ public final class ProxyPostOperator extends ProxyOperator {
 
     private RowWithId readNextRowWithId(RowKind fallbackKind) throws IOException {
         if (codec == null || in == null) {
-            throw new IOException("ProxyPostOperator codec not initialized");
+            throw new IOException("ExternalRuntimePostOperator codec not initialized");
         }
 
-        final ProxyBinaryCodec.RowWithId decoded = codec.readFramedRow(in, fallbackKind, reuseRow);
+        final ExternalRuntimeBinaryCodec.RowWithId decoded =
+                codec.readFramedRow(in, fallbackKind, reuseRow);
         return new RowWithId(decoded.rowId, decoded.row);
     }
 
     private Header readNextHeader(RowKind fallbackKind) throws IOException {
         if (headerCodec == null || in == null || countGetter == null) {
-            throw new IOException("ProxyPostOperator header codec not initialized");
+            throw new IOException("ExternalRuntimePostOperator header codec not initialized");
         }
-        final ProxyBinaryCodec.RowWithId decoded =
+        final ExternalRuntimeBinaryCodec.RowWithId decoded =
                 headerCodec.readFramedRow(in, fallbackKind, reuseHeaderRow);
         final Object countValue = countGetter.getFieldOrNull(decoded.row);
         if (!(countValue instanceof Integer)) {
-            throw new IOException("ProxyPostOperator invalid count field: " + countValue);
+            throw new IOException("ExternalRuntimePostOperator invalid count field: " + countValue);
         }
         return new Header(decoded.rowId, (Integer) countValue);
     }
@@ -182,7 +180,7 @@ public final class ProxyPostOperator extends ProxyOperator {
     private ResponseBlock readNextBlock(RowKind fallbackKind) throws IOException {
         final Header header = readNextHeader(fallbackKind);
         if (header.count < 0) {
-            throw new IOException("ProxyPostOperator received negative count: " + header.count);
+            throw new IOException("ExternalRuntimePostOperator received negative count: " + header.count);
         }
 
         final List<RowData> rows = new ArrayList<>(header.count);
@@ -190,7 +188,7 @@ public final class ProxyPostOperator extends ProxyOperator {
             final RowWithId decoded = readNextRowWithId(fallbackKind);
             if (decoded.rowId != header.rowId) {
                 throw new IOException(
-                        "ProxyPostOperator expected rowId "
+                        "ExternalRuntimePostOperator expected rowId "
                                 + header.rowId
                                 + " but received "
                                 + decoded.rowId);
@@ -211,7 +209,7 @@ public final class ProxyPostOperator extends ProxyOperator {
                 reorderBlockBuffer.put(next.rowId, next);
                 if (reorderBlockBuffer.size() > tcpConfig.getReorderMaxBuffer()) {
                     throw new IOException(
-                            "ProxyPostOperator reorder buffer exceeded "
+                            "ExternalRuntimePostOperator reorder buffer exceeded "
                                     + tcpConfig.getReorderMaxBuffer()
                                     + " entries; increase reorderMax or enforce ordered responses.");
                 }

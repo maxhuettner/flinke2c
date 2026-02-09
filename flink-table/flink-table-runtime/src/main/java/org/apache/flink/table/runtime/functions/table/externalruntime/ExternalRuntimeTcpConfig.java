@@ -1,4 +1,4 @@
-package org.apache.flink.table.runtime.functions.table.proxy;
+package org.apache.flink.table.runtime.functions.table.externalruntime;
 
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -8,15 +8,15 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-final class ProxyTcpConfig {
+final class ExternalRuntimeTcpConfig {
     private static final int DEFAULT_BUFFER_SIZE = 64 * 1024;
     private static final int DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 
     private static final int DEFAULT_REORDER_MAX_BUFFER = 10000;
     private static final boolean DEFAULT_POST_ROLE_ONLY = true;
 
-    private final List<ProxyEndpoint> proxies;
-    private final ProxyEndpoint selectedProxy;
+    private final List<ExternalRuntimeEndpoint> proxies;
+    private final ExternalRuntimeEndpoint selectedProxy;
     private final int bufferSize;
     private final int connectTimeoutMs;
     private final int readTimeoutMs;
@@ -42,7 +42,7 @@ final class ProxyTcpConfig {
 
     private final boolean postRoleOnly;
 
-    private ProxyTcpConfig(
+    private ExternalRuntimeTcpConfig(
             int bufferSize,
             int connectTimeoutMs,
             int readTimeoutMs,
@@ -61,8 +61,8 @@ final class ProxyTcpConfig {
             boolean reorderResponses,
             int reorderMaxBuffer,
             boolean postRoleOnly,
-            List<ProxyEndpoint> proxies,
-            ProxyEndpoint selectedProxy) {
+            List<ExternalRuntimeEndpoint> proxies,
+            ExternalRuntimeEndpoint selectedProxy) {
         this.bufferSize = bufferSize;
         this.connectTimeoutMs = connectTimeoutMs;
         this.readTimeoutMs = readTimeoutMs;
@@ -92,7 +92,7 @@ final class ProxyTcpConfig {
         this.postRoleOnly = postRoleOnly;
     }
 
-    static ProxyTcpConfig from(String conf) {
+    static ExternalRuntimeTcpConfig from(String conf) {
         final Map<String, String> map = parse(conf);
 
         final int bufferSize = parseInt(map.get("buffersize"), DEFAULT_BUFFER_SIZE);
@@ -123,10 +123,10 @@ final class ProxyTcpConfig {
 
         final boolean postRoleOnly = parseBoolean(map.get("postroleonly"), DEFAULT_POST_ROLE_ONLY);
 
-        final List<ProxyEndpoint> proxies = parseProxies(map.get("proxies"));
-        final ProxyEndpoint selectedProxy = proxies.get(0);
+        final List<ExternalRuntimeEndpoint> proxies = parseProxies(map.get("proxies"));
+        final ExternalRuntimeEndpoint selectedProxy = proxies.get(0);
 
-        return new ProxyTcpConfig(
+        return new ExternalRuntimeTcpConfig(
                 bufferSize,
                 connectTimeoutMs,
                 readTimeoutMs,
@@ -149,12 +149,12 @@ final class ProxyTcpConfig {
                 selectedProxy);
     }
 
-    private static List<ProxyEndpoint> parseProxies(String value) {
+    private static List<ExternalRuntimeEndpoint> parseProxies(String value) {
         if (value == null || value.trim().isEmpty()) {
             throw new IllegalArgumentException(
-                    "ProxyOperator requires proxies=<host:port> or proxies=<host:send:recv> in conf.");
+                    "ExternalRuntimeOperator requires proxies=<host:port> or proxies=<host:send:recv> in conf.");
         }
-        final List<ProxyEndpoint> proxies = new ArrayList<>();
+        final List<ExternalRuntimeEndpoint> proxies = new ArrayList<>();
         final String[] entries = value.split(",");
         for (String entry : entries) {
             final String trimmed = entry.trim();
@@ -168,12 +168,12 @@ final class ProxyTcpConfig {
             } else if (parts.length == 2) {
                 final String h = parts[0].trim();
                 final int port = Integer.parseInt(parts[1].trim());
-                proxies.add(new ProxyEndpoint(h, port, port));
+                proxies.add(new ExternalRuntimeEndpoint(h, port, port));
             } else if (parts.length == 3) {
                 final String h = parts[0].trim();
                 final int send = Integer.parseInt(parts[1].trim());
                 final int recv = Integer.parseInt(parts[2].trim());
-                proxies.add(new ProxyEndpoint(h, send, recv));
+                proxies.add(new ExternalRuntimeEndpoint(h, send, recv));
             } else {
                 throw new IllegalArgumentException(
                         "Invalid proxies entry: " + trimmed + " (expected host:port or host:send:recv)");
@@ -181,17 +181,17 @@ final class ProxyTcpConfig {
         }
         if (proxies.isEmpty()) {
             throw new IllegalArgumentException(
-                    "ProxyOperator requires at least one proxy entry in proxies=...");
+                    "ExternalRuntimeOperator requires at least one proxy entry in proxies=...");
         }
         return proxies;
     }
 
-    protected static final class ProxyEndpoint {
+    protected static final class ExternalRuntimeEndpoint {
         private final String host;
         private final int sendPort;
         private final int receivePort;
 
-        private ProxyEndpoint(String host, int sendPort, int receivePort) {
+        private ExternalRuntimeEndpoint(String host, int sendPort, int receivePort) {
             this.host = host;
             this.sendPort = sendPort;
             this.receivePort = receivePort;
@@ -303,7 +303,7 @@ final class ProxyTcpConfig {
         return this.bufferSize;
     }
 
-    public ProxyEndpoint getSelectedProxy() {
+    public ExternalRuntimeEndpoint getSelectedProxy() {
         return this.selectedProxy;
     }
 

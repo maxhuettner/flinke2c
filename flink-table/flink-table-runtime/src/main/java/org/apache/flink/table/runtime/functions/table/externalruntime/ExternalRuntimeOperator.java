@@ -16,20 +16,16 @@
  * limitations under the License.
  */
 
-package org.apache.flink.table.runtime.functions.table.proxy;
+package org.apache.flink.table.runtime.functions.table.externalruntime;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
-import org.apache.flink.table.api.TableException;
-import org.apache.flink.table.data.DecimalData;
-import org.apache.flink.table.data.DecimalDataUtils;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
-import org.apache.flink.table.data.StringData;
-import org.apache.flink.table.runtime.functions.table.proxy.ProxyBinaryCodec.WireType;
+import org.apache.flink.table.runtime.functions.table.externalruntime.ExternalRuntimeBinaryCodec.WireType;
 import org.apache.flink.table.runtime.operators.TableStreamOperator;
 import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.LocalZonedTimestampType;
@@ -38,22 +34,18 @@ import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.utils.LogicalTypeParser;
-import org.apache.flink.types.RowKind;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
 import java.io.Flushable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -65,20 +57,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
-/**
- * Shared base class for PRE and POST proxy operators.
- *
- * <p>
- * PRE writes framed rows to an external TCP process and emits placeholders
- * downstream.
- * POST reads framed rows from an external TCP process and merges returned
- * fields into incoming rows.
- */
+/** Shared base class for external runtime PRE/POST operators. */
 @Internal
-abstract class ProxyOperator extends TableStreamOperator<RowData>
+abstract class ExternalRuntimeOperator extends TableStreamOperator<RowData>
         implements OneInputStreamOperator<RowData, RowData> {
 
-    protected static final Logger LOG = LoggerFactory.getLogger(ProxyOperator.class);
+    protected static final Logger LOG = LoggerFactory.getLogger(ExternalRuntimeOperator.class);
     private static final long serialVersionUID = 1L;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -92,10 +76,8 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
     protected final RowType inputRowType;
     protected final RowType resultRowType;
 
-    // parsed config
-    protected transient ProxyTcpConfig tcpConfig;
+    protected transient ExternalRuntimeTcpConfig tcpConfig;
 
-    // payload fields (PRE encoding)
     protected transient List<Integer> payloadFieldIndices;
     protected transient int[] payloadFieldIndicesArray;
     protected transient List<String> payloadFieldNames;
@@ -108,7 +90,6 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
     protected transient int[] payloadTimestampPrecision;
     protected transient WireType[] payloadWireTypes;
 
-    // result fields (POST decoding + merge)
     protected transient List<Integer> resultFieldIndices;
     protected transient List<LogicalType> resultFieldTypes;
     protected transient List<LogicalType> resultReadTypes;
@@ -120,24 +101,21 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
     protected transient int[] resultPosByInputIndex;
     protected transient boolean resultReplacesAllFields;
 
-    // placeholders (PRE)
     protected transient GenericRowData insertPlaceholder;
     protected transient GenericRowData updateAfterPlaceholder;
     protected transient GenericRowData updateBeforePlaceholder;
     protected transient GenericRowData deletePlaceholder;
     protected transient int inputFieldCount;
 
-    // shared socket (each side uses one direction + may write preamble)
     protected transient Socket socket;
 
-    // codec (PRE uses writer-configured; POST uses reader-configured)
-    protected transient ProxyBinaryCodec codec;
+    protected transient ExternalRuntimeBinaryCodec codec;
 
-    protected ProxyOperator(String conf, RowType rowType) {
+    protected ExternalRuntimeOperator(String conf, RowType rowType) {
         this(conf, rowType, rowType);
     }
 
-    protected ProxyOperator(String conf, RowType inputRowType, @Nullable RowType resultRowType) {
+    protected ExternalRuntimeOperator(String conf, RowType inputRowType, @Nullable RowType resultRowType) {
         this.conf = conf == null ? "" : conf;
         this.inputRowType = Objects.requireNonNull(inputRowType, "inputRowType");
         this.resultRowType = resultRowType == null ? this.inputRowType : resultRowType;
@@ -150,7 +128,7 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
     @Override
     public final void open() throws Exception {
         super.open();
-        this.tcpConfig = ProxyTcpConfig.from(conf);
+        this.tcpConfig = ExternalRuntimeTcpConfig.from(conf);
         initializePayloadFields();
         openInternal();
     }
@@ -205,7 +183,6 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
         final int fieldCount = inputFields.size();
         this.inputFieldCount = fieldCount;
 
-        // payload indices (currently: all fields)
         final List<Integer> indices = new ArrayList<>(fieldCount);
         for (int i = 0; i < fieldCount; i++) {
             indices.add(i);
@@ -222,7 +199,6 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
             payloadFieldNames.add(inputFields.get(idx).getName());
         }
 
-        // optional override arg types
         final Map<Integer, LogicalType> argTypeByIndex = new HashMap<>();
         if (tcpConfig.getArgFieldTypes() != null && !tcpConfig.getArgFieldTypes().isEmpty()) {
             final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
@@ -279,15 +255,13 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
             }
         }
 
-        // PRE: wire types for payload fields (excluding __op/__rowId)
         final int payloadSize = payloadFieldIndices.size();
         final WireType[] payloadWireTypes = new WireType[payloadSize];
         for (int i = 0; i < payloadSize; i++) {
-            payloadWireTypes[i] = ProxyBinaryCodec.wireTypeFor(payloadWriteTypes.get(i));
+            payloadWireTypes[i] = ExternalRuntimeBinaryCodec.wireTypeFor(payloadWriteTypes.get(i));
         }
         this.payloadWireTypes = payloadWireTypes;
 
-        // caches for fast decimal/timestamp paths used by codec writer
         this.payloadSourceRoots = new LogicalTypeRoot[payloadSize];
         payloadTargetRoots = new LogicalTypeRoot[payloadSize];
         this.payloadTargetPrecision = new int[payloadSize];
@@ -328,7 +302,6 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
             }
         }
 
-        // result fields (POST output schema)
         this.resultFieldIndices = new ArrayList<>(resultFields.size());
         for (int i = 0; i < resultFields.size(); i++) {
             resultFieldIndices.add(i);
@@ -337,7 +310,6 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
                 .map(i -> resultFields.get(i).getType())
                 .collect(Collectors.toList());
 
-        // optional override udf types
         final Map<Integer, LogicalType> udfTypeByIndex = new HashMap<>();
         final ClassLoader cl = getRuntimeContext().getUserCodeClassLoader();
         boolean mappedByIndex = false;
@@ -410,21 +382,18 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
             }
         }
 
-        // IMPORTANT: align resultReadTypes with resultFieldIndices
         this.resultReadTypes = new ArrayList<>(resultFieldIndices.size());
         for (int i = 0; i < resultFieldIndices.size(); i++) {
             final int idx = resultFieldIndices.get(i);
             this.resultReadTypes.add(postFieldTypes.get(idx));
         }
 
-        // wire types for POST read
         final WireType[] resultWireTypes = new WireType[resultReadTypes.size()];
         for (int i = 0; i < resultReadTypes.size(); i++) {
-            resultWireTypes[i] = ProxyBinaryCodec.wireTypeFor(resultReadTypes.get(i));
+            resultWireTypes[i] = ExternalRuntimeBinaryCodec.wireTypeFor(resultReadTypes.get(i));
         }
         this.resultWireTypes = resultWireTypes;
 
-        // field getters for merge
         this.resultFieldGetters = new RowData.FieldGetter[resultFieldTypes.size()];
         for (int i = 0; i < resultFieldTypes.size(); i++) {
             resultFieldGetters[i] = RowData.createFieldGetter(resultFieldTypes.get(i), i);
@@ -434,7 +403,6 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
             fullRowFieldGetters[i] = RowData.createFieldGetter(inputFields.get(i).getType(), i);
         }
 
-        // fast merge metadata
         this.resultPosByInputIndex = new int[fieldCount];
         Arrays.fill(resultPosByInputIndex, -1);
         boolean replacesAll = resultFieldIndices.size() == fieldCount;
@@ -489,7 +457,6 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
             root.put("functionResults", functionResults);
         }
 
-        // Always include fields (matches your current behavior).
         root.put("preFields", buildPreFields());
         root.put("postFields", buildPostFields());
         root.put("postHeaderFields", buildPostHeaderFields());
@@ -497,7 +464,7 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
         try {
             return MAPPER.writeValueAsString(root);
         } catch (JsonProcessingException e) {
-            throw new RuntimeException("Failed to serialize proxy config JSON", e);
+            throw new RuntimeException("Failed to serialize external runtime config JSON", e);
         }
     }
 
@@ -567,17 +534,14 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
 
     private List<Map<String, Object>> buildPreFields() {
         final List<RowType.RowField> fields = inputRowType.getFields();
-        final int extra = 2; // __op + __rowId
+        final int extra = 2;
         final List<Map<String, Object>> out = new ArrayList<>(
                 extra + (payloadFieldIndices == null ? 0 : payloadFieldIndices.size()));
 
-        // index 0: op
         out.add(fieldEntry("__op", "INT32"));
 
-        // index 1: rowId
         out.add(fieldEntry("__rowId", "INT64"));
 
-        // payload fields
         for (int i = 0; i < payloadFieldIndices.size(); i++) {
             final int idx = payloadFieldIndices.get(i);
             final RowType.RowField field = fields.get(idx);
@@ -594,17 +558,14 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
 
     private List<Map<String, Object>> buildPostFields() {
         final List<RowType.RowField> fields = inputRowType.getFields();
-        final int extra = 2; // __op + __rowId
+        final int extra = 2;
         final List<Map<String, Object>> out = new ArrayList<>(
                 extra + (resultFieldIndices == null ? 0 : resultFieldIndices.size()));
 
-        // index 0: op
         out.add(fieldEntry("__op", "INT32"));
 
-        // index 1: rowId
         out.add(fieldEntry("__rowId", "INT64"));
 
-        // result fields follow the order of resultFieldIndices / resultFieldTypes
         for (int i = 0; i < resultFieldIndices.size(); i++) {
             final int idx = resultFieldIndices.get(i);
             final RowType.RowField field = fields.get(idx);
@@ -619,7 +580,7 @@ abstract class ProxyOperator extends TableStreamOperator<RowData>
     }
 
     private List<Map<String, Object>> buildPostHeaderFields() {
-        final int extra = 2; // __op + __rowId
+        final int extra = 2;
         final List<Map<String, Object>> out = new ArrayList<>(extra + 1);
 
         out.add(fieldEntry("__op", "INT32"));

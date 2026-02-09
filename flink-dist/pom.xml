@@ -118,7 +118,7 @@ under the License.
 			<optional>${flink.markBundledAsOptional}</optional>
 		</dependency>
 
-		<!-- Arrow runtime for ProxyOperator -->
+		<!-- Arrow runtime for ExternalRuntimeOperator -->
 		<dependency>
 			<groupId>org.apache.arrow</groupId>
 			<artifactId>arrow-vector</artifactId>

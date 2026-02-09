@@ -1,4 +1,4 @@
-package org.apache.flink.table.runtime.functions.table.proxy;
+package org.apache.flink.table.runtime.functions.table.externalruntime;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.table.data.GenericRowData;
@@ -11,17 +11,16 @@ import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
-/** PRE: sends input rows (framed binary) to external process, emits placeholders. */
+/** PRE: sends input rows to the external runtime and emits placeholders. */
 @Internal
-public final class ProxyPreOperator extends ProxyOperator {
+public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator {
 
     private static final long serialVersionUID = 1L;
 
-    // PRE (binary writer + batch state)
     private transient BufferedOutputStream out;
     private transient long nextRowId;
 
-    public ProxyPreOperator(String conf, RowType rowType) {
+    public ExternalRuntimePreOperator(String conf, RowType rowType) {
         super(conf, rowType, null);
     }
 
@@ -32,20 +31,18 @@ public final class ProxyPreOperator extends ProxyOperator {
 
     @Override
     protected void openInternal() throws Exception {
-        final ProxyTcpConfig.ProxyEndpoint proxy = tcpConfig.getSelectedProxy();
+        final ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint proxy = tcpConfig.getSelectedProxy();
         final int port = proxy.getSendPort();
         this.socket = connectSocket(proxy.getHost(), port, tcpConfig.getConnectTimeoutMs());
         this.out = new BufferedOutputStream(socket.getOutputStream(), tcpConfig.getBufferSize());
 
-        // preamble
         final String configJson = buildConfigJson();
         writeLengthPrefixedJson(out, configJson);
 
         this.nextRowId = 0L;
 
-        // codec (writer configured; reader null)
         this.codec =
-                new ProxyBinaryCodec(
+                new ExternalRuntimeBinaryCodec(
                         true,
                         payloadWireTypes,
                         payloadWriteTypes.toArray(new LogicalType[0]),
@@ -59,7 +56,7 @@ public final class ProxyPreOperator extends ProxyOperator {
                         false);
 
         LOG.info(
-                "ProxyPreOperator connected to {}:{} (rowType={}, sentConfigBytes={})",
+                "ExternalRuntimePreOperator connected to {}:{} (rowType={}, sentConfigBytes={})",
                 proxy.getHost(),
                 port,
                 inputRowType,

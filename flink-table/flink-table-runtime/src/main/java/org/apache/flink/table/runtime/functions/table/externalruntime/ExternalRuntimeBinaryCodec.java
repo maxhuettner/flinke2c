@@ -1,4 +1,4 @@
-package org.apache.flink.table.runtime.functions.table.proxy;
+package org.apache.flink.table.runtime.functions.table.externalruntime;
 
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.DecimalData;
@@ -27,7 +27,7 @@ import java.math.RoundingMode;
  * [int32_be frameLen][payload]
  * payload := int32 __op, [int64 __rowId if enabled], nullBitmap, values...
  */
-final class ProxyBinaryCodec {
+final class ExternalRuntimeBinaryCodec {
 
     enum WireType {
         INT32,
@@ -67,7 +67,7 @@ final class ProxyBinaryCodec {
 
     private static final long[] POW10 = initPow10();
 
-    ProxyBinaryCodec(
+    ExternalRuntimeBinaryCodec(
             boolean includeRowId,
             @Nullable WireType[] writeWireTypes,
             @Nullable LogicalType[] writeTargetTypes,
@@ -109,7 +109,7 @@ final class ProxyBinaryCodec {
             long rowId) throws IOException {
 
         if (writeWireTypes == null) {
-            throw new IOException("ProxyBinaryCodec not configured for writing");
+            throw new IOException("ExternalRuntimeBinaryCodec not configured for writing");
         }
 
         final int nFields = writeWireTypes.length;
@@ -234,7 +234,7 @@ final class ProxyBinaryCodec {
     RowWithId readFramedRow(
             InputStream in, RowKind fallbackKind, @Nullable GenericRowData reuseRow) throws IOException {
         if (readWireTypes == null) {
-            throw new IOException("ProxyBinaryCodec not configured for reading");
+            throw new IOException("ExternalRuntimeBinaryCodec not configured for reading");
         }
 
         final int frameLen = readIntBE(in);
@@ -478,7 +478,7 @@ final class ProxyBinaryCodec {
         }
 
         throw new TableException(
-                "ProxyOperator cannot cast "
+                "ExternalRuntimeOperator cannot cast "
                         + sourceType.asSerializableString()
                         + " to "
                         + targetType.asSerializableString());
