@@ -4,7 +4,6 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
-import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.types.RowKind;
@@ -21,7 +20,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-
 /** POST: receives processed rows from the external runtime and merges them into incoming rows. */
 @Internal
 public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
@@ -36,10 +34,8 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     private transient List<Map<Long, ResponseBlock>> reorderBlockBuffers;
     private transient boolean reuseObjects;
     private transient GenericRowData reuseRow;
-    private transient GenericRowData reuseMergedRow;
-    private transient ExternalRuntimeBinaryCodec headerCodec;
-    private transient GenericRowData reuseHeaderRow;
-    private transient RowData.FieldGetter countGetter;
+    private transient byte[] frameBuf;
+    private transient StreamRecord<RowData> reuseStreamRecord;
 
     public ExternalRuntimePostOperator(String conf, RowType rowType) {
         this(conf, rowType, rowType);
@@ -103,27 +99,10 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
 
         if (reuseObjects) {
             this.reuseRow = new GenericRowData(resultFieldTypes.size());
+            this.reuseStreamRecord = new StreamRecord<>(null);
         }
 
-        final WireType[] headerWireTypes = new WireType[] {WireType.INT32};
-        final LogicalType[] headerTypes = new LogicalType[] {new IntType()};
-        this.headerCodec =
-                new ExternalRuntimeBinaryCodec(
-                        true,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                        headerWireTypes,
-                        headerTypes,
-                        headerTypes,
-                        false);
-        this.countGetter = RowData.createFieldGetter(headerTypes[0], 0);
-        if (reuseObjects) {
-            this.reuseHeaderRow = new GenericRowData(1);
-        }
+        this.frameBuf = new byte[tcpConfig.getBufferSize()];
 
         this.expectedRowId = 0L;
         if (tcpConfig.isReorderResponses()) {
@@ -161,78 +140,274 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                     readNextOrderedBlock(endpointIndex, fallbackKind, expectedRowId);
             expectedRowId++;
             for (int i = 0; i < block.rows.size(); i++) {
-                final RowData outRow = mergeExternalRuntimeRow(inRow, block.rows.get(i));
-                output.collect(element.copy(outRow));
+                emitWithTimestamp(block.rows.get(i), element);
             }
             return;
         }
 
-        readAndEmitBlock(endpointIndex, fallbackKind, expectedRowId, element, inRow);
+        readAndEmitBlock(endpointIndex, fallbackKind, expectedRowId, element);
         expectedRowId++;
-    }
-
-    private RowWithId readNextRowWithId(BufferedInputStream in, RowKind fallbackKind)
-            throws IOException {
-        if (codec == null || in == null) {
-            throw new IOException("ExternalRuntimePostOperator codec not initialized");
-        }
-
-        final ExternalRuntimeBinaryCodec.RowWithId decoded =
-                codec.readFramedRow(in, fallbackKind, reuseRow);
-        return new RowWithId(decoded.rowId, decoded.row);
-    }
-
-    private Header readNextHeader(BufferedInputStream in, RowKind fallbackKind) throws IOException {
-        if (headerCodec == null || in == null || countGetter == null) {
-            throw new IOException("ExternalRuntimePostOperator header codec not initialized");
-        }
-        final ExternalRuntimeBinaryCodec.RowWithId decoded =
-                headerCodec.readFramedRow(in, fallbackKind, reuseHeaderRow);
-        final Object countValue = countGetter.getFieldOrNull(decoded.row);
-        if (!(countValue instanceof Integer)) {
-            throw new IOException("ExternalRuntimePostOperator invalid count field: " + countValue);
-        }
-        return new Header(decoded.rowId, (Integer) countValue);
     }
 
     private ResponseBlock readNextBlock(int endpointIndex, RowKind fallbackKind) throws IOException {
         final BufferedInputStream in = ins.get(endpointIndex);
-        final Header header = readNextHeader(in, fallbackKind);
-        if (header.count < 0) {
-            throw new IOException("ExternalRuntimePostOperator received negative count: " + header.count);
+
+        final int batchLen = readIntBE(in);
+        ensureFrameBuf(batchLen);
+        readFully(in, frameBuf, 0, batchLen);
+
+        int pos = 0;
+
+        pos += 4; // __op
+        final long blockRowId = readLongBE(frameBuf, pos);
+        pos += 8;
+
+        final boolean countIsNull = (frameBuf[pos] & 1) != 0;
+        pos += 1;
+
+        if (countIsNull) {
+            throw new IOException("ExternalRuntimePostOperator received null count");
         }
 
-        final List<RowData> rows = new ArrayList<>(header.count);
-        for (int i = 0; i < header.count; i++) {
-            final RowWithId decoded = readNextRowWithId(in, fallbackKind);
-            rows.add(decoded.row);
+        final int count = readIntBE(frameBuf, pos);
+        pos += 4;
+
+        if (count < 0) {
+            throw new IOException("ExternalRuntimePostOperator received negative count: " + count);
         }
-        return new ResponseBlock(header.rowId, rows);
+
+        final List<RowData> rows = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            pos = decodeRowFromBuffer(frameBuf, pos, fallbackKind, rows);
+        }
+
+        return new ResponseBlock(blockRowId, rows);
+    }
+
+    private int decodeRowFromBuffer(byte[] buffer, int pos, RowKind fallbackKind, List<RowData> rows) throws IOException {
+        final int op = readIntBE(buffer, pos);
+        pos += 4;
+        pos += 8; // skip __rowId
+
+        final int nFields = resultFieldTypes.size();
+        final int nullBytes = (nFields + 7) >>> 3;
+        final int nullBitmapPos = pos;
+        pos += nullBytes;
+
+        final GenericRowData outRow = new GenericRowData(nFields);
+
+        for (int i = 0; i < nFields; i++) {
+            final boolean isNull = isNullBitSet(buffer, nullBitmapPos, i);
+            if (isNull) {
+                outRow.setField(i, null);
+                continue;
+            }
+
+            final WireType wt = resultWireTypes[i];
+            final Object value = decodeFieldValue(buffer, pos, wt, resultReadTypes.get(i), resultFieldTypes.get(i));
+            outRow.setField(i, value);
+            pos += getFieldSize(buffer, pos, wt);
+        }
+
+        outRow.setRowKind(ExternalRuntimeBinaryCodec.opToRowKind(op, fallbackKind));
+        rows.add(outRow);
+        return pos;
     }
 
     private void readAndEmitBlock(
             int endpointIndex,
             RowKind fallbackKind,
             long targetRowId,
-            StreamRecord<RowData> element,
-            RowData baseRow)
+            StreamRecord<RowData> element)
             throws IOException {
         final BufferedInputStream in = ins.get(endpointIndex);
-        final Header header = readNextHeader(in, fallbackKind);
-        if (header.rowId != targetRowId) {
+
+        final int batchLen = readIntBE(in);
+        ensureFrameBuf(batchLen);
+        readFully(in, frameBuf, 0, batchLen);
+
+        int pos = 0;
+
+        pos += 4; // __op
+        final long blockRowId = readLongBE(frameBuf, pos);
+        pos += 8;
+
+        if (blockRowId != targetRowId) {
             throw new IOException(
                     "ExternalRuntimePostOperator expected rowId "
                             + targetRowId
                             + " but received "
-                            + header.rowId);
+                            + blockRowId);
         }
-        if (header.count < 0) {
-            throw new IOException("ExternalRuntimePostOperator received negative count: " + header.count);
+
+        final boolean countIsNull = (frameBuf[pos] & 1) != 0;
+        pos += 1;
+
+        if (countIsNull) {
+            throw new IOException("ExternalRuntimePostOperator received null count");
         }
-        for (int i = 0; i < header.count; i++) {
-            final RowWithId decoded = readNextRowWithId(in, fallbackKind);
-            final RowData outRow = mergeExternalRuntimeRow(baseRow, decoded.row);
-            output.collect(element.copy(outRow));
+
+        final int count = readIntBE(frameBuf, pos);
+        pos += 4;
+
+        if (count < 0) {
+            throw new IOException("ExternalRuntimePostOperator received negative count: " + count);
+        }
+        if (count == 0) {
+            return;
+        }
+
+        final GenericRowData rowToEmit = reuseObjects ? reuseRow : null;
+        final boolean hasTimestamp = element.hasTimestamp();
+        final long timestamp = hasTimestamp ? element.getTimestamp() : 0L;
+
+        if (reuseObjects && reuseStreamRecord != null) {
+            for (int i = 0; i < count; i++) {
+                pos = decodeAndEmitRow(frameBuf, pos, fallbackKind, rowToEmit, reuseStreamRecord, timestamp);
+            }
+        } else {
+            for (int i = 0; i < count; i++) {
+                pos = decodeAndEmitRow(frameBuf, pos, fallbackKind, rowToEmit, null, timestamp);
+            }
+        }
+    }
+
+    private int decodeAndEmitRow(
+            byte[] buffer,
+            int pos,
+            RowKind fallbackKind,
+            GenericRowData reuseRow,
+            StreamRecord<RowData> reuseRecord,
+            long timestamp)
+            throws IOException {
+
+        final int op = readIntBE(buffer, pos);
+        pos += 4;
+        pos += 8; // skip __rowId
+
+        final int nFields = resultFieldTypes.size();
+        final int nullBytes = (nFields + 7) >>> 3;
+        final int nullBitmapPos = pos;
+        pos += nullBytes;
+
+        final GenericRowData outRow =
+                reuseRow != null && reuseRow.getArity() == nFields
+                        ? reuseRow
+                        : new GenericRowData(nFields);
+
+        for (int i = 0; i < nFields; i++) {
+            final boolean isNull = isNullBitSet(buffer, nullBitmapPos, i);
+            if (isNull) {
+                outRow.setField(i, null);
+                continue;
+            }
+
+            final WireType wt = resultWireTypes[i];
+            final Object value = decodeFieldValue(buffer, pos, wt, resultReadTypes.get(i), resultFieldTypes.get(i));
+            outRow.setField(i, value);
+            pos += getFieldSize(buffer, pos, wt);
+        }
+
+        outRow.setRowKind(ExternalRuntimeBinaryCodec.opToRowKind(op, fallbackKind));
+
+        if (reuseRecord != null) {
+            reuseRecord.replace(outRow, timestamp);
+            output.collect(reuseRecord);
+        } else {
+            output.collect(new StreamRecord<>(outRow, timestamp));
+        }
+
+        return pos;
+    }
+
+    private Object decodeFieldValue(byte[] buf, int pos, WireType wt, LogicalType sourceType, LogicalType targetType) throws IOException {
+        switch (wt) {
+            case BOOL:
+                return buf[pos] != 0;
+            case INT32:
+                return readIntBE(buf, pos);
+            case INT64:
+                return readLongBE(buf, pos);
+            case TIMESTAMP_MILLIS: {
+                final long millis = readLongBE(buf, pos);
+                return org.apache.flink.table.data.TimestampData.fromEpochMillis(millis);
+            }
+            case FLOAT32:
+                return Float.intBitsToFloat(readIntBE(buf, pos));
+            case FLOAT64:
+                return Double.longBitsToDouble(readLongBE(buf, pos));
+            case STRING: {
+                final int strLen = readIntBE(buf, pos);
+                return org.apache.flink.table.data.StringData.fromBytes(buf, pos + 4, strLen);
+            }
+            case BYTES: {
+                final int bytesLen = readIntBE(buf, pos);
+                byte[] bytes = new byte[bytesLen];
+                System.arraycopy(buf, pos + 4, bytes, 0, bytesLen);
+                return bytes;
+            }
+            case DECIMAL_UNSCALED_I64: {
+                final long unscaled = readLongBE(buf, pos);
+                if (targetType instanceof org.apache.flink.table.types.logical.DecimalType) {
+                    final org.apache.flink.table.types.logical.DecimalType dt =
+                            (org.apache.flink.table.types.logical.DecimalType) targetType;
+                    return org.apache.flink.table.data.DecimalData.fromUnscaledLong(
+                            unscaled, dt.getPrecision(), dt.getScale());
+                }
+                return unscaled;
+            }
+            case DECIMAL_UNSCALED_BYTES: {
+                final int decLen = readIntBE(buf, pos);
+                byte[] decBytes = new byte[decLen];
+                System.arraycopy(buf, pos + 4, decBytes, 0, decLen);
+                if (targetType instanceof org.apache.flink.table.types.logical.DecimalType) {
+                    final org.apache.flink.table.types.logical.DecimalType dt =
+                            (org.apache.flink.table.types.logical.DecimalType) targetType;
+                    final java.math.BigInteger bi = new java.math.BigInteger(decBytes);
+                    final java.math.BigDecimal bd = new java.math.BigDecimal(bi, dt.getScale());
+                    return org.apache.flink.table.data.DecimalData.fromBigDecimal(
+                            bd, dt.getPrecision(), dt.getScale());
+                }
+                return decBytes;
+            }
+            default:
+                throw new IOException("Unsupported wire type: " + wt);
+        }
+    }
+
+    private int getFieldSize(byte[] buf, int pos, WireType wt) {
+        switch (wt) {
+            case BOOL:
+                return 1;
+            case INT32:
+            case FLOAT32:
+                return 4;
+            case INT64:
+            case FLOAT64:
+            case TIMESTAMP_MILLIS:
+            case DECIMAL_UNSCALED_I64:
+                return 8;
+            case STRING:
+            case BYTES:
+            case DECIMAL_UNSCALED_BYTES:
+                final int len = readIntBE(buf, pos);
+                return 4 + len;
+            default:
+                return 0;
+        }
+    }
+
+    private static boolean isNullBitSet(byte[] payload, int bitmapPos, int fieldIndex) {
+        final int byteIndex = bitmapPos + (fieldIndex >>> 3);
+        final int bit = fieldIndex & 7;
+        return (payload[byteIndex] & (1 << bit)) != 0;
+    }
+
+    private void emitWithTimestamp(RowData row, StreamRecord<RowData> input) {
+        if (input.hasTimestamp()) {
+            output.collect(new StreamRecord<>(row, input.getTimestamp()));
+        } else {
+            output.collect(new StreamRecord<>(row));
         }
     }
 
@@ -257,26 +432,6 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         return ready;
     }
 
-    private static final class RowWithId {
-        private final long rowId;
-        private final RowData row;
-
-        private RowWithId(long rowId, RowData row) {
-            this.rowId = rowId;
-            this.row = row;
-        }
-    }
-
-    private static final class Header {
-        private final long rowId;
-        private final int count;
-
-        private Header(long rowId, int count) {
-            this.rowId = rowId;
-            this.count = count;
-        }
-    }
-
     private static final class ResponseBlock {
         private final long rowId;
         private final List<RowData> rows;
@@ -287,15 +442,66 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         }
     }
 
+    private void ensureFrameBuf(int len) {
+        if (frameBuf.length >= len) {
+            return;
+        }
+        int n = frameBuf.length;
+        while (n < len) {
+            n <<= 1;
+        }
+        frameBuf = new byte[n];
+    }
+
+    private static int readIntBE(BufferedInputStream in) throws IOException {
+        final int b1 = in.read();
+        final int b2 = in.read();
+        final int b3 = in.read();
+        final int b4 = in.read();
+        if ((b1 | b2 | b3 | b4) < 0) {
+            throw new java.io.EOFException("EOF while reading int32");
+        }
+        return (b1 << 24) | (b2 << 16) | (b3 << 8) | (b4);
+    }
+
+    private static int readIntBE(byte[] buf, int p) {
+        return ((buf[p] & 0xff) << 24)
+                | ((buf[p + 1] & 0xff) << 16)
+                | ((buf[p + 2] & 0xff) << 8)
+                | (buf[p + 3] & 0xff);
+    }
+
+    private static long readLongBE(byte[] buf, int p) {
+        return ((long) (buf[p] & 0xff) << 56)
+                | ((long) (buf[p + 1] & 0xff) << 48)
+                | ((long) (buf[p + 2] & 0xff) << 40)
+                | ((long) (buf[p + 3] & 0xff) << 32)
+                | ((long) (buf[p + 4] & 0xff) << 24)
+                | ((long) (buf[p + 5] & 0xff) << 16)
+                | ((long) (buf[p + 6] & 0xff) << 8)
+                | (buf[p + 7] & 0xff);
+    }
+
+    private static void readFully(BufferedInputStream in, byte[] b, int off, int len)
+            throws IOException {
+        int n = 0;
+        while (n < len) {
+            final int r = in.read(b, off + n, len - n);
+            if (r < 0) {
+                throw new java.io.EOFException("Truncated frame");
+            }
+            n += r;
+        }
+    }
+
     @Override
     protected void closeInternal() throws Exception {
         IOException error = null;
 
         codec = null;
         reuseRow = null;
-        headerCodec = null;
-        reuseHeaderRow = null;
-        countGetter = null;
+        reuseStreamRecord = null;
+        frameBuf = null;
         reorderBlockBuffers = null;
 
         if (outs != null) {
@@ -325,26 +531,5 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         }
     }
 
-    private RowData mergeExternalRuntimeRow(RowData baseRow, RowData externalRow) {
-        if (resultReplacesAllFields) {
-            return externalRow;
-        }
-        final int fieldCount = inputRowType.getFieldCount();
-        if (reuseObjects && reuseMergedRow == null) {
-            reuseMergedRow = new GenericRowData(fieldCount);
-        }
-        final GenericRowData outRow = reuseObjects ? reuseMergedRow : new GenericRowData(fieldCount);
-        outRow.setRowKind(externalRow.getRowKind());
-
-        for (int i = 0; i < fieldCount; i++) {
-            final int resultPos = resultPosByInputIndex[i];
-            if (resultPos >= 0) {
-                outRow.setField(i, resultFieldGetters[resultPos].getFieldOrNull(externalRow));
-            } else {
-                outRow.setField(i, fullRowFieldGetters[i].getFieldOrNull(baseRow));
-            }
-        }
-        return outRow;
-    }
 
 }
