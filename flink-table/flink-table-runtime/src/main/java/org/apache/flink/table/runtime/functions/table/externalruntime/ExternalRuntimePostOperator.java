@@ -15,6 +15,7 @@ import javax.annotation.Nullable;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -27,11 +28,15 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
 
     private static final long serialVersionUID = 1L;
 
-    private transient BufferedInputStream in;
+    private transient List<ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint> endpoints;
+    private transient List<BufferedInputStream> ins;
+    private transient List<BufferedOutputStream> outs;
+    private transient List<Socket> sockets;
     private transient long expectedRowId;
-    private transient Map<Long, ResponseBlock> reorderBlockBuffer;
+    private transient List<Map<Long, ResponseBlock>> reorderBlockBuffers;
     private transient boolean reuseObjects;
     private transient GenericRowData reuseRow;
+    private transient GenericRowData reuseMergedRow;
     private transient ExternalRuntimeBinaryCodec headerCodec;
     private transient GenericRowData reuseHeaderRow;
     private transient RowData.FieldGetter countGetter;
@@ -51,20 +56,33 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
 
     @Override
     protected void openInternal() throws Exception {
-        final ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint proxy = tcpConfig.getSelectedProxy();
-        final int port = proxy.getReceivePort();
-        this.socket = connectSocket(proxy.getHost(), port, tcpConfig.getConnectTimeoutMs());
-
-        if (tcpConfig.getReadTimeoutMs() > 0) {
-            socket.setSoTimeout(tcpConfig.getReadTimeoutMs());
-        }
-
-        this.in = new BufferedInputStream(socket.getInputStream(), tcpConfig.getBufferSize());
-
-        final BufferedOutputStream postOut =
-                new BufferedOutputStream(socket.getOutputStream(), tcpConfig.getBufferSize());
+        final int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
+        final int totalSubtasks = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
+        this.endpoints = tcpConfig.selectEndpoints(subtaskIndex, totalSubtasks);
+        this.ins = new ArrayList<>(endpoints.size());
+        this.outs = new ArrayList<>(endpoints.size());
+        this.sockets = new ArrayList<>(endpoints.size());
         final String configJson = buildConfigJson();
-        writeLengthPrefixedJson(postOut, configJson);
+        for (ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint endpoint : endpoints) {
+            final int port = endpoint.getReceivePort();
+            final Socket sock =
+                    connectSocket(endpoint.getHost(), port, tcpConfig.getConnectTimeoutMs());
+            if (tcpConfig.getReadTimeoutMs() > 0) {
+                sock.setSoTimeout(tcpConfig.getReadTimeoutMs());
+            }
+            final BufferedInputStream in =
+                    new BufferedInputStream(sock.getInputStream(), tcpConfig.getBufferSize());
+            final BufferedOutputStream postOut =
+                    new BufferedOutputStream(sock.getOutputStream(), tcpConfig.getBufferSize());
+            writeLengthPrefixedJson(postOut, configJson);
+            postOut.flush();
+            sockets.add(sock);
+            ins.add(in);
+            outs.add(postOut);
+        }
+        if (!sockets.isEmpty()) {
+            this.socket = sockets.get(0);
+        }
 
         this.reuseObjects =
                 getRuntimeContext().isObjectReuseEnabled() && !tcpConfig.isReorderResponses();
@@ -109,15 +127,17 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
 
         this.expectedRowId = 0L;
         if (tcpConfig.isReorderResponses()) {
-            this.reorderBlockBuffer = new HashMap<>();
+            this.reorderBlockBuffers = new ArrayList<>(endpoints.size());
+            for (int i = 0; i < endpoints.size(); i++) {
+                reorderBlockBuffers.add(new HashMap<>());
+            }
         } else {
-            this.reorderBlockBuffer = null;
+            this.reorderBlockBuffers = null;
         }
 
         LOG.info(
-                "ExternalRuntimePostOperator connected to {}:{} (rowType={}, sentConfigBytes={})",
-                proxy.getHost(),
-                port,
+                "ExternalRuntimePostOperator connected to {} runtime(s) (rowType={}, sentConfigBytes={})",
+                endpoints.size(),
                 inputRowType,
                 configJson.getBytes(StandardCharsets.UTF_8).length);
     }
@@ -132,29 +152,27 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     protected void processElementInternal(StreamRecord<RowData> element) throws Exception {
         final RowData inRow = element.getValue();
         final RowKind fallbackKind = inRow.getRowKind();
-        final ResponseBlock block =
-                tcpConfig.isReorderResponses()
-                        ? readNextOrderedBlock(fallbackKind)
-                        : readNextBlock(fallbackKind);
-
-        if (!tcpConfig.isReorderResponses()) {
-            if (block.rowId != expectedRowId) {
-                throw new IOException(
-                        "ExternalRuntimePostOperator expected rowId "
-                                + expectedRowId
-                                + " but received "
-                                + block.rowId);
-            }
+        if (ins == null || ins.isEmpty()) {
+            throw new IOException("ExternalRuntimePostOperator input stream not initialized");
+        }
+        final int endpointIndex = tcpConfig.selectEndpointIndex(expectedRowId, ins.size());
+        if (tcpConfig.isReorderResponses()) {
+            final ResponseBlock block =
+                    readNextOrderedBlock(endpointIndex, fallbackKind, expectedRowId);
             expectedRowId++;
+            for (int i = 0; i < block.rows.size(); i++) {
+                final RowData outRow = mergeExternalRuntimeRow(inRow, block.rows.get(i));
+                output.collect(element.copy(outRow));
+            }
+            return;
         }
 
-        for (int i = 0; i < block.rows.size(); i++) {
-            final RowData outRow = mergeProxyRow(inRow, block.rows.get(i));
-            output.collect(element.copy(outRow));
-        }
+        readAndEmitBlock(endpointIndex, fallbackKind, expectedRowId, element, inRow);
+        expectedRowId++;
     }
 
-    private RowWithId readNextRowWithId(RowKind fallbackKind) throws IOException {
+    private RowWithId readNextRowWithId(BufferedInputStream in, RowKind fallbackKind)
+            throws IOException {
         if (codec == null || in == null) {
             throw new IOException("ExternalRuntimePostOperator codec not initialized");
         }
@@ -164,7 +182,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         return new RowWithId(decoded.rowId, decoded.row);
     }
 
-    private Header readNextHeader(RowKind fallbackKind) throws IOException {
+    private Header readNextHeader(BufferedInputStream in, RowKind fallbackKind) throws IOException {
         if (headerCodec == null || in == null || countGetter == null) {
             throw new IOException("ExternalRuntimePostOperator header codec not initialized");
         }
@@ -177,37 +195,58 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         return new Header(decoded.rowId, (Integer) countValue);
     }
 
-    private ResponseBlock readNextBlock(RowKind fallbackKind) throws IOException {
-        final Header header = readNextHeader(fallbackKind);
+    private ResponseBlock readNextBlock(int endpointIndex, RowKind fallbackKind) throws IOException {
+        final BufferedInputStream in = ins.get(endpointIndex);
+        final Header header = readNextHeader(in, fallbackKind);
         if (header.count < 0) {
             throw new IOException("ExternalRuntimePostOperator received negative count: " + header.count);
         }
 
         final List<RowData> rows = new ArrayList<>(header.count);
         for (int i = 0; i < header.count; i++) {
-            final RowWithId decoded = readNextRowWithId(fallbackKind);
-            if (decoded.rowId != header.rowId) {
-                throw new IOException(
-                        "ExternalRuntimePostOperator expected rowId "
-                                + header.rowId
-                                + " but received "
-                                + decoded.rowId);
-            }
+            final RowWithId decoded = readNextRowWithId(in, fallbackKind);
             rows.add(decoded.row);
         }
         return new ResponseBlock(header.rowId, rows);
     }
 
-    private ResponseBlock readNextOrderedBlock(RowKind fallbackKind) throws IOException {
-        final long targetId = expectedRowId;
-        ResponseBlock ready = reorderBlockBuffer.remove(targetId);
+    private void readAndEmitBlock(
+            int endpointIndex,
+            RowKind fallbackKind,
+            long targetRowId,
+            StreamRecord<RowData> element,
+            RowData baseRow)
+            throws IOException {
+        final BufferedInputStream in = ins.get(endpointIndex);
+        final Header header = readNextHeader(in, fallbackKind);
+        if (header.rowId != targetRowId) {
+            throw new IOException(
+                    "ExternalRuntimePostOperator expected rowId "
+                            + targetRowId
+                            + " but received "
+                            + header.rowId);
+        }
+        if (header.count < 0) {
+            throw new IOException("ExternalRuntimePostOperator received negative count: " + header.count);
+        }
+        for (int i = 0; i < header.count; i++) {
+            final RowWithId decoded = readNextRowWithId(in, fallbackKind);
+            final RowData outRow = mergeExternalRuntimeRow(baseRow, decoded.row);
+            output.collect(element.copy(outRow));
+        }
+    }
+
+    private ResponseBlock readNextOrderedBlock(
+            int endpointIndex, RowKind fallbackKind, long targetId) throws IOException {
+        final Map<Long, ResponseBlock> buffer = reorderBlockBuffers.get(endpointIndex);
+        ResponseBlock ready = buffer.remove(targetId);
         while (ready == null) {
-            final ResponseBlock next = readNextBlock(fallbackKind);
+            final ResponseBlock next = readNextBlock(endpointIndex, fallbackKind);
             if (next.rowId == targetId) {
                 ready = next;
             } else {
-                reorderBlockBuffer.put(next.rowId, next);
-                if (reorderBlockBuffer.size() > tcpConfig.getReorderMaxBuffer()) {
+                buffer.put(next.rowId, next);
+                if (buffer.size() > tcpConfig.getReorderMaxBuffer()) {
                     throw new IOException(
                             "ExternalRuntimePostOperator reorder buffer exceeded "
                                     + tcpConfig.getReorderMaxBuffer()
@@ -215,7 +254,6 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                 }
             }
         }
-        expectedRowId++;
         return ready;
     }
 
@@ -258,32 +296,55 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         headerCodec = null;
         reuseHeaderRow = null;
         countGetter = null;
-        reorderBlockBuffer = null;
+        reorderBlockBuffers = null;
 
-        error = suppress(error, closeQuietly(in));
-        in = null;
+        if (outs != null) {
+            for (BufferedOutputStream out : outs) {
+                error = suppress(error, flushAndClose(out));
+            }
+        }
+        outs = null;
+
+        if (ins != null) {
+            for (BufferedInputStream in : ins) {
+                error = suppress(error, closeQuietly(in));
+            }
+        }
+        ins = null;
+
+        if (sockets != null) {
+            for (Socket sock : sockets) {
+                error = suppress(error, closeQuietly(sock));
+            }
+        }
+        sockets = null;
+        socket = null;
 
         if (error != null) {
             throw error;
         }
     }
 
-    private final RowData mergeProxyRow(RowData baseRow, RowData proxyRow) {
+    private RowData mergeExternalRuntimeRow(RowData baseRow, RowData externalRow) {
         if (resultReplacesAllFields) {
-            return proxyRow;
+            return externalRow;
         }
         final int fieldCount = inputRowType.getFieldCount();
-        final GenericRowData outRow = new GenericRowData(fieldCount);
-        outRow.setRowKind(proxyRow.getRowKind());
+        if (reuseObjects && reuseMergedRow == null) {
+            reuseMergedRow = new GenericRowData(fieldCount);
+        }
+        final GenericRowData outRow = reuseObjects ? reuseMergedRow : new GenericRowData(fieldCount);
+        outRow.setRowKind(externalRow.getRowKind());
 
         for (int i = 0; i < fieldCount; i++) {
             final int resultPos = resultPosByInputIndex[i];
             if (resultPos >= 0) {
-                outRow.setField(i, resultFieldGetters[resultPos].getFieldOrNull(proxyRow));
+                outRow.setField(i, resultFieldGetters[resultPos].getFieldOrNull(externalRow));
             } else {
                 outRow.setField(i, fullRowFieldGetters[i].getFieldOrNull(baseRow));
             }
         }
         return outRow;
     }
+
 }

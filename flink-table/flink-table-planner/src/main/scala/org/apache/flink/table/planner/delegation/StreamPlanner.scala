@@ -93,22 +93,22 @@ class StreamPlanner(
     }
     afterTranslation()
     val result = transformations ++ planner.extraTransformations
-    applyProxyChainOnlyOverrides(result)
+    applyExternalRuntimeChainOnlyOverrides(result)
     result
   }
 
-  private def applyProxyChainOnlyOverrides(
+  private def applyExternalRuntimeChainOnlyOverrides(
       transformations: util.List[Transformation[_]]): Unit = {
-    if (!getTableConfig.get(CommonExecCalc.PROXY_CHAIN_ONLY_OPTION)) {
+    if (!getTableConfig.get(CommonExecCalc.EXTERNAL_RUNTIME_CHAIN_ONLY_OPTION)) {
       return
     }
     if (!getTableConfig.get(PipelineOptions.OPERATOR_CHAINING)) {
       LOG.info(
-        "Proxy chain-only enabled; forcing pipeline.operator-chaining.enabled to true.")
+        "External runtime chain-only enabled; forcing pipeline.operator-chaining.enabled to true.")
       getTableConfig.set(PipelineOptions.OPERATOR_CHAINING, Boolean.box(true))
     }
     val all = collectTransformations(transformations)
-    if (!all.exists(t => isProxyPre(t) || isProxyPost(t))) {
+    if (!all.exists(t => isExternalRuntimePre(t) || isExternalRuntimePost(t))) {
       return
     }
     val upstreamOfPre = util.Collections.newSetFromMap(
@@ -116,18 +116,18 @@ class StreamPlanner(
     val downstreamOfPost = util.Collections.newSetFromMap(
       new util.IdentityHashMap[Transformation[_], java.lang.Boolean]())
     all.foreach { t =>
-      if (isProxyPre(t)) {
+      if (isExternalRuntimePre(t)) {
         t.getInputs.foreach(upstreamOfPre.add)
       }
-      if (hasProxyPostInput(t)) {
+      if (hasExternalRuntimePostInput(t)) {
         downstreamOfPost.add(t)
       }
     }
     all.foreach {
       case t: PhysicalTransformation[_] =>
-        if (isProxyPre(t)) {
+        if (isExternalRuntimePre(t)) {
           t.setChainingStrategy(ChainingStrategy.ALWAYS)
-        } else if (isProxyPost(t)) {
+        } else if (isExternalRuntimePost(t)) {
           t.setChainingStrategy(ChainingStrategy.HEAD)
         } else if (upstreamOfPre.contains(t)) {
           t.setChainingStrategy(ChainingStrategy.ALWAYS)
@@ -153,16 +153,16 @@ class StreamPlanner(
     visited
   }
 
-  private def hasProxyPostInput(transformation: Transformation[_]): Boolean = {
-    transformation.getInputs.exists(isProxyPost)
+  private def hasExternalRuntimePostInput(transformation: Transformation[_]): Boolean = {
+    transformation.getInputs.exists(isExternalRuntimePost)
   }
 
-  private def isProxyPre(transformation: Transformation[_]): Boolean = {
-    hasNameFragment(transformation, "ProxyPre")
+  private def isExternalRuntimePre(transformation: Transformation[_]): Boolean = {
+    hasNameFragment(transformation, "ExternalRuntimePre")
   }
 
-  private def isProxyPost(transformation: Transformation[_]): Boolean = {
-    hasNameFragment(transformation, "ProxyPost")
+  private def isExternalRuntimePost(transformation: Transformation[_]): Boolean = {
+    hasNameFragment(transformation, "ExternalRuntimePost")
   }
 
   private def hasNameFragment(

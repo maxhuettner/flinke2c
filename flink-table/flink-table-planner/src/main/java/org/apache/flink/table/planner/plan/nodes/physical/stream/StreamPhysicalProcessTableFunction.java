@@ -161,7 +161,7 @@ public class StreamPhysicalProcessTableFunction extends AbstractRelNode
         return planner.getCostFactory().makeCost(elementRate, elementRate, 0);
     }
 
-    private static boolean isProxyFunction(RexCall udfCall) {
+    private static boolean isExternalRuntimeFunction(RexCall udfCall) {
         final BridgingSqlFunction bridging = ShortcutUtils.unwrapBridgingSqlFunction(udfCall);
         if (bridging == null) {
             LOG.info("ExternalRuntime watermark check: bridging is null");
@@ -188,7 +188,7 @@ public class StreamPhysicalProcessTableFunction extends AbstractRelNode
         final String defClassName = definition.getClass().getName();
         if (ExternalRuntimeTableFunction.class.getName().equals(defClassName)) {
             LOG.info(
-                    "ExternalRuntime watermark check matched (name): defClass={}, defCl={}, proxyCl={}, ident={}",
+                    "ExternalRuntime watermark check matched (name): defClass={}, defCl={}, runtimeCl={}, ident={}",
                     defClassName,
                     definition.getClass().getClassLoader(),
                     ExternalRuntimeTableFunction.class.getClassLoader(),
@@ -197,7 +197,7 @@ public class StreamPhysicalProcessTableFunction extends AbstractRelNode
         }
         if (defClassName.endsWith("ExternalRuntimeTableFunction")) {
             LOG.info(
-                    "ExternalRuntime watermark check not matched: defClass={}, defCl={}, proxyCl={}, ident={}",
+                    "ExternalRuntime watermark check not matched: defClass={}, defCl={}, runtimeCl={}, ident={}",
                     defClassName,
                     definition.getClass().getClassLoader(),
                     ExternalRuntimeTableFunction.class.getClassLoader(),

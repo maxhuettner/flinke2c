@@ -66,15 +66,13 @@ class StreamPhysicalCalc(
     }
 
     val tableConfig = unwrapTableConfig(this)
-    val proxyFunctionClass =
-      tableConfig.getOptional(CommonExecCalc.PROXY_FUNCTION_CLASS_OPTION)
-        .orElse(CommonExecCalc.CUSTOM_PROXY_FUNCTION_CLASS_NAME)
+    val externalRuntimeFunctionClasses = CommonExecCalc.resolveExternalRuntimeFunctionClasses(tableConfig)
 
     val rewriter =
-      new StreamPhysicalCalc.ProxyScalarFunctionRewriter(
+      new StreamPhysicalCalc.ExternalRuntimeScalarFunctionRewriter(
         inputRel.getRowType,
         getRowType,
-        proxyFunctionClass)
+        externalRuntimeFunctionClasses)
     val rewrittenProjection = projection.zipWithIndex.map {
       case (node, idx) =>
         rewriter.setCurrentOutputFieldIndex(idx)
@@ -87,24 +85,23 @@ class StreamPhysicalCalc(
       null
     }
     val effectiveCondition =
-      if (rewriter.hasProxyFunction &&
-        CommonExecCalc.PROXY_FUNCTION_KIND_FILTER == rewriter.getProxyFunctionKind) {
+      if (rewriter.hasExternalRuntimeFunction &&
+        CommonExecCalc.EXTERNAL_RUNTIME_FUNCTION_KIND_FILTER == rewriter.getExternalRuntimeFunctionKind) {
         null
       } else {
         rewrittenCondition
       }
     if (StreamPhysicalCalc.LOG.isDebugEnabled) {
       StreamPhysicalCalc.LOG.debug(
-        s"StreamPhysicalCalc proxy rewrite: hasProxyFunction=${rewriter.hasProxyFunction}, " +
-          s"functionKind=${rewriter.getProxyFunctionKind}")
+        s"StreamPhysicalCalc external runtime rewrite: hasExternalRuntimeFunction=${rewriter.hasExternalRuntimeFunction}, " +
+          s"functionKind=${rewriter.getExternalRuntimeFunctionKind}")
     }
 
-    if (rewriter.hasProxyFunction) {
+    if (rewriter.hasExternalRuntimeFunction) {
       if (StreamPhysicalCalc.LOG.isDebugEnabled) {
         StreamPhysicalCalc.LOG.debug(
-          "Proxy rewrite matched function: class={}, kind={}",
-          rewriter.getProxyFunctionClass,
-          rewriter.getProxyFunctionKind)
+          s"External runtime rewrite matched function: class=${rewriter.getExternalRuntimeFunctionClass}, " +
+            s"kind=${rewriter.getExternalRuntimeFunctionKind}")
       }
       new StreamExecCalc(
         tableConfig,
@@ -113,19 +110,19 @@ class StreamPhysicalCalc(
         InputProperty.DEFAULT,
         FlinkTypeFactory.toLogicalRowType(getRowType),
         getRelDetailedDescription,
-        rewriter.getProxyConf,
-        rewriter.getProxyFieldIndex.orNull,
-        rewriter.getProxyFieldName,
-        rewriter.getProxyFunctionClass,
-        rewriter.getProxyFunctionKind,
-        rewriter.getProxyArgFieldIndices,
-        rewriter.getProxyArgFieldNames,
-        rewriter.getProxyArgFieldTypes,
-        rewriter.getProxyResultFieldIndices,
-        rewriter.getProxyResultFieldNames,
-        rewriter.getProxyResultFieldTypes,
-        rewriter.getProxyResultUdfFieldTypes,
-        rewriter.getProxyResultUdfFieldIndices)
+        rewriter.getExternalRuntimeConf,
+        rewriter.getExternalRuntimeFieldIndex.orNull,
+        rewriter.getExternalRuntimeFieldName,
+        rewriter.getExternalRuntimeFunctionClass,
+        rewriter.getExternalRuntimeFunctionKind,
+        rewriter.getExternalRuntimeArgFieldIndices,
+        rewriter.getExternalRuntimeArgFieldNames,
+        rewriter.getExternalRuntimeArgFieldTypes,
+        rewriter.getExternalRuntimeResultFieldIndices,
+        rewriter.getExternalRuntimeResultFieldNames,
+        rewriter.getExternalRuntimeResultFieldTypes,
+        rewriter.getExternalRuntimeResultUdfFieldTypes,
+        rewriter.getExternalRuntimeResultUdfFieldIndices)
     } else {
       new StreamExecCalc(
         tableConfig,
@@ -181,7 +178,7 @@ private object StreamPhysicalCalc {
     }
   }
 
-  private def isProxyScalarFunction(
+  private def isExternalRuntimeScalarFunction(
       call: RexCall,
       targetClassName: String,
       targetSimpleName: String): Boolean = {
@@ -204,13 +201,13 @@ private object StreamPhysicalCalc {
     }
   }
 
-  private def isSupportedProxyOperand(operand: RexNode): Boolean = {
+  private def isSupportedExternalRuntimeOperand(operand: RexNode): Boolean = {
     operand match {
       case _: RexInputRef => true
       case _: RexFieldAccess => true
       case call: RexCall =>
         if (call.getKind == SqlKind.CAST || call.getKind == SqlKind.AS) {
-          isSupportedProxyOperand(call.getOperands.get(0))
+          isSupportedExternalRuntimeOperand(call.getOperands.get(0))
         } else {
           false
         }
@@ -218,21 +215,21 @@ private object StreamPhysicalCalc {
     }
   }
 
-  private def mergeProxyConf(existing: String, conf: String): String = {
+  private def mergeExternalRuntimeConf(existing: String, conf: String): String = {
     if (conf == null || conf.isEmpty) {
       return if (existing == null) "" else existing
     }
     if (existing == null || existing.isEmpty) {
       return conf
     }
-    if (existing != conf) {
-      throw new TableException(
-        "Proxy scalar function requires a single, consistent conf literal.")
+      if (existing != conf) {
+        throw new TableException(
+          "External runtime function requires a single, consistent conf literal.")
     }
     existing
   }
 
-  private def extractProxyConf(operands: java.util.List[RexNode]): String = {
+  private def extractExternalRuntimeConf(operands: java.util.List[RexNode]): String = {
     val iterator = operands.iterator()
     while (iterator.hasNext) {
       val operand = iterator.next()
@@ -251,7 +248,7 @@ private object StreamPhysicalCalc {
     ""
   }
 
-  private def extractProxyFieldIndex(operand: RexNode): Option[Integer] = {
+  private def extractExternalRuntimeFieldIndex(operand: RexNode): Option[Integer] = {
     operand match {
       case inputRef: RexInputRef =>
         Some(inputRef.getIndex)
@@ -259,12 +256,12 @@ private object StreamPhysicalCalc {
         fieldAccess.getReferenceExpr match {
           case inputRef: RexInputRef => Some(inputRef.getIndex)
           case refCall: RexCall if refCall.getKind == SqlKind.CAST || refCall.getKind == SqlKind.AS =>
-            extractProxyFieldIndex(refCall.getOperands.get(0))
+            extractExternalRuntimeFieldIndex(refCall.getOperands.get(0))
           case _ => None
         }
       case call: RexCall =>
         if (call.getKind == SqlKind.CAST || call.getKind == SqlKind.AS) {
-          extractProxyFieldIndex(call.getOperands.get(0))
+          extractExternalRuntimeFieldIndex(call.getOperands.get(0))
         } else {
           None
         }
@@ -322,60 +319,68 @@ private object StreamPhysicalCalc {
     }
   }
 
-  private class ProxyScalarFunctionRewriter(
+  private class ExternalRuntimeScalarFunctionRewriter(
       inputType: RelDataType,
       outputType: RelDataType,
-      targetClassName: String)
+      targetClassNames: java.util.List[String])
     extends RexShuttle {
-    private val targetSimpleName = deriveSimpleName(targetClassName)
-    private var proxyFunctionFound = false
-    private var proxyConf: String = null
-    private var proxyFieldIndex: Integer = null
-    private var proxyFieldName: String = null
-    private var proxyFunctionClass: String = null
-    private var proxyFunctionKind: String = CommonExecCalc.PROXY_FUNCTION_KIND_SCALAR
+    private val targets = buildTargets(targetClassNames)
+    private var externalRuntimeFunctionFound = false
+    private var externalRuntimeConf: String = null
+    private var externalRuntimeFieldIndex: Integer = null
+    private var externalRuntimeFieldName: String = null
+    private var externalRuntimeFunctionClass: String = null
+    private var matchedFunctionClass: String = null
+    private var externalRuntimeFunctionKind: String = CommonExecCalc.EXTERNAL_RUNTIME_FUNCTION_KIND_SCALAR
     private var currentOutputFieldIndex: Int = -1
     private var currentUdfFieldIndexOverride: Integer = null
-    private val proxyArgFieldIndices = new java.util.ArrayList[Integer]()
-    private val proxyArgFieldNames = new java.util.ArrayList[String]()
-    private val proxyArgFieldTypes = new java.util.ArrayList[String]()
-    private val proxyResultFieldIndices = new java.util.ArrayList[Integer]()
-    private val proxyResultFieldNames = new java.util.ArrayList[String]()
-    private val proxyResultFieldTypes = new java.util.ArrayList[String]()
-    private val proxyResultUdfFieldIndices = new java.util.ArrayList[Integer]()
-    private val proxyResultUdfFieldTypes = new java.util.ArrayList[String]()
+    private val externalRuntimeArgFieldIndices = new java.util.ArrayList[Integer]()
+    private val externalRuntimeArgFieldNames = new java.util.ArrayList[String]()
+    private val externalRuntimeArgFieldTypes = new java.util.ArrayList[String]()
+    private val externalRuntimeResultFieldIndices = new java.util.ArrayList[Integer]()
+    private val externalRuntimeResultFieldNames = new java.util.ArrayList[String]()
+    private val externalRuntimeResultFieldTypes = new java.util.ArrayList[String]()
+    private val externalRuntimeResultUdfFieldIndices = new java.util.ArrayList[Integer]()
+    private val externalRuntimeResultUdfFieldTypes = new java.util.ArrayList[String]()
 
     def setCurrentOutputFieldIndex(idx: Int): Unit = {
       currentOutputFieldIndex = idx
     }
 
     override def visitFieldAccess(fieldAccess: RexFieldAccess): RexNode = {
-      val proxyCall = unwrapProxyCall(fieldAccess.getReferenceExpr)
-      if (proxyCall == null || fieldAccess.getField == null) {
+      val externalRuntimeCall = unwrapExternalRuntimeCall(fieldAccess.getReferenceExpr)
+      if (externalRuntimeCall == null || fieldAccess.getField == null) {
         return super.visitFieldAccess(fieldAccess)
       }
       currentUdfFieldIndexOverride = fieldAccess.getField.getIndex
       try {
-        // Drop the field access; the proxy uses the recorded udfFieldIndex.
-        proxyCall.accept(this)
+        // Drop the field access; the external runtime uses the recorded udfFieldIndex.
+        externalRuntimeCall.accept(this)
       } finally {
         currentUdfFieldIndexOverride = null
       }
     }
 
     override def visitCall(call: RexCall): RexNode = {
-      if (!isProxyScalarFunction(call, targetClassName, targetSimpleName)) {
+      val matchTarget = matchFunction(call)
+      if (matchTarget == null) {
         return super.visitCall(call)
+      }
+      if (matchedFunctionClass == null) {
+        matchedFunctionClass = matchTarget.className
+      } else if (matchedFunctionClass != matchTarget.className) {
+        throw new TableException(
+          "External runtime function supports a single function class per Calc.")
       }
       val operands = call.getOperands
       if (operands.isEmpty) {
-        throw new TableException("Proxy scalar function requires at least one argument.")
+        throw new TableException("External runtime function requires at least one argument.")
       }
-      proxyFunctionFound = true
-      proxyConf = mergeProxyConf(proxyConf, extractProxyConf(operands))
-      proxyFunctionClass = targetClassName
+      externalRuntimeFunctionFound = true
+      externalRuntimeConf = mergeExternalRuntimeConf(externalRuntimeConf, extractExternalRuntimeConf(operands))
+      externalRuntimeFunctionClass = matchedFunctionClass
       if (currentOutputFieldIndex < 0) {
-        proxyFunctionKind = CommonExecCalc.PROXY_FUNCTION_KIND_FILTER
+        externalRuntimeFunctionKind = CommonExecCalc.EXTERNAL_RUNTIME_FUNCTION_KIND_FILTER
       }
       var foundFieldArg = false
       var firstFieldOperand: RexNode = null
@@ -384,18 +389,18 @@ private object StreamPhysicalCalc {
       while (iterator.hasNext) {
         val operand = iterator.next()
         if (!(operand.isInstanceOf[RexLiteral] || operand.getKind == SqlKind.DEFAULT)) {
-          if (!isSupportedProxyOperand(operand)) {
+          if (!isSupportedExternalRuntimeOperand(operand)) {
             throw new TableException(
-              "Proxy scalar function requires column references for all non-literal arguments.")
+              "External runtime function requires column references for all non-literal arguments.")
           }
-          extractProxyFieldIndex(operand) match {
+          extractExternalRuntimeFieldIndex(operand) match {
             case Some(idx) =>
-              proxyArgFieldIndices.add(idx)
-              proxyArgFieldNames.add(resolveFieldName(inputType, idx).orNull)
-              proxyArgFieldTypes.add(resolveOperandType(operand, inputType, idx).orNull)
-              if (proxyFieldIndex == null) {
-                proxyFieldIndex = idx
-                proxyFieldName = resolveFieldName(inputType, idx).orNull
+              externalRuntimeArgFieldIndices.add(idx)
+              externalRuntimeArgFieldNames.add(resolveFieldName(inputType, idx).orNull)
+              externalRuntimeArgFieldTypes.add(resolveOperandType(operand, inputType, idx).orNull)
+              if (externalRuntimeFieldIndex == null) {
+                externalRuntimeFieldIndex = idx
+                externalRuntimeFieldName = resolveFieldName(inputType, idx).orNull
               }
               if (firstFieldOperand == null) {
                 firstFieldOperand = operand
@@ -404,13 +409,13 @@ private object StreamPhysicalCalc {
               foundFieldArg = true
             case None =>
               throw new TableException(
-                "Proxy scalar function requires input references as arguments.")
+                "External runtime function requires input references as arguments.")
           }
         }
       }
       if (!foundFieldArg) {
         throw new TableException(
-          "Proxy scalar function requires at least one column reference argument.")
+          "External runtime function requires at least one column reference argument.")
       }
       if (currentOutputFieldIndex < 0) {
         return call
@@ -420,33 +425,34 @@ private object StreamPhysicalCalc {
       firstFieldOperand.accept(this)
     }
 
-    def hasProxyFunction: Boolean = proxyFunctionFound
+    def hasExternalRuntimeFunction: Boolean = externalRuntimeFunctionFound
 
-    def getProxyConf: String = if (proxyConf == null) "" else proxyConf
+    def getExternalRuntimeConf: String = if (externalRuntimeConf == null) "" else externalRuntimeConf
 
-    def getProxyFieldIndex: Option[Integer] = Option(proxyFieldIndex)
+    def getExternalRuntimeFieldIndex: Option[Integer] = Option(externalRuntimeFieldIndex)
 
-    def getProxyFieldName: String = if (proxyFieldName == null) "" else proxyFieldName
+    def getExternalRuntimeFieldName: String =
+      if (externalRuntimeFieldName == null) "" else externalRuntimeFieldName
 
-    def getProxyFunctionClass: String = if (proxyFunctionClass == null) "" else proxyFunctionClass
+    def getExternalRuntimeFunctionClass: String = if (externalRuntimeFunctionClass == null) "" else externalRuntimeFunctionClass
 
-    def getProxyFunctionKind: String = if (proxyFunctionKind == null) "" else proxyFunctionKind
+    def getExternalRuntimeFunctionKind: String = if (externalRuntimeFunctionKind == null) "" else externalRuntimeFunctionKind
 
-    def getProxyArgFieldIndices: java.util.List[Integer] = proxyArgFieldIndices
+    def getExternalRuntimeArgFieldIndices: java.util.List[Integer] = externalRuntimeArgFieldIndices
 
-    def getProxyArgFieldNames: java.util.List[String] = proxyArgFieldNames
+    def getExternalRuntimeArgFieldNames: java.util.List[String] = externalRuntimeArgFieldNames
 
-    def getProxyArgFieldTypes: java.util.List[String] = proxyArgFieldTypes
+    def getExternalRuntimeArgFieldTypes: java.util.List[String] = externalRuntimeArgFieldTypes
 
-    def getProxyResultFieldIndices: java.util.List[Integer] = proxyResultFieldIndices
+    def getExternalRuntimeResultFieldIndices: java.util.List[Integer] = externalRuntimeResultFieldIndices
 
-    def getProxyResultFieldNames: java.util.List[String] = proxyResultFieldNames
+    def getExternalRuntimeResultFieldNames: java.util.List[String] = externalRuntimeResultFieldNames
 
-    def getProxyResultFieldTypes: java.util.List[String] = proxyResultFieldTypes
+    def getExternalRuntimeResultFieldTypes: java.util.List[String] = externalRuntimeResultFieldTypes
 
-    def getProxyResultUdfFieldIndices: java.util.List[Integer] = proxyResultUdfFieldIndices
+    def getExternalRuntimeResultUdfFieldIndices: java.util.List[Integer] = externalRuntimeResultUdfFieldIndices
 
-    def getProxyResultUdfFieldTypes: java.util.List[String] = proxyResultUdfFieldTypes
+    def getExternalRuntimeResultUdfFieldTypes: java.util.List[String] = externalRuntimeResultUdfFieldTypes
 
     private def addResultField(
         udfFieldIndex: Integer,
@@ -458,23 +464,23 @@ private object StreamPhysicalCalc {
       if (targetFieldIndex == null || targetFieldIndex < 0) {
         return
       }
-      if (proxyResultFieldIndices.contains(targetFieldIndex: Integer)) {
+      if (externalRuntimeResultFieldIndices.contains(targetFieldIndex: Integer)) {
         return
       }
-      proxyResultFieldIndices.add(targetFieldIndex)
-      proxyResultFieldNames.add(resolveFieldName(outputType, currentOutputFieldIndex).orNull)
-      proxyResultFieldTypes.add(resolveFieldType(outputType, currentOutputFieldIndex).orNull)
-      proxyResultUdfFieldIndices.add(if (udfFieldIndex == null) -1 else udfFieldIndex)
-      proxyResultUdfFieldTypes.add(udfFieldType)
+      externalRuntimeResultFieldIndices.add(targetFieldIndex)
+      externalRuntimeResultFieldNames.add(resolveFieldName(outputType, currentOutputFieldIndex).orNull)
+      externalRuntimeResultFieldTypes.add(resolveFieldType(outputType, currentOutputFieldIndex).orNull)
+      externalRuntimeResultUdfFieldIndices.add(if (udfFieldIndex == null) -1 else udfFieldIndex)
+      externalRuntimeResultUdfFieldTypes.add(udfFieldType)
     }
 
-    private def unwrapProxyCall(node: RexNode): RexCall = {
+    private def unwrapExternalRuntimeCall(node: RexNode): RexCall = {
       node match {
         case call: RexCall =>
-          if (isProxyScalarFunction(call, targetClassName, targetSimpleName)) {
+          if (matchFunction(call) != null) {
             call
           } else if (call.getKind == SqlKind.CAST || call.getKind == SqlKind.AS) {
-            unwrapProxyCall(call.getOperands.get(0))
+            unwrapExternalRuntimeCall(call.getOperands.get(0))
           } else {
             null
           }
@@ -488,6 +494,31 @@ private object StreamPhysicalCalc {
       val suffixIndex = base.indexOf('$')
       if (suffixIndex > 0) base.substring(0, suffixIndex) else base
     }
+
+    private def buildTargets(
+        classNames: java.util.List[String]): List[TargetFunction] = {
+      if (classNames == null || classNames.isEmpty) {
+        return List.empty
+      }
+      val out = scala.collection.mutable.ListBuffer.empty[TargetFunction]
+      val iterator = classNames.iterator()
+      while (iterator.hasNext) {
+        val raw = iterator.next()
+        if (raw != null) {
+          val trimmed = raw.trim
+          if (trimmed.nonEmpty) {
+            out += TargetFunction(trimmed, deriveSimpleName(trimmed))
+          }
+        }
+      }
+      out.toList
+    }
+
+    private def matchFunction(call: RexCall): TargetFunction = {
+      targets.find(target => isExternalRuntimeScalarFunction(call, target.className, target.simpleName)).orNull
+    }
+
+    private case class TargetFunction(className: String, simpleName: String)
 
     private def resolveUdfReturnType(call: RexCall, udfFieldIndex: Integer): String = {
       if (call == null) {

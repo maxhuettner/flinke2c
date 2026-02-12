@@ -446,6 +446,9 @@ abstract class ExternalRuntimeOperator extends TableStreamOperator<RowData>
         root.put("externalOnly", true);
         root.put("reorderResponses", tcpConfig.isReorderResponses());
         root.put("countedResponses", true);
+        if (tcpConfig.getBatchSize() > 0) {
+            root.put("batchSize", tcpConfig.getBatchSize());
+        }
 
         final List<Map<String, Object>> functionArgs = buildFunctionArgs();
         if (!functionArgs.isEmpty()) {
