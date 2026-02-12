@@ -11,18 +11,21 @@ import java.util.Map;
 final class ExternalRuntimeTcpConfig {
     private static final int DEFAULT_BUFFER_SIZE = 64 * 1024;
     private static final int DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
-
-    private static final int DEFAULT_REORDER_MAX_BUFFER = 10000;
+    private static final int DEFAULT_BATCH_SIZE = 2048;
+    private static final int DEFAULT_FLUSH_INTERVAL_MS = 20;
+    private static final int DEFAULT_FLUSH_IDLE_MS = 10;
+    private static final int DEFAULT_REORDER_MAX_BUFFER = 100000;
     private static final boolean DEFAULT_POST_ROLE_ONLY = true;
 
-    private final List<ExternalRuntimeEndpoint> proxies;
-    private final ExternalRuntimeEndpoint selectedProxy;
+    private final List<ExternalRuntimeEndpoint> runtimes;
+    private final int runtimeParallelism;
+    private final int batchSize;
+    private final int flushIntervalMs;
+    private final int flushIdleMs;
     private final int bufferSize;
     private final int connectTimeoutMs;
     private final int readTimeoutMs;
 
-    private final Integer calcFieldIndex;
-    private final String calcFieldName;
     private final String functionClass;
     private final String functionKind;
 
@@ -46,8 +49,6 @@ final class ExternalRuntimeTcpConfig {
             int bufferSize,
             int connectTimeoutMs,
             int readTimeoutMs,
-            Integer calcFieldIndex,
-            String calcFieldName,
             String functionClass,
             String functionKind,
             List<Integer> argFieldIndices,
@@ -61,14 +62,15 @@ final class ExternalRuntimeTcpConfig {
             boolean reorderResponses,
             int reorderMaxBuffer,
             boolean postRoleOnly,
-            List<ExternalRuntimeEndpoint> proxies,
-            ExternalRuntimeEndpoint selectedProxy) {
+            List<ExternalRuntimeEndpoint> runtimes,
+            int runtimeParallelism,
+            int batchSize,
+            int flushIntervalMs,
+            int flushIdleMs) {
         this.bufferSize = bufferSize;
         this.connectTimeoutMs = connectTimeoutMs;
         this.readTimeoutMs = readTimeoutMs;
 
-        this.calcFieldIndex = calcFieldIndex;
-        this.calcFieldName = calcFieldName;
         this.functionClass = functionClass;
         this.functionKind = functionKind;
 
@@ -86,8 +88,11 @@ final class ExternalRuntimeTcpConfig {
         this.reorderResponses = reorderResponses;
         this.reorderMaxBuffer = reorderMaxBuffer;
 
-        this.proxies = proxies;
-        this.selectedProxy = selectedProxy;
+        this.runtimes = runtimes;
+        this.runtimeParallelism = runtimeParallelism;
+        this.batchSize = batchSize;
+        this.flushIntervalMs = flushIntervalMs;
+        this.flushIdleMs = flushIdleMs;
 
         this.postRoleOnly = postRoleOnly;
     }
@@ -98,11 +103,6 @@ final class ExternalRuntimeTcpConfig {
         final int bufferSize = parseInt(map.get("buffersize"), DEFAULT_BUFFER_SIZE);
         final int connectTimeoutMs = parseInt(map.get("connecttimeoutms"), DEFAULT_CONNECT_TIMEOUT_MS);
         final int readTimeoutMs = parseInt(map.get("readtimeoutms"), 0);
-
-        final boolean flushOnWrite = parseBoolean(map.get("flush"), false);
-
-        final Integer calcFieldIndex = parseInt(map.get("calcfieldindex"));
-        final String calcFieldName = map.get("calcfieldname");
 
         final String functionClass = firstNonNull(map, "class", "functionclass");
         final String functionKind = firstNonNull(map, "type", "functionkind");
@@ -123,15 +123,23 @@ final class ExternalRuntimeTcpConfig {
 
         final boolean postRoleOnly = parseBoolean(map.get("postroleonly"), DEFAULT_POST_ROLE_ONLY);
 
-        final List<ExternalRuntimeEndpoint> proxies = parseProxies(map.get("proxies"));
-        final ExternalRuntimeEndpoint selectedProxy = proxies.get(0);
+        final List<ExternalRuntimeEndpoint> runtimes = parseRuntimes(map.get("runtimes"));
+        final int runtimeParallelism =
+                parseInt(firstNonNull(map, "runtimeparallelism", "externalparallelism", "parallelism"), 0);
+        final int batchSize = parseInt(firstNonNull(map, "batchsize", "batchSize"), DEFAULT_BATCH_SIZE);
+        final int flushIntervalMs =
+                parseInt(
+                        firstNonNull(map, "flushintervalms", "flushinterval", "flushms"),
+                        DEFAULT_FLUSH_INTERVAL_MS);
+        final int flushIdleMs =
+                parseInt(
+                        firstNonNull(map, "flushidlems", "flushidle", "flushidleinterval"),
+                        DEFAULT_FLUSH_IDLE_MS);
 
         return new ExternalRuntimeTcpConfig(
                 bufferSize,
                 connectTimeoutMs,
                 readTimeoutMs,
-                calcFieldIndex,
-                calcFieldName,
                 functionClass,
                 functionKind,
                 argFieldIndices,
@@ -145,16 +153,19 @@ final class ExternalRuntimeTcpConfig {
                 reorderResponses,
                 reorderMaxBuffer,
                 postRoleOnly,
-                proxies,
-                selectedProxy);
+                runtimes,
+                runtimeParallelism,
+                batchSize,
+                flushIntervalMs,
+                flushIdleMs);
     }
 
-    private static List<ExternalRuntimeEndpoint> parseProxies(String value) {
+    private static List<ExternalRuntimeEndpoint> parseRuntimes(String value) {
         if (value == null || value.trim().isEmpty()) {
             throw new IllegalArgumentException(
-                    "ExternalRuntimeOperator requires proxies=<host:port> or proxies=<host:send:recv> in conf.");
+                    "ExternalRuntimeOperator requires runtimes=<host:port> or runtimes=<host:send:recv> in conf.");
         }
-        final List<ExternalRuntimeEndpoint> proxies = new ArrayList<>();
+        final List<ExternalRuntimeEndpoint> runtimes = new ArrayList<>();
         final String[] entries = value.split(",");
         for (String entry : entries) {
             final String trimmed = entry.trim();
@@ -164,26 +175,26 @@ final class ExternalRuntimeTcpConfig {
             final String[] parts = trimmed.split(":");
             if (parts.length == 1) {
                 throw new IllegalArgumentException(
-                        "Invalid proxies entry: " + trimmed + " (expected host:port or host:send:recv)");
+                        "Invalid runtimes entry: " + trimmed + " (expected host:port or host:send:recv)");
             } else if (parts.length == 2) {
                 final String h = parts[0].trim();
                 final int port = Integer.parseInt(parts[1].trim());
-                proxies.add(new ExternalRuntimeEndpoint(h, port, port));
+                runtimes.add(new ExternalRuntimeEndpoint(h, port, port));
             } else if (parts.length == 3) {
                 final String h = parts[0].trim();
                 final int send = Integer.parseInt(parts[1].trim());
                 final int recv = Integer.parseInt(parts[2].trim());
-                proxies.add(new ExternalRuntimeEndpoint(h, send, recv));
+                runtimes.add(new ExternalRuntimeEndpoint(h, send, recv));
             } else {
                 throw new IllegalArgumentException(
-                        "Invalid proxies entry: " + trimmed + " (expected host:port or host:send:recv)");
+                        "Invalid runtimes entry: " + trimmed + " (expected host:port or host:send:recv)");
             }
         }
-        if (proxies.isEmpty()) {
+        if (runtimes.isEmpty()) {
             throw new IllegalArgumentException(
-                    "ExternalRuntimeOperator requires at least one proxy entry in proxies=...");
+                    "ExternalRuntimeOperator requires at least one runtime entry in runtimes=...");
         }
-        return proxies;
+        return runtimes;
     }
 
     protected static final class ExternalRuntimeEndpoint {
@@ -303,8 +314,65 @@ final class ExternalRuntimeTcpConfig {
         return this.bufferSize;
     }
 
-    public ExternalRuntimeEndpoint getSelectedProxy() {
-        return this.selectedProxy;
+    public ExternalRuntimeEndpoint selectEndpoint(int subtaskIndex) {
+        return selectEndpoints(subtaskIndex, 1).get(0);
+    }
+
+    public List<ExternalRuntimeEndpoint> selectEndpoints(int subtaskIndex, int totalSubtasks) {
+        if (runtimes.isEmpty()) {
+            throw new IllegalStateException("No external runtime endpoints configured.");
+        }
+        final int max =
+                runtimeParallelism > 0 ? Math.min(runtimeParallelism, runtimes.size()) : runtimes.size();
+        if (max <= 0) {
+            throw new IllegalStateException("External runtime parallelism must be > 0.");
+        }
+        final int normalizedSubtasks = Math.max(1, totalSubtasks);
+        final int normalizedIndex = Math.floorMod(subtaskIndex, normalizedSubtasks);
+        final List<ExternalRuntimeEndpoint> selected = new ArrayList<>();
+        for (int i = 0; i < max; i++) {
+            if (Math.floorMod(i, normalizedSubtasks) == normalizedIndex) {
+                selected.add(runtimes.get(i));
+            }
+        }
+        if (!selected.isEmpty()) {
+            return selected;
+        }
+        final int fallbackIdx = Math.floorMod(subtaskIndex, max);
+        selected.add(runtimes.get(fallbackIdx));
+        return selected;
+    }
+
+    public int getRuntimeParallelism() {
+        return runtimeParallelism;
+    }
+
+    public int getBatchSize() {
+        final int runtimeCount = effectiveRuntimeCount();
+        final int perRuntime = batchSize / runtimeCount;
+        return Math.max(1, perRuntime);
+    }
+
+    private int effectiveRuntimeCount() {
+        final int max =
+                runtimeParallelism > 0 ? Math.min(runtimeParallelism, runtimes.size()) : runtimes.size();
+        return Math.max(1, max);
+    }
+
+    public int getFlushIntervalMs() {
+        return flushIntervalMs;
+    }
+
+    public int getFlushIdleMs() {
+        return flushIdleMs;
+    }
+
+
+    public int selectEndpointIndex(long rowId, int endpointsCount) {
+        if (endpointsCount <= 0) {
+            throw new IllegalStateException("External runtime endpoints count must be > 0.");
+        }
+        return (int) Math.floorMod(rowId, endpointsCount);
     }
 
     public boolean isReorderResponses() {

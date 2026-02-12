@@ -140,6 +140,7 @@ public class ExecutionConfigOptions {
                                     + " enforcing constraints for nested fields adds computational"
                                     + " overhead especially when iterating through collections");
 
+
     @Documentation.TableOption(execMode = Documentation.ExecMode.STREAMING)
     public static final ConfigOption<UpsertMaterialize> TABLE_EXEC_SINK_UPSERT_MATERIALIZE =
             key("table.exec.sink.upsert-materialize")

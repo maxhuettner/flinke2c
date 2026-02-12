@@ -73,6 +73,7 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Map;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
@@ -88,21 +89,28 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
 
     public static final String CALC_TRANSFORMATION = "calc";
 
-    public static final String CUSTOM_PROXY_FUNCTION_CLASS_NAME =
+    public static final String CUSTOM_EXTERNAL_RUNTIME_FUNCTION_CLASS_NAME =
             "org.example.flinke2c.CurrencyConversionFunction";
 
-    protected static final ConfigOption<String> PROXY_CONF_OPTION =
-            ConfigOptions.key("table.exec.proxy.conf").stringType().noDefaultValue();
-    public static final ConfigOption<String> PROXY_FUNCTION_CLASS_OPTION =
-            ConfigOptions.key("table.exec.proxy.function-class")
+    protected static final ConfigOption<String> EXTERNAL_RUNTIME_CONF_OPTION =
+            ConfigOptions.key("table.exec.external-runtime.conf").stringType().noDefaultValue();
+    public static final String EXTERNAL_RUNTIME_CONF_KEY_PREFIX = "table.exec.external-runtime.conf.";
+    public static final String EXTERNAL_RUNTIME_CALC_PARALLELISM_PREFIX =
+            "table.exec.external-runtime.calc-parallelism.";
+    public static final ConfigOption<Integer> EXTERNAL_RUNTIME_CALC_PARALLELISM_OPTION =
+            ConfigOptions.key("table.exec.external-runtime.calc-parallelism")
+                    .intType()
+                    .noDefaultValue();
+    public static final ConfigOption<String> EXTERNAL_RUNTIME_FUNCTION_CLASS_OPTION =
+            ConfigOptions.key("table.exec.external-runtime.function-class")
                     .stringType()
-                    .defaultValue(CUSTOM_PROXY_FUNCTION_CLASS_NAME);
-    public static final ConfigOption<Boolean> PROXY_CHAIN_ONLY_OPTION =
-            ConfigOptions.key("table.exec.proxy.chain-only.enabled")
+                    .noDefaultValue();
+    public static final ConfigOption<Boolean> EXTERNAL_RUNTIME_CHAIN_ONLY_OPTION =
+            ConfigOptions.key("table.exec.external-runtime.chain-only.enabled")
                     .booleanType()
                     .defaultValue(false);
-    public static final String PROXY_FUNCTION_KIND_SCALAR = "scalar";
-    public static final String PROXY_FUNCTION_KIND_FILTER = "filter";
+    public static final String EXTERNAL_RUNTIME_FUNCTION_KIND_SCALAR = "scalar";
+    public static final String EXTERNAL_RUNTIME_FUNCTION_KIND_FILTER = "filter";
 
     public static final String FIELD_NAME_PROJECTION = "projection";
     public static final String FIELD_NAME_CONDITION = "condition";
@@ -160,11 +168,9 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
 
         final RowType inputRowType = extractRowType(inputTransform);
         final RowType outputRowType = (RowType) getOutputType();
-        final String proxyFunctionClass =
-                config.getOptional(PROXY_FUNCTION_CLASS_OPTION)
-                        .orElse(CUSTOM_PROXY_FUNCTION_CLASS_NAME);
-        final ProxyScalarFunctionRewriter rewriter =
-                new ProxyScalarFunctionRewriter(proxyFunctionClass, inputRowType, outputRowType);
+        final List<String> externalRuntimeFunctionClasses = resolveExternalRuntimeFunctionClasses(config);
+        final ExternalRuntimeScalarFunctionRewriter rewriter =
+                new ExternalRuntimeScalarFunctionRewriter(externalRuntimeFunctionClasses, inputRowType, outputRowType);
         final List<RexNode> rewrittenProjection = new ArrayList<>(projection.size());
         for (int i = 0; i < projection.size(); i++) {
             rewriter.setCurrentOutputFieldIndex(i);
@@ -174,64 +180,67 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         final @Nullable RexNode rewrittenCondition =
                 condition == null ? null : condition.accept(rewriter);
 
-        final boolean hasProxyFunction = rewriter.hasProxyFunction();
+        final boolean hasExternalRuntimeFunction = rewriter.hasExternalRuntimeFunction();
         final List<RexNode> effectiveProjection =
-                hasProxyFunction ? rewrittenProjection : projection;
+                hasExternalRuntimeFunction ? rewrittenProjection : projection;
         final @Nullable RexNode effectiveCondition =
-                hasProxyFunction ? rewrittenCondition : condition;
-        final @Nullable String resolvedProxyConf;
-        if (hasProxyFunction) {
-            String proxyConf = rewriter.getProxyConf();
-            if (proxyConf.isEmpty()) {
-                proxyConf = config.getOptional(PROXY_CONF_OPTION).orElse("");
+                hasExternalRuntimeFunction ? rewrittenCondition : condition;
+        final @Nullable String resolvedExternalRuntimeConf;
+        if (hasExternalRuntimeFunction) {
+            String externalRuntimeConf = rewriter.getExternalRuntimeConf();
+            if (externalRuntimeConf.isEmpty()) {
+                externalRuntimeConf = resolveExternalRuntimeConf(config, rewriter.getExternalRuntimeFunctionClass());
             }
-            if (proxyConf.isEmpty()) {
+            if (externalRuntimeConf.isEmpty()) {
                 throw new TableException(
-                        "Proxy scalar function requires a TCP conf literal or table.exec.proxy.conf.");
+                        "External runtime function requires a TCP conf literal, "
+                                + "table.exec.external-runtime.conf, "
+                                + "or table.exec.external-runtime.conf.<functionClass>.");
             }
-            proxyConf =
-                    appendProxyFunctionMetadata(
-                            proxyConf,
-                            rewriter.getProxyFunctionClass(),
-                            rewriter.getProxyFunctionKind());
-            proxyConf =
-                    appendProxyFunctionArgsMetadata(
-                            proxyConf,
-                            rewriter.getProxyArgFieldIndices(),
-                            rewriter.getProxyArgFieldNames(),
-                            rewriter.getProxyArgFieldTypes());
-            proxyConf =
-                    appendProxyFunctionResultMetadata(
-                            proxyConf,
-                            rewriter.getProxyResultFieldIndices(),
-                            rewriter.getProxyResultFieldNames(),
-                            rewriter.getProxyResultFieldTypes(),
-                            rewriter.getProxyResultUdfFieldTypes(),
-                            rewriter.getProxyResultUdfFieldIndices());
+            externalRuntimeConf =
+                    appendExternalRuntimeFunctionMetadata(
+                            externalRuntimeConf,
+                            rewriter.getExternalRuntimeFunctionClass(),
+                            rewriter.getExternalRuntimeFunctionKind());
+            externalRuntimeConf =
+                    appendExternalRuntimeFunctionArgsMetadata(
+                            externalRuntimeConf,
+                            rewriter.getExternalRuntimeArgFieldIndices(),
+                            rewriter.getExternalRuntimeArgFieldNames(),
+                            rewriter.getExternalRuntimeArgFieldTypes());
+            externalRuntimeConf =
+                    appendExternalRuntimeFunctionResultMetadata(
+                            externalRuntimeConf,
+                            rewriter.getExternalRuntimeResultFieldIndices(),
+                            rewriter.getExternalRuntimeResultFieldNames(),
+                            rewriter.getExternalRuntimeResultFieldTypes(),
+                            rewriter.getExternalRuntimeResultUdfFieldTypes(),
+                            rewriter.getExternalRuntimeResultUdfFieldIndices());
             if (LOG.isDebugEnabled()) {
                 LOG.debug(
-                        "Proxy rewrite injecting pre/post operators: functionClass={}, functionKind={}, resultFieldIndices={}",
-                        rewriter.getProxyFunctionClass(),
-                        rewriter.getProxyFunctionKind(),
-                        rewriter.getProxyResultFieldIndices());
+                        "External runtime rewrite injecting pre/post operators: functionClass={}, functionKind={}, resultFieldIndices={}",
+                        rewriter.getExternalRuntimeFunctionClass(),
+                        rewriter.getExternalRuntimeFunctionKind(),
+                        rewriter.getExternalRuntimeResultFieldIndices());
             }
-            resolvedProxyConf = proxyConf;
+            resolvedExternalRuntimeConf = externalRuntimeConf;
         } else {
-            resolvedProxyConf = null;
+            resolvedExternalRuntimeConf = null;
         }
 
-        final Transformation<RowData> proxyInputTransform;
-        if (resolvedProxyConf != null) {
-            final RowType proxyOutputRowType =
+        final Transformation<RowData> externalRuntimeInputTransform;
+        if (resolvedExternalRuntimeConf != null) {
+            final RowType externalRuntimeOutputRowType =
                     applyResultTypes(
                             inputRowType,
-                            rewriter.getProxyResultFieldIndices(),
-                            rewriter.getProxyResultFieldTypes(),
+                            rewriter.getExternalRuntimeResultFieldIndices(),
+                            rewriter.getExternalRuntimeResultFieldTypes(),
                             planner.getFlinkContext().getClassLoader());
-            proxyInputTransform =
-                    createProxyChain(inputTransform, resolvedProxyConf, config, proxyOutputRowType);
+            externalRuntimeInputTransform =
+                    createExternalRuntimeChain(
+                            inputTransform, resolvedExternalRuntimeConf, config, externalRuntimeOutputRowType);
         } else {
-            proxyInputTransform = inputTransform;
+            externalRuntimeInputTransform = inputTransform;
         }
 
         final CodeGeneratorContext ctx =
@@ -241,22 +250,22 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         final CodeGenOperatorFactory<RowData> substituteStreamOperator =
                 CalcCodeGenerator.generateCalcOperator(
                         ctx,
-                        proxyInputTransform,
+                        externalRuntimeInputTransform,
                         (RowType) getOutputType(),
                         JavaScalaConversionUtil.toScala(effectiveProjection),
                         JavaScalaConversionUtil.toScala(Optional.ofNullable(effectiveCondition)),
                         retainHeader,
                         getClass().getSimpleName());
         return ExecNodeUtil.createOneInputTransformation(
-                        proxyInputTransform,
+                        externalRuntimeInputTransform,
                         createTransformationMeta(CALC_TRANSFORMATION, config),
                         substituteStreamOperator,
                         InternalTypeInfo.of(getOutputType()),
-                        proxyInputTransform.getParallelism(),
+                        externalRuntimeInputTransform.getParallelism(),
                         false);
     }
 
-    protected Transformation<RowData> createProxyChain(
+    protected Transformation<RowData> createExternalRuntimeChain(
             Transformation<RowData> input,
             String conf,
             ExecNodeConfig config,
@@ -276,7 +285,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                         input.getParallelism(),
                         input.isParallelismConfigured());
         copyPlacementConstraints(input, pre);
-        if (Boolean.TRUE.equals(config.get(PROXY_CHAIN_ONLY_OPTION))) {
+        if (isChainOnly(config)) {
             pre.setChainingStrategy(ChainingStrategy.ALWAYS);
         }
         setMaxParallelismIfConfigured(input, pre);
@@ -294,7 +303,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                         pre.getParallelism(),
                         pre.isParallelismConfigured());
         copyPlacementConstraints(input, post);
-        if (Boolean.TRUE.equals(config.get(PROXY_CHAIN_ONLY_OPTION))) {
+        if (isChainOnly(config)) {
             post.setChainingStrategy(ChainingStrategy.HEAD);
         }
         setMaxParallelismIfConfigured(input, post);
@@ -302,9 +311,9 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         return post;
     }
 
-    protected Transformation<RowData> createProxyChain(
+    protected Transformation<RowData> createExternalRuntimeChain(
             Transformation<RowData> input, String conf, ExecNodeConfig config) {
-        return createProxyChain(input, conf, config, null);
+        return createExternalRuntimeChain(input, conf, config, null);
     }
 
     protected static void copyPlacementConstraints(Transformation<?> from, Transformation<?> to) {
@@ -320,6 +329,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             to.setMaxParallelism(from.getMaxParallelism());
         }
     }
+
 
     @SuppressWarnings("unchecked")
     protected static RowType extractRowType(Transformation<RowData> input) {
@@ -367,7 +377,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         return RowType.of(types, names);
     }
 
-    protected static String appendProxyFunctionMetadata(
+    protected static String appendExternalRuntimeFunctionMetadata(
             String conf, @Nullable String functionClass, @Nullable String functionKind) {
         String result = conf;
         if (functionClass != null
@@ -385,7 +395,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         return result;
     }
 
-    protected static String appendProxyFunctionArgsMetadata(
+    protected static String appendExternalRuntimeFunctionArgsMetadata(
             String conf,
             @Nullable List<Integer> argFieldIndices,
             @Nullable List<String> argFieldNames,
@@ -421,7 +431,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         return result;
     }
 
-    protected static String appendProxyFunctionResultMetadata(
+    protected static String appendExternalRuntimeFunctionResultMetadata(
             String conf,
             @Nullable List<Integer> resultFieldIndices,
             @Nullable List<String> resultFieldNames,
@@ -509,6 +519,138 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         return conf + ";" + key + "=" + value;
     }
 
+    public static List<String> parseExternalRuntimeFunctionClasses(
+            @Nullable String value, String defaultClass) {
+        final List<String> classes = new ArrayList<>();
+        if (value != null && !value.trim().isEmpty()) {
+            final String[] parts = value.split(",");
+            for (String part : parts) {
+                final String trimmed = part.trim();
+                if (!trimmed.isEmpty()) {
+                    classes.add(trimmed);
+                }
+            }
+        }
+        if (classes.isEmpty() && defaultClass != null && !defaultClass.isEmpty()) {
+            classes.add(defaultClass);
+        }
+        return classes;
+    }
+
+    public static @Nullable String resolveFunctionClassConfig(ReadableConfig config) {
+        return config.getOptional(EXTERNAL_RUNTIME_FUNCTION_CLASS_OPTION).orElse(null);
+    }
+
+    public static List<String> resolveExternalRuntimeFunctionClasses(ReadableConfig config) {
+        return parseExternalRuntimeFunctionClasses(
+                resolveFunctionClassConfig(config), CUSTOM_EXTERNAL_RUNTIME_FUNCTION_CLASS_NAME);
+    }
+
+    public static @Nullable Integer resolveExternalRuntimeCalcParallelism(
+            ExecNodeConfig config, List<RexNode> projection, @Nullable RexNode condition) {
+        final Integer global = config.getOptional(EXTERNAL_RUNTIME_CALC_PARALLELISM_OPTION).orElse(null);
+        if (global != null) {
+            return global;
+        }
+        final Map<String, String> map = config.toMap();
+        if (map.isEmpty()) {
+            return null;
+        }
+        final Map<String, Integer> configured = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : map.entrySet()) {
+            final String key = entry.getKey();
+            if (!key.startsWith(EXTERNAL_RUNTIME_CALC_PARALLELISM_PREFIX)) {
+                continue;
+            }
+            final String suffix = key.substring(EXTERNAL_RUNTIME_CALC_PARALLELISM_PREFIX.length());
+            if (suffix.isEmpty()) {
+                continue;
+            }
+            final String value = entry.getValue();
+            if (value == null || value.trim().isEmpty()) {
+                continue;
+            }
+            try {
+                configured.put(suffix, Integer.parseInt(value.trim()));
+            } catch (NumberFormatException e) {
+                throw new TableException(
+                        "Invalid external runtime calc parallelism for " + suffix + ": " + value,
+                        e);
+            }
+        }
+        if (configured.isEmpty()) {
+            return null;
+        }
+        final String matched =
+                findExternalRuntimeFunctionClass(new ArrayList<>(configured.keySet()), projection, condition);
+        if (matched != null) {
+            return configured.get(matched);
+        }
+        if (configured.size() == 1) {
+            final Map.Entry<String, Integer> entry = configured.entrySet().iterator().next();
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "External runtime calc parallelism fallback: no match found, applying {}={}",
+                        entry.getKey(),
+                        entry.getValue());
+            }
+            return entry.getValue();
+        }
+        return null;
+    }
+
+    public static String resolveExternalRuntimeConf(ReadableConfig config, @Nullable String functionClass) {
+        return resolveExternalRuntimeConfWithPrefix(
+                config, functionClass, EXTERNAL_RUNTIME_CONF_KEY_PREFIX, EXTERNAL_RUNTIME_CONF_OPTION);
+    }
+
+    private static String resolveExternalRuntimeConfWithPrefix(
+            ReadableConfig config,
+            @Nullable String functionClass,
+            String prefix,
+            ConfigOption<String> fallback) {
+        if (functionClass != null && !functionClass.isEmpty()) {
+            final String directKey = prefix + functionClass;
+            final String direct =
+                    config.getOptional(ConfigOptions.key(directKey).stringType().noDefaultValue())
+                            .orElse("");
+            if (!direct.isEmpty()) {
+                return direct;
+            }
+            final String simple = deriveSimpleName(functionClass);
+            if (simple != null && !simple.isEmpty()) {
+                final String simpleKey = prefix + simple;
+                final String simpleValue =
+                        config.getOptional(
+                                        ConfigOptions.key(simpleKey)
+                                                .stringType()
+                                                .noDefaultValue())
+                                .orElse("");
+                if (!simpleValue.isEmpty()) {
+                    return simpleValue;
+                }
+            }
+        }
+        return config.getOptional(fallback).orElse("");
+    }
+
+    private static String deriveSimpleName(String className) {
+        if (className == null) {
+            return null;
+        }
+        final int lastDot = className.lastIndexOf('.');
+        String simple = lastDot < 0 ? className : className.substring(lastDot + 1);
+        final int suffixIndex = simple.indexOf('$');
+        if (suffixIndex > 0) {
+            simple = simple.substring(0, suffixIndex);
+        }
+        return simple;
+    }
+
+    private static boolean isChainOnly(ReadableConfig config) {
+        return Boolean.TRUE.equals(config.get(EXTERNAL_RUNTIME_CHAIN_ONLY_OPTION));
+    }
+
     private static String joinIntList(List<Integer> values) {
         final StringBuilder sb = new StringBuilder(values.size() * 4);
         for (int i = 0; i < values.size(); i++) {
@@ -566,7 +708,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         return false;
     }
 
-    private static boolean isProxyScalarFunction(
+    private static boolean isExternalRuntimeScalarFunction(
             RexCall call, String targetClassName, @Nullable String targetSimpleName) {
         final SqlOperator operator = call.getOperator();
         if (matchesOperatorName(operator.getName(), targetSimpleName)) {
@@ -574,7 +716,8 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         }
         if (operator instanceof ScalarSqlFunction) {
             final ScalarSqlFunction function = (ScalarSqlFunction) operator;
-            return targetClassName.equals(function.scalarFunction().getClass().getName());
+            return classNameEquals(
+                    targetClassName, function.scalarFunction().getClass().getName());
         }
         if (operator instanceof BridgingSqlFunction) {
             final BridgingSqlFunction bridging = (BridgingSqlFunction) operator;
@@ -600,28 +743,35 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         if (definition instanceof ScalarFunctionDefinition) {
             final ScalarFunction scalarFunction =
                     ((ScalarFunctionDefinition) definition).getScalarFunction();
-            return targetClassName.equals(scalarFunction.getClass().getName());
+            return classNameEquals(targetClassName, scalarFunction.getClass().getName());
         }
         if (definition instanceof ScalarFunction) {
-            return targetClassName.equals(definition.getClass().getName());
+            return classNameEquals(targetClassName, definition.getClass().getName());
         }
         return false;
     }
 
-    private static boolean isSupportedProxyOperand(RexNode operand) {
+    private static boolean classNameEquals(String expected, String actual) {
+        if (expected == null || actual == null) {
+            return false;
+        }
+        return expected.equals(actual) || expected.equalsIgnoreCase(actual);
+    }
+
+    private static boolean isSupportedExternalRuntimeOperand(RexNode operand) {
         if (operand instanceof RexInputRef || operand instanceof RexFieldAccess) {
             return true;
         }
         if (operand instanceof RexCall) {
             final RexCall call = (RexCall) operand;
             if (call.getKind() == SqlKind.CAST || call.getKind() == SqlKind.AS) {
-                return isSupportedProxyOperand(call.getOperands().get(0));
+                return isSupportedExternalRuntimeOperand(call.getOperands().get(0));
             }
         }
         return false;
     }
 
-    private static String mergeProxyConf(@Nullable String existing, String conf) {
+    private static String mergeExternalRuntimeConf(@Nullable String existing, String conf) {
         if (conf == null || conf.isEmpty()) {
             return existing == null ? "" : existing;
         }
@@ -630,12 +780,12 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         }
         if (!existing.equals(conf)) {
             throw new TableException(
-                    "Proxy scalar function requires a single, consistent conf literal.");
+                    "External runtime function requires a single, consistent conf literal.");
         }
         return existing;
     }
 
-    private static String extractProxyConf(List<RexNode> operands) {
+    private static String extractExternalRuntimeConf(List<RexNode> operands) {
         for (RexNode operand : operands) {
             if (operand instanceof RexLiteral) {
                 final String conf = RexLiteral.stringValue((RexLiteral) operand);
@@ -650,29 +800,28 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         return "";
     }
 
-    public static final class ProxyScalarFunctionRewriter extends RexShuttle {
-        private final String targetClassName;
-        private final String targetSimpleName;
+    public static final class ExternalRuntimeScalarFunctionRewriter extends RexShuttle {
+        private final List<TargetFunction> targets;
         private final RowType inputRowType;
         private final RowType outputRowType;
-        private boolean proxyFunctionFound;
-        private String proxyFunctionKind = PROXY_FUNCTION_KIND_SCALAR;
-        private @Nullable String proxyConf;
+        private boolean externalRuntimeFunctionFound;
+        private String externalRuntimeFunctionKind = EXTERNAL_RUNTIME_FUNCTION_KIND_SCALAR;
+        private @Nullable String matchedFunctionClass;
+        private @Nullable String externalRuntimeConf;
         private int currentOutputFieldIndex = -1;
         private @Nullable Integer currentUdfFieldIndexOverride;
-        private final List<Integer> proxyArgFieldIndices = new ArrayList<>();
-        private final List<String> proxyArgFieldNames = new ArrayList<>();
-        private final List<String> proxyArgFieldTypes = new ArrayList<>();
-        private final List<Integer> proxyResultFieldIndices = new ArrayList<>();
-        private final List<String> proxyResultFieldNames = new ArrayList<>();
-        private final List<String> proxyResultFieldTypes = new ArrayList<>();
-        private final List<Integer> proxyResultUdfFieldIndices = new ArrayList<>();
-        private final List<String> proxyResultUdfFieldTypes = new ArrayList<>();
+        private final List<Integer> externalRuntimeArgFieldIndices = new ArrayList<>();
+        private final List<String> externalRuntimeArgFieldNames = new ArrayList<>();
+        private final List<String> externalRuntimeArgFieldTypes = new ArrayList<>();
+        private final List<Integer> externalRuntimeResultFieldIndices = new ArrayList<>();
+        private final List<String> externalRuntimeResultFieldNames = new ArrayList<>();
+        private final List<String> externalRuntimeResultFieldTypes = new ArrayList<>();
+        private final List<Integer> externalRuntimeResultUdfFieldIndices = new ArrayList<>();
+        private final List<String> externalRuntimeResultUdfFieldTypes = new ArrayList<>();
 
-        public ProxyScalarFunctionRewriter(
-                String targetClassName, RowType inputRowType, RowType outputRowType) {
-            this.targetClassName = checkNotNull(targetClassName, "targetClassName");
-            this.targetSimpleName = deriveSimpleName(targetClassName);
+        public ExternalRuntimeScalarFunctionRewriter(
+                List<String> targetClassNames, RowType inputRowType, RowType outputRowType) {
+            this.targets = buildTargets(targetClassNames);
             this.inputRowType = checkNotNull(inputRowType, "inputRowType");
             this.outputRowType = checkNotNull(outputRowType, "outputRowType");
         }
@@ -683,15 +832,15 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
 
         @Override
         public RexNode visitFieldAccess(RexFieldAccess fieldAccess) {
-            final RexCall proxyCall = unwrapProxyCall(fieldAccess.getReferenceExpr());
-            if (proxyCall == null || fieldAccess.getField() == null) {
+            final RexCall externalRuntimeCall = unwrapExternalRuntimeCall(fieldAccess.getReferenceExpr());
+            if (externalRuntimeCall == null || fieldAccess.getField() == null) {
                 return super.visitFieldAccess(fieldAccess);
             }
             final int udfFieldIndex = fieldAccess.getField().getIndex();
             currentUdfFieldIndexOverride = udfFieldIndex;
             try {
-                // Drop the field access; the proxy uses the recorded udfFieldIndex.
-                return proxyCall.accept(this);
+                // Drop the field access; the external runtime uses the recorded udfFieldIndex.
+                return externalRuntimeCall.accept(this);
             } finally {
                 currentUdfFieldIndexOverride = null;
             }
@@ -699,20 +848,27 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
 
         @Override
         public RexNode visitCall(RexCall call) {
-            if (!isProxyScalarFunction(call, targetClassName, targetSimpleName)) {
+            final TargetFunction match = matchTarget(call);
+            if (match == null) {
                 return super.visitCall(call);
             }
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Proxy rewrite matched UDF: {}", targetClassName);
+                LOG.debug("External runtime rewrite matched UDF: {}", match.className);
+            }
+            if (matchedFunctionClass == null) {
+                matchedFunctionClass = match.className;
+            } else if (!matchedFunctionClass.equals(match.className)) {
+                throw new TableException(
+                        "External runtime function supports a single function class per Calc.");
             }
             final List<RexNode> operands = call.getOperands();
             if (operands.isEmpty()) {
-                throw new TableException("Proxy scalar function requires at least one argument.");
+                throw new TableException("External runtime function requires at least one argument.");
             }
-            proxyFunctionFound = true;
-            proxyConf = mergeProxyConf(proxyConf, extractProxyConf(operands));
+            externalRuntimeFunctionFound = true;
+            externalRuntimeConf = mergeExternalRuntimeConf(externalRuntimeConf, extractExternalRuntimeConf(operands));
             if (currentOutputFieldIndex < 0) {
-                proxyFunctionKind = PROXY_FUNCTION_KIND_FILTER;
+                externalRuntimeFunctionKind = EXTERNAL_RUNTIME_FUNCTION_KIND_FILTER;
             }
             boolean foundFieldArg = false;
             RexNode firstFieldOperand = null;
@@ -721,14 +877,14 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                 if (operand instanceof RexLiteral || operand.getKind() == SqlKind.DEFAULT) {
                     continue;
                 }
-                if (!isSupportedProxyOperand(operand)) {
+                if (!isSupportedExternalRuntimeOperand(operand)) {
                     throw new TableException(
-                            "Proxy scalar function requires column references for all non-literal arguments.");
+                            "External runtime function requires column references for all non-literal arguments.");
                 }
-                final @Nullable Integer fieldIndex = extractProxyFieldIndex(operand);
+                final @Nullable Integer fieldIndex = extractExternalRuntimeFieldIndex(operand);
                 if (fieldIndex == null) {
                     throw new TableException(
-                            "Proxy scalar function requires input references as arguments.");
+                            "External runtime function requires input references as arguments.");
                 }
                 addArgField(operand, fieldIndex);
                 if (firstFieldOperand == null) {
@@ -739,7 +895,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             }
             if (!foundFieldArg) {
                 throw new TableException(
-                        "Proxy scalar function requires at least one column reference argument.");
+                        "External runtime function requires at least one column reference argument.");
             }
             if (currentOutputFieldIndex < 0) {
                 return call;
@@ -749,68 +905,61 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             return firstFieldOperand.accept(this);
         }
 
-        public boolean hasProxyFunction() {
-            return proxyFunctionFound;
+        public boolean hasExternalRuntimeFunction() {
+            return externalRuntimeFunctionFound;
         }
 
-        public String getProxyConf() {
-            return proxyConf == null ? "" : proxyConf;
+        public String getExternalRuntimeConf() {
+            return externalRuntimeConf == null ? "" : externalRuntimeConf;
         }
 
-        public String getProxyFunctionClass() {
-            return targetClassName;
-        }
-
-        public String getProxyFunctionKind() {
-            return proxyFunctionKind;
-        }
-
-        public List<Integer> getProxyArgFieldIndices() {
-            return proxyArgFieldIndices;
-        }
-
-        public List<String> getProxyArgFieldNames() {
-            return proxyArgFieldNames;
-        }
-
-        public List<String> getProxyArgFieldTypes() {
-            return proxyArgFieldTypes;
-        }
-
-        public List<Integer> getProxyResultFieldIndices() {
-            return proxyResultFieldIndices;
-        }
-
-        public List<String> getProxyResultFieldNames() {
-            return proxyResultFieldNames;
-        }
-
-        public List<String> getProxyResultFieldTypes() {
-            return proxyResultFieldTypes;
-        }
-
-        public List<Integer> getProxyResultUdfFieldIndices() {
-            return proxyResultUdfFieldIndices;
-        }
-
-        public List<String> getProxyResultUdfFieldTypes() {
-            return proxyResultUdfFieldTypes;
-        }
-
-        private static String deriveSimpleName(String className) {
-            final int lastDot = className.lastIndexOf('.');
-            String simple = lastDot < 0 ? className : className.substring(lastDot + 1);
-            final int suffixIndex = simple.indexOf('$');
-            if (suffixIndex > 0) {
-                simple = simple.substring(0, suffixIndex);
+        public String getExternalRuntimeFunctionClass() {
+            if (matchedFunctionClass != null) {
+                return matchedFunctionClass;
             }
-            return simple;
+            return targets.isEmpty() ? "" : targets.get(0).className;
+        }
+
+        public String getExternalRuntimeFunctionKind() {
+            return externalRuntimeFunctionKind;
+        }
+
+        public List<Integer> getExternalRuntimeArgFieldIndices() {
+            return externalRuntimeArgFieldIndices;
+        }
+
+        public List<String> getExternalRuntimeArgFieldNames() {
+            return externalRuntimeArgFieldNames;
+        }
+
+        public List<String> getExternalRuntimeArgFieldTypes() {
+            return externalRuntimeArgFieldTypes;
+        }
+
+        public List<Integer> getExternalRuntimeResultFieldIndices() {
+            return externalRuntimeResultFieldIndices;
+        }
+
+        public List<String> getExternalRuntimeResultFieldNames() {
+            return externalRuntimeResultFieldNames;
+        }
+
+        public List<String> getExternalRuntimeResultFieldTypes() {
+            return externalRuntimeResultFieldTypes;
+        }
+
+        public List<Integer> getExternalRuntimeResultUdfFieldIndices() {
+            return externalRuntimeResultUdfFieldIndices;
+        }
+
+        public List<String> getExternalRuntimeResultUdfFieldTypes() {
+            return externalRuntimeResultUdfFieldTypes;
         }
 
         private void addArgField(int fieldIndex) {
-            proxyArgFieldIndices.add(fieldIndex);
-            proxyArgFieldNames.add(resolveFieldName(inputRowType, fieldIndex));
-            proxyArgFieldTypes.add(resolveFieldType(inputRowType, fieldIndex));
+            externalRuntimeArgFieldIndices.add(fieldIndex);
+            externalRuntimeArgFieldNames.add(resolveFieldName(inputRowType, fieldIndex));
+            externalRuntimeArgFieldTypes.add(resolveFieldType(inputRowType, fieldIndex));
         }
 
         private void addResultField(
@@ -823,14 +972,14 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             if (targetFieldIndex == null || targetFieldIndex < 0) {
                 return;
             }
-            if (proxyResultFieldIndices.contains(targetFieldIndex)) {
+            if (externalRuntimeResultFieldIndices.contains(targetFieldIndex)) {
                 return;
             }
-            proxyResultFieldIndices.add(targetFieldIndex);
-            proxyResultFieldNames.add(resolveFieldName(outputRowType, currentOutputFieldIndex));
-            proxyResultFieldTypes.add(resolveFieldType(outputRowType, currentOutputFieldIndex));
-            proxyResultUdfFieldIndices.add(udfFieldIndex == null ? -1 : udfFieldIndex);
-            proxyResultUdfFieldTypes.add(udfFieldType);
+            externalRuntimeResultFieldIndices.add(targetFieldIndex);
+            externalRuntimeResultFieldNames.add(resolveFieldName(outputRowType, currentOutputFieldIndex));
+            externalRuntimeResultFieldTypes.add(resolveFieldType(outputRowType, currentOutputFieldIndex));
+            externalRuntimeResultUdfFieldIndices.add(udfFieldIndex == null ? -1 : udfFieldIndex);
+            externalRuntimeResultUdfFieldTypes.add(udfFieldType);
         }
 
         private @Nullable String resolveUdfReturnType(
@@ -851,28 +1000,116 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                     : FlinkTypeFactory.toLogicalType(relType).asSerializableString();
         }
 
-        private @Nullable RexCall unwrapProxyCall(RexNode node) {
+        private @Nullable RexCall unwrapExternalRuntimeCall(RexNode node) {
             if (!(node instanceof RexCall)) {
                 return null;
             }
             final RexCall call = (RexCall) node;
-            if (isProxyScalarFunction(call, targetClassName, targetSimpleName)) {
+            if (matchTarget(call) != null) {
                 return call;
             }
             if (call.getKind() == SqlKind.CAST || call.getKind() == SqlKind.AS) {
-                return unwrapProxyCall(call.getOperands().get(0));
+                return unwrapExternalRuntimeCall(call.getOperands().get(0));
             }
             return null;
         }
 
         private void addArgField(RexNode operand, int fieldIndex) {
-            proxyArgFieldIndices.add(fieldIndex);
-            proxyArgFieldNames.add(resolveFieldName(inputRowType, fieldIndex));
-            proxyArgFieldTypes.add(resolveOperandType(inputRowType, operand, fieldIndex));
+            externalRuntimeArgFieldIndices.add(fieldIndex);
+            externalRuntimeArgFieldNames.add(resolveFieldName(inputRowType, fieldIndex));
+            externalRuntimeArgFieldTypes.add(resolveOperandType(inputRowType, operand, fieldIndex));
+        }
+
+        private TargetFunction matchTarget(RexCall call) {
+            for (TargetFunction target : targets) {
+                if (isExternalRuntimeScalarFunction(call, target.className, target.simpleName)) {
+                    return target;
+                }
+            }
+            return null;
         }
     }
 
-    private static @Nullable Integer extractProxyFieldIndex(RexNode operand) {
+    private static List<TargetFunction> buildTargets(List<String> classNames) {
+        final List<TargetFunction> targets = new ArrayList<>();
+        if (classNames != null) {
+            for (String className : classNames) {
+                if (className == null || className.trim().isEmpty()) {
+                    continue;
+                }
+                targets.add(new TargetFunction(className.trim(), deriveSimpleName(className)));
+            }
+        }
+        return targets;
+    }
+
+    private static final class TargetFunction {
+        private final String className;
+        private final String simpleName;
+
+        private TargetFunction(String className, String simpleName) {
+            this.className = className;
+            this.simpleName = simpleName;
+        }
+    }
+
+    private static @Nullable String findExternalRuntimeFunctionClass(
+            List<String> classNames, List<RexNode> projection, @Nullable RexNode condition) {
+        if (classNames == null || classNames.isEmpty()) {
+            return null;
+        }
+        final ExternalRuntimeFunctionDetector detector =
+                new ExternalRuntimeFunctionDetector(buildTargets(classNames));
+        for (RexNode node : projection) {
+            detector.scan(node);
+        }
+        if (condition != null) {
+            detector.scan(condition);
+        }
+        return detector.getMatchedClass();
+    }
+
+    private static final class ExternalRuntimeFunctionDetector {
+        private final List<TargetFunction> targets;
+        private @Nullable String matchedClass;
+
+        private ExternalRuntimeFunctionDetector(List<TargetFunction> targets) {
+            this.targets = targets;
+        }
+
+        private void scan(@Nullable RexNode node) {
+            if (node == null) {
+                return;
+            }
+            if (node instanceof RexCall) {
+                final RexCall call = (RexCall) node;
+                for (TargetFunction target : targets) {
+                    if (isExternalRuntimeScalarFunction(call, target.className, target.simpleName)) {
+                        if (matchedClass == null) {
+                            matchedClass = target.className;
+                        } else if (!matchedClass.equals(target.className)) {
+                            throw new TableException(
+                                    "External runtime calc parallelism requires a single function class per Calc.");
+                        }
+                        break;
+                    }
+                }
+                for (RexNode operand : call.getOperands()) {
+                    scan(operand);
+                }
+                return;
+            }
+            if (node instanceof RexFieldAccess) {
+                scan(((RexFieldAccess) node).getReferenceExpr());
+            }
+        }
+
+        private @Nullable String getMatchedClass() {
+            return matchedClass;
+        }
+    }
+
+    private static @Nullable Integer extractExternalRuntimeFieldIndex(RexNode operand) {
         if (operand instanceof RexInputRef) {
             return ((RexInputRef) operand).getIndex();
         }
@@ -884,7 +1121,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             if (ref instanceof RexCall) {
                 final RexCall call = (RexCall) ref;
                 if (call.getKind() == SqlKind.CAST || call.getKind() == SqlKind.AS) {
-                    return extractProxyFieldIndex(call.getOperands().get(0));
+                    return extractExternalRuntimeFieldIndex(call.getOperands().get(0));
                 }
             }
             return null;
@@ -892,7 +1129,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         if (operand instanceof RexCall) {
             final RexCall call = (RexCall) operand;
             if (call.getKind() == SqlKind.CAST || call.getKind() == SqlKind.AS) {
-                return extractProxyFieldIndex(call.getOperands().get(0));
+                return extractExternalRuntimeFieldIndex(call.getOperands().get(0));
             }
         }
         return null;
@@ -902,7 +1139,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         final List<RowType.RowField> fields = rowType.getFields();
         if (fieldIndex < 0 || fieldIndex >= fields.size()) {
             throw new TableException(
-                    "Proxy scalar function argument index out of bounds: " + fieldIndex);
+                    "External runtime function argument index out of bounds: " + fieldIndex);
         }
         return fields.get(fieldIndex).getName();
     }
@@ -911,7 +1148,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         final List<RowType.RowField> fields = rowType.getFields();
         if (fieldIndex < 0 || fieldIndex >= fields.size()) {
             throw new TableException(
-                    "Proxy scalar function argument index out of bounds: " + fieldIndex);
+                    "External runtime function argument index out of bounds: " + fieldIndex);
         }
         return fields.get(fieldIndex).getType().asSerializableString();
     }

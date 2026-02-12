@@ -554,7 +554,8 @@ final class ExternalRuntimeBinaryCodec {
                 return WireType.BYTES;
             default:
                 throw new TableException(
-                        "Unsupported logical type for proxy wire format: " + type.asSerializableString());
+                        "Unsupported logical type for external runtime wire format: "
+                                + type.asSerializableString());
         }
     }
 

@@ -66,42 +66,35 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
 
     private static final Logger LOG = LoggerFactory.getLogger(StreamExecCalc.class);
 
-    public static final String FIELD_NAME_PROXY_CONF = "proxyConf";
-    public static final String FIELD_NAME_PROXY_FIELD_INDEX = "proxyFieldIndex";
-    public static final String FIELD_NAME_PROXY_FIELD_NAME = "proxyFieldName";
-    public static final String FIELD_NAME_PROXY_FUNCTION_CLASS = "proxyFunctionClass";
-    public static final String FIELD_NAME_PROXY_FUNCTION_KIND = "proxyFunctionKind";
-    public static final String FIELD_NAME_PROXY_ARG_FIELD_INDICES = "proxyArgFieldIndices";
-    public static final String FIELD_NAME_PROXY_ARG_FIELD_NAMES = "proxyArgFieldNames";
-    public static final String FIELD_NAME_PROXY_ARG_FIELD_TYPES = "proxyArgFieldTypes";
-    public static final String FIELD_NAME_PROXY_RESULT_FIELD_INDICES = "proxyResultFieldIndices";
-    public static final String FIELD_NAME_PROXY_RESULT_FIELD_NAMES = "proxyResultFieldNames";
-    public static final String FIELD_NAME_PROXY_RESULT_FIELD_TYPES = "proxyResultFieldTypes";
-    public static final String FIELD_NAME_PROXY_RESULT_UDF_FIELD_TYPES =
-            "proxyResultUdfFieldTypes";
-    public static final String FIELD_NAME_PROXY_RESULT_UDF_FIELD_INDICES =
-            "proxyResultUdfFieldIndices";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_CONF = "externalRuntimeConf";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_FIELD_INDEX = "externalRuntimeFieldIndex";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_FIELD_NAME = "externalRuntimeFieldName";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_FUNCTION_CLASS = "externalRuntimeFunctionClass";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_FUNCTION_KIND = "externalRuntimeFunctionKind";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_ARG_FIELD_INDICES = "externalRuntimeArgFieldIndices";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_ARG_FIELD_NAMES = "externalRuntimeArgFieldNames";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_ARG_FIELD_TYPES = "externalRuntimeArgFieldTypes";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_RESULT_FIELD_INDICES = "externalRuntimeResultFieldIndices";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_RESULT_FIELD_NAMES = "externalRuntimeResultFieldNames";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_RESULT_FIELD_TYPES = "externalRuntimeResultFieldTypes";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_RESULT_UDF_FIELD_TYPES =
+            "externalRuntimeResultUdfFieldTypes";
+    public static final String FIELD_NAME_EXTERNAL_RUNTIME_RESULT_UDF_FIELD_INDICES =
+            "externalRuntimeResultUdfFieldIndices";
 
-    private final @Nullable String proxyConf;
-    private final @Nullable Integer proxyFieldIndex;
-    private final @Nullable String proxyFieldName;
-    private final @Nullable String proxyFunctionClass;
-    private final @Nullable String proxyFunctionKind;
-    private final @Nullable List<Integer> proxyArgFieldIndices;
-    private final @Nullable List<String> proxyArgFieldNames;
-    private final @Nullable List<String> proxyArgFieldTypes;
-    private final @Nullable List<Integer> proxyResultFieldIndices;
-    private final @Nullable List<String> proxyResultFieldNames;
-    private final @Nullable List<String> proxyResultFieldTypes;
-    private final @Nullable List<String> proxyResultUdfFieldTypes;
-    private final @Nullable List<Integer> proxyResultUdfFieldIndices;
-
-    static {
-        final String source =
-                String.valueOf(StreamExecCalc.class.getProtectionDomain().getCodeSource());
-        LOG.warn("StreamExecCalc class loaded from {}", source);
-        System.err.println("StreamExecCalc class loaded from " + source);
-    }
+    private final @Nullable String externalRuntimeConf;
+    private final @Nullable Integer externalRuntimeFieldIndex;
+    private final @Nullable String externalRuntimeFieldName;
+    private final @Nullable String externalRuntimeFunctionClass;
+    private final @Nullable String externalRuntimeFunctionKind;
+    private final @Nullable List<Integer> externalRuntimeArgFieldIndices;
+    private final @Nullable List<String> externalRuntimeArgFieldNames;
+    private final @Nullable List<String> externalRuntimeArgFieldTypes;
+    private final @Nullable List<Integer> externalRuntimeResultFieldIndices;
+    private final @Nullable List<String> externalRuntimeResultFieldNames;
+    private final @Nullable List<String> externalRuntimeResultFieldTypes;
+    private final @Nullable List<String> externalRuntimeResultUdfFieldTypes;
+    private final @Nullable List<Integer> externalRuntimeResultUdfFieldIndices;
 
     public StreamExecCalc(
             ReadableConfig tableConfig,
@@ -127,7 +120,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             InputProperty inputProperty,
             RowType outputType,
             String description,
-            @Nullable String proxyConf) {
+            @Nullable String externalRuntimeConf) {
         this(
                 ExecNodeContext.newNodeId(),
                 ExecNodeContext.newContext(StreamExecCalc.class),
@@ -137,7 +130,7 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 Collections.singletonList(inputProperty),
                 outputType,
                 description,
-                proxyConf,
+                externalRuntimeConf,
                 null,
                 null,
                 null,
@@ -159,19 +152,19 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             InputProperty inputProperty,
             RowType outputType,
             String description,
-            @Nullable String proxyConf,
-            @Nullable Integer proxyFieldIndex,
-            @Nullable String proxyFieldName,
-            @Nullable String proxyFunctionClass,
-            @Nullable String proxyFunctionKind,
-            @Nullable List<Integer> proxyArgFieldIndices,
-            @Nullable List<String> proxyArgFieldNames,
-            @Nullable List<String> proxyArgFieldTypes,
-            @Nullable List<Integer> proxyResultFieldIndices,
-            @Nullable List<String> proxyResultFieldNames,
-            @Nullable List<String> proxyResultFieldTypes,
-            @Nullable List<String> proxyResultUdfFieldTypes,
-            @Nullable List<Integer> proxyResultUdfFieldIndices) {
+            @Nullable String externalRuntimeConf,
+            @Nullable Integer externalRuntimeFieldIndex,
+            @Nullable String externalRuntimeFieldName,
+            @Nullable String externalRuntimeFunctionClass,
+            @Nullable String externalRuntimeFunctionKind,
+            @Nullable List<Integer> externalRuntimeArgFieldIndices,
+            @Nullable List<String> externalRuntimeArgFieldNames,
+            @Nullable List<String> externalRuntimeArgFieldTypes,
+            @Nullable List<Integer> externalRuntimeResultFieldIndices,
+            @Nullable List<String> externalRuntimeResultFieldNames,
+            @Nullable List<String> externalRuntimeResultFieldTypes,
+            @Nullable List<String> externalRuntimeResultUdfFieldTypes,
+            @Nullable List<Integer> externalRuntimeResultUdfFieldIndices) {
         this(
                 ExecNodeContext.newNodeId(),
                 ExecNodeContext.newContext(StreamExecCalc.class),
@@ -181,19 +174,19 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 Collections.singletonList(inputProperty),
                 outputType,
                 description,
-                proxyConf,
-                proxyFieldIndex,
-                proxyFieldName,
-                proxyFunctionClass,
-                proxyFunctionKind,
-                proxyArgFieldIndices,
-                proxyArgFieldNames,
-                proxyArgFieldTypes,
-                proxyResultFieldIndices,
-                proxyResultFieldNames,
-                proxyResultFieldTypes,
-                proxyResultUdfFieldTypes,
-                proxyResultUdfFieldIndices);
+                externalRuntimeConf,
+                externalRuntimeFieldIndex,
+                externalRuntimeFieldName,
+                externalRuntimeFunctionClass,
+                externalRuntimeFunctionKind,
+                externalRuntimeArgFieldIndices,
+                externalRuntimeArgFieldNames,
+                externalRuntimeArgFieldTypes,
+                externalRuntimeResultFieldIndices,
+                externalRuntimeResultFieldNames,
+                externalRuntimeResultFieldTypes,
+                externalRuntimeResultUdfFieldTypes,
+                externalRuntimeResultUdfFieldIndices);
     }
 
     @JsonCreator
@@ -206,27 +199,27 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
             @JsonProperty(FIELD_NAME_INPUT_PROPERTIES) List<InputProperty> inputProperties,
             @JsonProperty(FIELD_NAME_OUTPUT_TYPE) RowType outputType,
             @JsonProperty(FIELD_NAME_DESCRIPTION) String description,
-            @JsonProperty(FIELD_NAME_PROXY_CONF) @Nullable String proxyConf,
-            @JsonProperty(FIELD_NAME_PROXY_FIELD_INDEX) @Nullable Integer proxyFieldIndex,
-            @JsonProperty(FIELD_NAME_PROXY_FIELD_NAME) @Nullable String proxyFieldName,
-            @JsonProperty(FIELD_NAME_PROXY_FUNCTION_CLASS) @Nullable String proxyFunctionClass,
-            @JsonProperty(FIELD_NAME_PROXY_FUNCTION_KIND) @Nullable String proxyFunctionKind,
-            @JsonProperty(FIELD_NAME_PROXY_ARG_FIELD_INDICES)
-                    @Nullable List<Integer> proxyArgFieldIndices,
-            @JsonProperty(FIELD_NAME_PROXY_ARG_FIELD_NAMES)
-                    @Nullable List<String> proxyArgFieldNames,
-            @JsonProperty(FIELD_NAME_PROXY_ARG_FIELD_TYPES)
-                    @Nullable List<String> proxyArgFieldTypes,
-            @JsonProperty(FIELD_NAME_PROXY_RESULT_FIELD_INDICES)
-                    @Nullable List<Integer> proxyResultFieldIndices,
-            @JsonProperty(FIELD_NAME_PROXY_RESULT_FIELD_NAMES)
-                    @Nullable List<String> proxyResultFieldNames,
-            @JsonProperty(FIELD_NAME_PROXY_RESULT_FIELD_TYPES)
-                    @Nullable List<String> proxyResultFieldTypes,
-            @JsonProperty(FIELD_NAME_PROXY_RESULT_UDF_FIELD_TYPES)
-                    @Nullable List<String> proxyResultUdfFieldTypes,
-            @JsonProperty(FIELD_NAME_PROXY_RESULT_UDF_FIELD_INDICES)
-                    @Nullable List<Integer> proxyResultUdfFieldIndices) {
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_CONF) @Nullable String externalRuntimeConf,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_FIELD_INDEX) @Nullable Integer externalRuntimeFieldIndex,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_FIELD_NAME) @Nullable String externalRuntimeFieldName,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_FUNCTION_CLASS) @Nullable String externalRuntimeFunctionClass,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_FUNCTION_KIND) @Nullable String externalRuntimeFunctionKind,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_ARG_FIELD_INDICES)
+                    @Nullable List<Integer> externalRuntimeArgFieldIndices,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_ARG_FIELD_NAMES)
+                    @Nullable List<String> externalRuntimeArgFieldNames,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_ARG_FIELD_TYPES)
+                    @Nullable List<String> externalRuntimeArgFieldTypes,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_RESULT_FIELD_INDICES)
+                    @Nullable List<Integer> externalRuntimeResultFieldIndices,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_RESULT_FIELD_NAMES)
+                    @Nullable List<String> externalRuntimeResultFieldNames,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_RESULT_FIELD_TYPES)
+                    @Nullable List<String> externalRuntimeResultFieldTypes,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_RESULT_UDF_FIELD_TYPES)
+                    @Nullable List<String> externalRuntimeResultUdfFieldTypes,
+            @JsonProperty(FIELD_NAME_EXTERNAL_RUNTIME_RESULT_UDF_FIELD_INDICES)
+                    @Nullable List<Integer> externalRuntimeResultUdfFieldIndices) {
         super(
                 id,
                 context,
@@ -238,31 +231,31 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 inputProperties,
                 outputType,
                 description);
-        this.proxyConf = proxyConf;
-        this.proxyFieldIndex = proxyFieldIndex;
-        this.proxyFieldName = proxyFieldName;
-        this.proxyFunctionClass = proxyFunctionClass;
-        this.proxyFunctionKind = proxyFunctionKind;
-        this.proxyArgFieldIndices = proxyArgFieldIndices;
-        this.proxyArgFieldNames = proxyArgFieldNames;
-        this.proxyArgFieldTypes = proxyArgFieldTypes;
-        this.proxyResultFieldIndices = proxyResultFieldIndices;
-        this.proxyResultFieldNames = proxyResultFieldNames;
-        this.proxyResultFieldTypes = proxyResultFieldTypes;
-        this.proxyResultUdfFieldTypes = proxyResultUdfFieldTypes;
-        this.proxyResultUdfFieldIndices = proxyResultUdfFieldIndices;
+        this.externalRuntimeConf = externalRuntimeConf;
+        this.externalRuntimeFieldIndex = externalRuntimeFieldIndex;
+        this.externalRuntimeFieldName = externalRuntimeFieldName;
+        this.externalRuntimeFunctionClass = externalRuntimeFunctionClass;
+        this.externalRuntimeFunctionKind = externalRuntimeFunctionKind;
+        this.externalRuntimeArgFieldIndices = externalRuntimeArgFieldIndices;
+        this.externalRuntimeArgFieldNames = externalRuntimeArgFieldNames;
+        this.externalRuntimeArgFieldTypes = externalRuntimeArgFieldTypes;
+        this.externalRuntimeResultFieldIndices = externalRuntimeResultFieldIndices;
+        this.externalRuntimeResultFieldNames = externalRuntimeResultFieldNames;
+        this.externalRuntimeResultFieldTypes = externalRuntimeResultFieldTypes;
+        this.externalRuntimeResultUdfFieldTypes = externalRuntimeResultUdfFieldTypes;
+        this.externalRuntimeResultUdfFieldIndices = externalRuntimeResultUdfFieldIndices;
         LOG.info(
-                "StreamExecCalc ctor: id={}, projectionSize={}, conditionPresent={}, proxyConfPresent={}, proxyFieldIndex={}, proxyFieldName={}, proxyFunctionClass={}, proxyFunctionKind={}, proxyArgFieldIndices={}, proxyResultFieldIndices={}",
+                "StreamExecCalc ctor: id={}, projectionSize={}, conditionPresent={}, externalRuntimeConfPresent={}, externalRuntimeFieldIndex={}, externalRuntimeFieldName={}, externalRuntimeFunctionClass={}, externalRuntimeFunctionKind={}, externalRuntimeArgFieldIndices={}, externalRuntimeResultFieldIndices={}",
                 id,
                 projection.size(),
                 condition != null,
-                proxyConf != null,
-                proxyFieldIndex,
-                proxyFieldName,
-                proxyFunctionClass,
-                proxyFunctionKind,
-                proxyArgFieldIndices,
-                proxyResultFieldIndices);
+                externalRuntimeConf != null,
+                externalRuntimeFieldIndex,
+                externalRuntimeFieldName,
+                externalRuntimeFunctionClass,
+                externalRuntimeFunctionKind,
+                externalRuntimeArgFieldIndices,
+                externalRuntimeResultFieldIndices);
     }
 
     @SuppressWarnings("unchecked")
@@ -270,30 +263,29 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
     protected Transformation<RowData> translateToPlanInternal(
             PlannerBase planner, ExecNodeConfig config) {
         LOG.info(
-                "StreamExecCalc translateToPlanInternal: id={}, projectionSize={}, conditionPresent={}, proxyConfPresent={}",
+                "StreamExecCalc translateToPlanInternal: id={}, projectionSize={}, conditionPresent={}, externalRuntimeConfPresent={}",
                 getId(),
                 projection.size(),
                 condition != null,
-                proxyConf != null);
+                externalRuntimeConf != null);
         final ExecEdge inputEdge = getInputEdges().get(0);
         final Transformation<RowData> inputTransform =
                 (Transformation<RowData>) inputEdge.translateToPlan(planner);
         final RowType inputRowType = extractRowType(inputTransform);
         final RowType outputRowType = (RowType) getOutputType();
 
-        final String resolvedProxyFunctionClass =
-                proxyFunctionClass != null && !proxyFunctionClass.isEmpty()
-                        ? proxyFunctionClass
-                        : config.getOptional(PROXY_FUNCTION_CLASS_OPTION)
-                                .orElse(CUSTOM_PROXY_FUNCTION_CLASS_NAME);
-        final String resolvedProxyFunctionKind =
-                proxyFunctionKind != null && !proxyFunctionKind.isEmpty()
-                        ? proxyFunctionKind
-                        : PROXY_FUNCTION_KIND_SCALAR;
+        final List<String> externalRuntimeFunctionClasses =
+                externalRuntimeFunctionClass != null && !externalRuntimeFunctionClass.isEmpty()
+                        ? List.of(externalRuntimeFunctionClass)
+                        : CommonExecCalc.resolveExternalRuntimeFunctionClasses(config);
+        final String resolvedExternalRuntimeFunctionKind =
+                externalRuntimeFunctionKind != null && !externalRuntimeFunctionKind.isEmpty()
+                        ? externalRuntimeFunctionKind
+                        : EXTERNAL_RUNTIME_FUNCTION_KIND_SCALAR;
 
-        final ProxyScalarFunctionRewriter rewriter =
-                new ProxyScalarFunctionRewriter(
-                        resolvedProxyFunctionClass, inputRowType, outputRowType);
+        final ExternalRuntimeScalarFunctionRewriter rewriter =
+                new ExternalRuntimeScalarFunctionRewriter(
+                        externalRuntimeFunctionClasses, inputRowType, outputRowType);
         final List<RexNode> rewrittenProjection = new ArrayList<>(projection.size());
         for (int i = 0; i < projection.size(); i++) {
             rewriter.setCurrentOutputFieldIndex(i);
@@ -303,52 +295,52 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
         final @Nullable RexNode rewrittenCondition =
                 condition == null ? null : condition.accept(rewriter);
 
-        final boolean hasProxyFunction = rewriter.hasProxyFunction();
-        final boolean proxyFilter =
-                hasProxyFunction
-                        && CommonExecCalc.PROXY_FUNCTION_KIND_FILTER.equals(
-                                rewriter.getProxyFunctionKind());
-        final boolean useProxyOperators = hasProxyFunction || proxyConf != null;
+        final boolean hasExternalRuntimeFunction = rewriter.hasExternalRuntimeFunction();
+        final boolean externalRuntimeFilter =
+                hasExternalRuntimeFunction
+                        && CommonExecCalc.EXTERNAL_RUNTIME_FUNCTION_KIND_FILTER.equals(
+                                rewriter.getExternalRuntimeFunctionKind());
+        final boolean useExternalRuntimeOperators = hasExternalRuntimeFunction || externalRuntimeConf != null;
         LOG.info(
-                "StreamExecCalc proxy rewrite: hasProxyFunction={}, proxyConfPresent={}, useProxyOperators={}",
-                hasProxyFunction,
-                proxyConf != null,
-                useProxyOperators);
+                "StreamExecCalc external runtime rewrite: hasExternalRuntimeFunction={}, externalRuntimeConfPresent={}, useExternalRuntimeOperators={}",
+                hasExternalRuntimeFunction,
+                externalRuntimeConf != null,
+                useExternalRuntimeOperators);
 
         final List<RexNode> effectiveProjection =
-                hasProxyFunction ? rewrittenProjection : projection;
+                hasExternalRuntimeFunction ? rewrittenProjection : projection;
         final @Nullable RexNode effectiveCondition =
-                proxyFilter ? null : (hasProxyFunction ? rewrittenCondition : condition);
-        final @Nullable String resolvedProxyConf;
+                externalRuntimeFilter ? null : (hasExternalRuntimeFunction ? rewrittenCondition : condition);
+        final @Nullable String resolvedExternalRuntimeConf;
         @Nullable List<String> resolvedResultFieldTypes = null;
         @Nullable List<Integer> resolvedResultFieldIndices = null;
-        if (useProxyOperators) {
-            String proxyConfValue = rewriter.getProxyConf();
+        if (useExternalRuntimeOperators) {
+            String externalRuntimeConfValue = rewriter.getExternalRuntimeConf();
 
             final List<Integer> resolvedArgFieldIndices =
-                    proxyArgFieldIndices != null
-                            ? proxyArgFieldIndices
-                            : rewriter.getProxyArgFieldIndices();
+                    externalRuntimeArgFieldIndices != null
+                            ? externalRuntimeArgFieldIndices
+                            : rewriter.getExternalRuntimeArgFieldIndices();
             final List<String> resolvedArgFieldNames =
-                    proxyArgFieldNames != null
-                            ? proxyArgFieldNames
-                            : rewriter.getProxyArgFieldNames();
+                    externalRuntimeArgFieldNames != null
+                            ? externalRuntimeArgFieldNames
+                            : rewriter.getExternalRuntimeArgFieldNames();
             final List<String> resolvedArgFieldTypes =
-                    proxyArgFieldTypes != null
-                            ? proxyArgFieldTypes
-                            : rewriter.getProxyArgFieldTypes();
+                    externalRuntimeArgFieldTypes != null
+                            ? externalRuntimeArgFieldTypes
+                            : rewriter.getExternalRuntimeArgFieldTypes();
             List<String> resolvedResultFieldNames =
-                    proxyResultFieldNames != null
-                            ? proxyResultFieldNames
-                            : rewriter.getProxyResultFieldNames();
+                    externalRuntimeResultFieldNames != null
+                            ? externalRuntimeResultFieldNames
+                            : rewriter.getExternalRuntimeResultFieldNames();
             resolvedResultFieldTypes =
-                    proxyResultFieldTypes != null
-                            ? proxyResultFieldTypes
-                            : rewriter.getProxyResultFieldTypes();
+                    externalRuntimeResultFieldTypes != null
+                            ? externalRuntimeResultFieldTypes
+                            : rewriter.getExternalRuntimeResultFieldTypes();
             resolvedResultFieldIndices =
-                    proxyResultFieldIndices != null
-                            ? proxyResultFieldIndices
-                            : rewriter.getProxyResultFieldIndices();
+                    externalRuntimeResultFieldIndices != null
+                            ? externalRuntimeResultFieldIndices
+                            : rewriter.getExternalRuntimeResultFieldIndices();
             if (resolvedResultFieldIndices != null && !resolvedResultFieldIndices.isEmpty()) {
                 // Ensure result metadata is aligned with the current output row type.
                 // This guards against missing or stale result type/name info from the rewriter.
@@ -370,63 +362,67 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                 }
             }
             final List<String> resolvedResultUdfFieldTypes =
-                    proxyResultUdfFieldTypes != null
-                            ? proxyResultUdfFieldTypes
-                            : rewriter.getProxyResultUdfFieldTypes();
+                    externalRuntimeResultUdfFieldTypes != null
+                            ? externalRuntimeResultUdfFieldTypes
+                            : rewriter.getExternalRuntimeResultUdfFieldTypes();
             final List<Integer> resolvedResultUdfFieldIndices =
-                    proxyResultUdfFieldIndices != null
-                            ? proxyResultUdfFieldIndices
-                            : rewriter.getProxyResultUdfFieldIndices();
-            if (proxyConf != null && !proxyConf.isEmpty()) {
-                if (proxyConfValue.isEmpty()) {
-                    proxyConfValue = proxyConf;
-                } else if (!proxyConfValue.equals(proxyConf)) {
+                    externalRuntimeResultUdfFieldIndices != null
+                            ? externalRuntimeResultUdfFieldIndices
+                            : rewriter.getExternalRuntimeResultUdfFieldIndices();
+            if (externalRuntimeConf != null && !externalRuntimeConf.isEmpty()) {
+                if (externalRuntimeConfValue.isEmpty()) {
+                    externalRuntimeConfValue = externalRuntimeConf;
+                } else if (!externalRuntimeConfValue.equals(externalRuntimeConf)) {
                     throw new TableException(
-                            "Proxy scalar function requires a single, consistent conf literal.");
+                            "External runtime function requires a single, consistent conf literal.");
                 }
             }
-            if (proxyConfValue.isEmpty()) {
-                proxyConfValue = config.getOptional(PROXY_CONF_OPTION).orElse("");
+            if (externalRuntimeConfValue.isEmpty()) {
+                externalRuntimeConfValue =
+                        CommonExecCalc.resolveExternalRuntimeConf(config, rewriter.getExternalRuntimeFunctionClass());
             }
-            if (proxyConfValue.isEmpty()) {
+            if (externalRuntimeConfValue.isEmpty()) {
                 throw new TableException(
-                        "Proxy scalar function requires a TCP conf literal or table.exec.proxy.conf.");
+                        "External runtime function requires a TCP conf literal, "
+                                + "table.exec.external-runtime.conf, "
+                                + "or table.exec.external-runtime.conf.<functionClass>.");
             }
-            if (proxyFieldIndex != null || (proxyFieldName != null && !proxyFieldName.isEmpty())) {
-                proxyConfValue =
-                        appendProxyField(proxyConfValue, proxyFieldIndex, proxyFieldName);
+            if (externalRuntimeFieldIndex != null || (externalRuntimeFieldName != null && !externalRuntimeFieldName.isEmpty())) {
+                externalRuntimeConfValue =
+                        appendExternalRuntimeField(externalRuntimeConfValue, externalRuntimeFieldIndex, externalRuntimeFieldName);
             }
-            proxyConfValue =
-                    appendProxyFunctionMetadata(
-                            proxyConfValue, resolvedProxyFunctionClass, resolvedProxyFunctionKind);
-            proxyConfValue =
-                    appendProxyFunctionArgsMetadata(
-                            proxyConfValue,
+            final String resolvedExternalRuntimeFunctionClass = rewriter.getExternalRuntimeFunctionClass();
+            externalRuntimeConfValue =
+                    appendExternalRuntimeFunctionMetadata(
+                            externalRuntimeConfValue, resolvedExternalRuntimeFunctionClass, resolvedExternalRuntimeFunctionKind);
+            externalRuntimeConfValue =
+                    appendExternalRuntimeFunctionArgsMetadata(
+                            externalRuntimeConfValue,
                             resolvedArgFieldIndices,
                             resolvedArgFieldNames,
                             resolvedArgFieldTypes);
-            proxyConfValue =
-                    appendProxyFunctionResultMetadata(
-                            proxyConfValue,
+            externalRuntimeConfValue =
+                    appendExternalRuntimeFunctionResultMetadata(
+                            externalRuntimeConfValue,
                             resolvedResultFieldIndices,
                             resolvedResultFieldNames,
                             resolvedResultFieldTypes,
                             resolvedResultUdfFieldTypes,
                             resolvedResultUdfFieldIndices);
             LOG.info(
-                    "Proxy rewrite injecting pre/post operators: functionClass={}, functionKind={}, argFieldIndices={}, resultFieldIndices={}, conf={}",
-                    resolvedProxyFunctionClass,
-                    resolvedProxyFunctionKind,
+                    "External runtime rewrite injecting pre/post operators: functionClass={}, functionKind={}, argFieldIndices={}, resultFieldIndices={}, conf={}",
+                    resolvedExternalRuntimeFunctionClass,
+                    resolvedExternalRuntimeFunctionKind,
                     resolvedArgFieldIndices,
                     resolvedResultFieldIndices,
-                    proxyConfValue);
-            resolvedProxyConf = proxyConfValue;
+                    externalRuntimeConfValue);
+            resolvedExternalRuntimeConf = externalRuntimeConfValue;
         } else {
-            resolvedProxyConf = null;
+            resolvedExternalRuntimeConf = null;
         }
 
-        final RowType proxyOutputRowType =
-                resolvedProxyConf != null
+        final RowType externalRuntimeOutputRowType =
+                resolvedExternalRuntimeConf != null
                         ? applyResultTypes(
                                 inputRowType,
                                 resolvedResultFieldIndices,
@@ -434,9 +430,10 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                                 planner.getFlinkContext().getClassLoader())
                         : inputRowType;
 
-        final Transformation<RowData> proxyInputTransform =
-                resolvedProxyConf != null
-                        ? createProxyChain(inputTransform, resolvedProxyConf, config, proxyOutputRowType)
+        final Transformation<RowData> externalRuntimeInputTransform =
+                resolvedExternalRuntimeConf != null
+                        ? createExternalRuntimeChain(
+                                inputTransform, resolvedExternalRuntimeConf, config, externalRuntimeOutputRowType)
                         : inputTransform;
 
         final CodeGeneratorContext ctx =
@@ -446,24 +443,35 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
         final CodeGenOperatorFactory<RowData> substituteStreamOperator =
                 CalcCodeGenerator.generateCalcOperator(
                         ctx,
-                        proxyInputTransform,
+                        externalRuntimeInputTransform,
                         (RowType) getOutputType(),
                         JavaScalaConversionUtil.toScala(effectiveProjection),
                         JavaScalaConversionUtil.toScala(Optional.ofNullable(effectiveCondition)),
                         isRetainHeader(),
                         getClass().getSimpleName());
+        final @Nullable Integer calcParallelism =
+                CommonExecCalc.resolveExternalRuntimeCalcParallelism(config, projection, condition);
+        final int configuredParallelism;
+        final boolean parallelismConfigured;
+        if (calcParallelism != null && calcParallelism > 0) {
+            configuredParallelism = calcParallelism;
+            parallelismConfigured = true;
+        } else {
+            configuredParallelism = externalRuntimeInputTransform.getParallelism();
+            parallelismConfigured = false;
+        }
         final Transformation<RowData> calcTransform =
                 ExecNodeUtil.createOneInputTransformation(
-                        proxyInputTransform,
+                        externalRuntimeInputTransform,
                         createTransformationMeta(CALC_TRANSFORMATION, config),
                         substituteStreamOperator,
                         InternalTypeInfo.of(getOutputType()),
-                        proxyInputTransform.getParallelism(),
-                        false);
+                        configuredParallelism,
+                        parallelismConfigured);
         return calcTransform;
     }
 
-    private static String appendProxyField(
+    private static String appendExternalRuntimeField(
             String conf, @Nullable Integer fieldIndex, @Nullable String fieldName) {
         String result = conf;
         if (fieldIndex != null && !containsConfKey(result, "calcfieldindex")) {
