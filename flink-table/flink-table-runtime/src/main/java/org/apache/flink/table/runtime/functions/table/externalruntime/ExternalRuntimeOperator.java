@@ -48,7 +48,6 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -95,11 +94,6 @@ abstract class ExternalRuntimeOperator extends TableStreamOperator<RowData>
     protected transient List<LogicalType> resultReadTypes;
     protected transient List<LogicalType> postFieldTypes;
     protected transient WireType[] resultWireTypes;
-
-    protected transient RowData.FieldGetter[] resultFieldGetters;
-    protected transient RowData.FieldGetter[] fullRowFieldGetters;
-    protected transient int[] resultPosByInputIndex;
-    protected transient boolean resultReplacesAllFields;
 
     protected transient GenericRowData insertPlaceholder;
     protected transient GenericRowData updateAfterPlaceholder;
@@ -394,30 +388,7 @@ abstract class ExternalRuntimeOperator extends TableStreamOperator<RowData>
         }
         this.resultWireTypes = resultWireTypes;
 
-        this.resultFieldGetters = new RowData.FieldGetter[resultFieldTypes.size()];
-        for (int i = 0; i < resultFieldTypes.size(); i++) {
-            resultFieldGetters[i] = RowData.createFieldGetter(resultFieldTypes.get(i), i);
-        }
-        this.fullRowFieldGetters = new RowData.FieldGetter[fieldCount];
-        for (int i = 0; i < fieldCount; i++) {
-            fullRowFieldGetters[i] = RowData.createFieldGetter(inputFields.get(i).getType(), i);
-        }
-
-        this.resultPosByInputIndex = new int[fieldCount];
-        Arrays.fill(resultPosByInputIndex, -1);
-        boolean replacesAll = resultFieldIndices.size() == fieldCount;
-        for (int i = 0; i < resultFieldIndices.size(); i++) {
-            final int idx = resultFieldIndices.get(i);
-            if (idx < 0 || idx >= fieldCount) {
-                replacesAll = false;
-                continue;
-            }
-            resultPosByInputIndex[idx] = i;
-            if (replacesAll && idx != i) {
-                replacesAll = false;
-            }
-        }
-        this.resultReplacesAllFields = replacesAll;
+        // External runtime always returns full rows, no merge planning required.
     }
 
     protected static int[] toIntArray(List<Integer> ints) {
