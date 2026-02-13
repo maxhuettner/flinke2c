@@ -1,7 +1,6 @@
 package org.apache.flink.table.runtime.functions.table.externalruntime;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.api.common.operators.ProcessingTimeService;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -18,8 +17,7 @@ import java.util.List;
 
 /** PRE: sends input rows to the external runtime and emits placeholders. */
 @Internal
-public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
-        implements ProcessingTimeService.ProcessingTimeCallback {
+public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator {
 
     private static final long serialVersionUID = 1L;
 
@@ -28,13 +26,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     private transient List<Socket> sockets;
     private transient List<ByteArrayOutputStream> batchBuffers;
     private transient int[] batchCounts;
-    private transient long[] batchFirstBufferedAt;
-    private transient long[] batchLastBufferedAt;
     private transient int batchSize;
-    private transient int flushIntervalMs;
-    private transient int flushIdleMs;
-    private transient long timerIntervalMs;
-    private transient boolean timerScheduled;
     private transient long nextRowId;
 
     public ExternalRuntimePreOperator(String conf, RowType rowType) {
@@ -55,17 +47,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         this.sockets = new ArrayList<>(endpoints.size());
         this.batchBuffers = new ArrayList<>(endpoints.size());
         this.batchCounts = new int[endpoints.size()];
-        this.batchFirstBufferedAt = new long[endpoints.size()];
-        this.batchLastBufferedAt = new long[endpoints.size()];
-        for (int i = 0; i < endpoints.size(); i++) {
-            batchFirstBufferedAt[i] = -1L;
-            batchLastBufferedAt[i] = -1L;
-        }
         this.batchSize = Math.max(1, tcpConfig.getBatchSize());
-        this.flushIntervalMs = Math.max(0, tcpConfig.getFlushIntervalMs());
-        this.flushIdleMs = Math.max(0, tcpConfig.getFlushIdleMs());
-        this.timerIntervalMs = computeTimerInterval(flushIntervalMs, flushIdleMs);
-        this.timerScheduled = false;
         final String configJson = buildConfigJson();
         for (ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint endpoint : endpoints) {
             final int port = endpoint.getSendPort();
@@ -105,10 +87,6 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
                 endpoints.size(),
                 inputRowType,
                 configJson.getBytes(StandardCharsets.UTF_8).length);
-
-        if (timerIntervalMs > 0) {
-            scheduleTimer(getProcessingTimeService().getCurrentProcessingTime());
-        }
     }
 
     @Override
@@ -124,19 +102,11 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         final int idx = tcpConfig.selectEndpointIndex(nextRowId, outs.size());
         final ByteArrayOutputStream buffer = batchBuffers.get(idx);
         codec.writeFramedRow(buffer, row, payloadFieldIndicesArray, nextRowId);
-        final long now = getProcessingTimeService().getCurrentProcessingTime();
-        if (batchCounts[idx] == 0) {
-            batchFirstBufferedAt[idx] = now;
-        }
-        batchLastBufferedAt[idx] = now;
         batchCounts[idx]++;
         if (batchCounts[idx] >= batchSize) {
             flushBatch(idx);
         }
         nextRowId++;
-        if (!timerScheduled && timerIntervalMs > 0) {
-            scheduleTimer(now);
-        }
     }
 
     private void flushBatch(int idx) throws IOException {
@@ -150,8 +120,6 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         out.flush();
         buffer.reset();
         batchCounts[idx] = 0;
-        batchFirstBufferedAt[idx] = -1L;
-        batchLastBufferedAt[idx] = -1L;
     }
 
     private IOException tryFlushRemaining() {
@@ -170,58 +138,6 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     }
 
     @Override
-    public void onProcessingTime(long timestamp) throws Exception {
-        if (batchCounts == null || batchBuffers == null) {
-            return;
-        }
-        final long now = timestamp;
-        boolean hasPending = false;
-        for (int i = 0; i < batchCounts.length; i++) {
-            if (batchCounts[i] == 0) {
-                continue;
-            }
-            hasPending = true;
-            if (flushIntervalMs > 0) {
-                final long firstAt = batchFirstBufferedAt[i];
-                if (firstAt >= 0 && now - firstAt >= flushIntervalMs) {
-                    flushBatch(i);
-                    continue;
-                }
-            }
-            if (flushIdleMs > 0) {
-                final long lastAt = batchLastBufferedAt[i];
-                if (lastAt >= 0 && now - lastAt >= flushIdleMs) {
-                    flushBatch(i);
-                }
-            }
-        }
-        if (timerIntervalMs > 0 && hasPending) {
-            scheduleTimer(now);
-        } else {
-            timerScheduled = false;
-        }
-    }
-
-    private void scheduleTimer(long now) {
-        final long next = now + timerIntervalMs;
-        timerScheduled = true;
-        getProcessingTimeService().registerTimer(next, this);
-    }
-
-    private static long computeTimerInterval(int flushIntervalMs, int flushIdleMs) {
-        if (flushIntervalMs > 0 && flushIdleMs > 0) {
-            return Math.min(flushIntervalMs, flushIdleMs);
-        }
-        if (flushIntervalMs > 0) {
-            return flushIntervalMs;
-        }
-        if (flushIdleMs > 0) {
-            return flushIdleMs;
-        }
-        return 0;
-    }
-
-    @Override
     protected void closeInternal() throws Exception {
         IOException error = null;
 
@@ -235,12 +151,6 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         outs = null;
         batchBuffers = null;
         batchCounts = null;
-        batchFirstBufferedAt = null;
-        batchLastBufferedAt = null;
-        flushIntervalMs = 0;
-        flushIdleMs = 0;
-        timerIntervalMs = 0;
-        timerScheduled = false;
 
         codec = null;
 
@@ -257,7 +167,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         }
     }
 
-    private final RowData createPlaceholderRow(RowKind kind) {
+    private RowData createPlaceholderRow(RowKind kind) {
         switch (kind) {
             case INSERT:
                 if (insertPlaceholder == null) {
