@@ -9,19 +9,15 @@ import java.util.Locale;
 import java.util.Map;
 
 final class ExternalRuntimeTcpConfig {
-    private static final int DEFAULT_BUFFER_SIZE = 64 * 1024;
+    private static final int DEFAULT_BUFFER_SIZE = 512 * 1024;
     private static final int DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
     private static final int DEFAULT_BATCH_SIZE = 2048;
-    private static final int DEFAULT_FLUSH_INTERVAL_MS = 20;
-    private static final int DEFAULT_FLUSH_IDLE_MS = 10;
     private static final int DEFAULT_REORDER_MAX_BUFFER = 100000;
     private static final boolean DEFAULT_POST_ROLE_ONLY = true;
 
     private final List<ExternalRuntimeEndpoint> runtimes;
     private final int runtimeParallelism;
     private final int batchSize;
-    private final int flushIntervalMs;
-    private final int flushIdleMs;
     private final int bufferSize;
     private final int connectTimeoutMs;
     private final int readTimeoutMs;
@@ -64,9 +60,7 @@ final class ExternalRuntimeTcpConfig {
             boolean postRoleOnly,
             List<ExternalRuntimeEndpoint> runtimes,
             int runtimeParallelism,
-            int batchSize,
-            int flushIntervalMs,
-            int flushIdleMs) {
+            int batchSize) {
         this.bufferSize = bufferSize;
         this.connectTimeoutMs = connectTimeoutMs;
         this.readTimeoutMs = readTimeoutMs;
@@ -91,8 +85,6 @@ final class ExternalRuntimeTcpConfig {
         this.runtimes = runtimes;
         this.runtimeParallelism = runtimeParallelism;
         this.batchSize = batchSize;
-        this.flushIntervalMs = flushIntervalMs;
-        this.flushIdleMs = flushIdleMs;
 
         this.postRoleOnly = postRoleOnly;
     }
@@ -127,14 +119,6 @@ final class ExternalRuntimeTcpConfig {
         final int runtimeParallelism =
                 parseInt(firstNonNull(map, "runtimeparallelism", "externalparallelism", "parallelism"), 0);
         final int batchSize = parseInt(firstNonNull(map, "batchsize", "batchSize"), DEFAULT_BATCH_SIZE);
-        final int flushIntervalMs =
-                parseInt(
-                        firstNonNull(map, "flushintervalms", "flushinterval", "flushms"),
-                        DEFAULT_FLUSH_INTERVAL_MS);
-        final int flushIdleMs =
-                parseInt(
-                        firstNonNull(map, "flushidlems", "flushidle", "flushidleinterval"),
-                        DEFAULT_FLUSH_IDLE_MS);
 
         return new ExternalRuntimeTcpConfig(
                 bufferSize,
@@ -155,9 +139,7 @@ final class ExternalRuntimeTcpConfig {
                 postRoleOnly,
                 runtimes,
                 runtimeParallelism,
-                batchSize,
-                flushIntervalMs,
-                flushIdleMs);
+                batchSize);
     }
 
     private static List<ExternalRuntimeEndpoint> parseRuntimes(String value) {
@@ -358,15 +340,6 @@ final class ExternalRuntimeTcpConfig {
                 runtimeParallelism > 0 ? Math.min(runtimeParallelism, runtimes.size()) : runtimes.size();
         return Math.max(1, max);
     }
-
-    public int getFlushIntervalMs() {
-        return flushIntervalMs;
-    }
-
-    public int getFlushIdleMs() {
-        return flushIdleMs;
-    }
-
 
     public int selectEndpointIndex(long rowId, int endpointsCount) {
         if (endpointsCount <= 0) {

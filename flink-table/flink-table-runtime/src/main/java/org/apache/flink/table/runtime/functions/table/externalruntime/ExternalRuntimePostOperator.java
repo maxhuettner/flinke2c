@@ -197,16 +197,13 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         final GenericRowData outRow = new GenericRowData(nFields);
 
         for (int i = 0; i < nFields; i++) {
-            final boolean isNull = isNullBitSet(buffer, nullBitmapPos, i);
-            if (isNull) {
+            if (isNullBitSet(buffer, nullBitmapPos, i)) {
                 outRow.setField(i, null);
                 continue;
             }
 
             final WireType wt = resultWireTypes[i];
-            final Object value = decodeFieldValue(buffer, pos, wt, resultReadTypes.get(i), resultFieldTypes.get(i));
-            outRow.setField(i, value);
-            pos += getFieldSize(buffer, pos, wt);
+            pos = decodeFieldValueAndAdvance(buffer, pos, wt, resultReadTypes.get(i), resultFieldTypes.get(i), outRow, i);
         }
 
         outRow.setRowKind(ExternalRuntimeBinaryCodec.opToRowKind(op, fallbackKind));
@@ -296,16 +293,13 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                         : new GenericRowData(nFields);
 
         for (int i = 0; i < nFields; i++) {
-            final boolean isNull = isNullBitSet(buffer, nullBitmapPos, i);
-            if (isNull) {
+            if (isNullBitSet(buffer, nullBitmapPos, i)) {
                 outRow.setField(i, null);
                 continue;
             }
 
             final WireType wt = resultWireTypes[i];
-            final Object value = decodeFieldValue(buffer, pos, wt, resultReadTypes.get(i), resultFieldTypes.get(i));
-            outRow.setField(i, value);
-            pos += getFieldSize(buffer, pos, wt);
+            pos = decodeFieldValueAndAdvance(buffer, pos, wt, resultReadTypes.get(i), resultFieldTypes.get(i), outRow, i);
         }
 
         outRow.setRowKind(ExternalRuntimeBinaryCodec.opToRowKind(op, fallbackKind));
@@ -320,41 +314,59 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         return pos;
     }
 
-    private Object decodeFieldValue(byte[] buf, int pos, WireType wt, LogicalType sourceType, LogicalType targetType) throws IOException {
+    private int decodeFieldValueAndAdvance(
+            byte[] buf,
+            int pos,
+            WireType wt,
+            LogicalType sourceType,
+            LogicalType targetType,
+            GenericRowData outRow,
+            int fieldIndex)
+            throws IOException {
         switch (wt) {
             case BOOL:
-                return buf[pos] != 0;
+                outRow.setField(fieldIndex, buf[pos] != 0);
+                return pos + 1;
             case INT32:
-                return readIntBE(buf, pos);
+                outRow.setField(fieldIndex, readIntBE(buf, pos));
+                return pos + 4;
             case INT64:
-                return readLongBE(buf, pos);
+                outRow.setField(fieldIndex, readLongBE(buf, pos));
+                return pos + 8;
             case TIMESTAMP_MILLIS: {
                 final long millis = readLongBE(buf, pos);
-                return org.apache.flink.table.data.TimestampData.fromEpochMillis(millis);
+                outRow.setField(fieldIndex, org.apache.flink.table.data.TimestampData.fromEpochMillis(millis));
+                return pos + 8;
             }
             case FLOAT32:
-                return Float.intBitsToFloat(readIntBE(buf, pos));
+                outRow.setField(fieldIndex, Float.intBitsToFloat(readIntBE(buf, pos)));
+                return pos + 4;
             case FLOAT64:
-                return Double.longBitsToDouble(readLongBE(buf, pos));
+                outRow.setField(fieldIndex, Double.longBitsToDouble(readLongBE(buf, pos)));
+                return pos + 8;
             case STRING: {
                 final int strLen = readIntBE(buf, pos);
-                return org.apache.flink.table.data.StringData.fromBytes(buf, pos + 4, strLen);
+                outRow.setField(fieldIndex, org.apache.flink.table.data.StringData.fromBytes(buf, pos + 4, strLen));
+                return pos + 4 + strLen;
             }
             case BYTES: {
                 final int bytesLen = readIntBE(buf, pos);
                 byte[] bytes = new byte[bytesLen];
                 System.arraycopy(buf, pos + 4, bytes, 0, bytesLen);
-                return bytes;
+                outRow.setField(fieldIndex, bytes);
+                return pos + 4 + bytesLen;
             }
             case DECIMAL_UNSCALED_I64: {
                 final long unscaled = readLongBE(buf, pos);
                 if (targetType instanceof org.apache.flink.table.types.logical.DecimalType) {
                     final org.apache.flink.table.types.logical.DecimalType dt =
                             (org.apache.flink.table.types.logical.DecimalType) targetType;
-                    return org.apache.flink.table.data.DecimalData.fromUnscaledLong(
-                            unscaled, dt.getPrecision(), dt.getScale());
+                    outRow.setField(fieldIndex, org.apache.flink.table.data.DecimalData.fromUnscaledLong(
+                            unscaled, dt.getPrecision(), dt.getScale()));
+                } else {
+                    outRow.setField(fieldIndex, unscaled);
                 }
-                return unscaled;
+                return pos + 8;
             }
             case DECIMAL_UNSCALED_BYTES: {
                 final int decLen = readIntBE(buf, pos);
@@ -365,35 +377,15 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                             (org.apache.flink.table.types.logical.DecimalType) targetType;
                     final java.math.BigInteger bi = new java.math.BigInteger(decBytes);
                     final java.math.BigDecimal bd = new java.math.BigDecimal(bi, dt.getScale());
-                    return org.apache.flink.table.data.DecimalData.fromBigDecimal(
-                            bd, dt.getPrecision(), dt.getScale());
+                    outRow.setField(fieldIndex, org.apache.flink.table.data.DecimalData.fromBigDecimal(
+                            bd, dt.getPrecision(), dt.getScale()));
+                } else {
+                    outRow.setField(fieldIndex, decBytes);
                 }
-                return decBytes;
+                return pos + 4 + decLen;
             }
             default:
                 throw new IOException("Unsupported wire type: " + wt);
-        }
-    }
-
-    private int getFieldSize(byte[] buf, int pos, WireType wt) {
-        switch (wt) {
-            case BOOL:
-                return 1;
-            case INT32:
-            case FLOAT32:
-                return 4;
-            case INT64:
-            case FLOAT64:
-            case TIMESTAMP_MILLIS:
-            case DECIMAL_UNSCALED_I64:
-                return 8;
-            case STRING:
-            case BYTES:
-            case DECIMAL_UNSCALED_BYTES:
-                final int len = readIntBE(buf, pos);
-                return 4 + len;
-            default:
-                return 0;
         }
     }
 
