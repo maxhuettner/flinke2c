@@ -14,28 +14,66 @@ import javax.annotation.Nullable;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-/** POST: receives processed rows from the external runtime and merges them into incoming rows. */
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * POST: receives processed rows from the external runtime and merges them into
+ * incoming rows.
+ */
 @Internal
 public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
 
     private static final long serialVersionUID = 1L;
+    private static final int MAX_FRAME_BYTES = 100_000_000;
+    private static final long ROUTING_HINT_RECENCY_ROWS = 65_536L;
 
     private transient List<ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint> endpoints;
     private transient List<BufferedInputStream> ins;
     private transient List<BufferedOutputStream> outs;
     private transient List<Socket> sockets;
+    private transient List<SocketChannel> channels;
+    private transient List<ChannelFrameState> channelFrameStates;
+    private transient Selector selector;
     private transient long expectedRowId;
-    private transient List<Map<Long, ResponseBlock>> reorderBlockBuffers;
+    private transient Map<Long, ResponseBlock> dynamicBlockBuffer;
+    private transient boolean dynamicRoutingEnabled;
+    private transient long[] endpointReconnectAtNanos;
+    private transient String configJson;
     private transient boolean reuseObjects;
     private transient GenericRowData reuseRow;
     private transient byte[] frameBuf;
+    private transient int frameDataPos;
+    private transient int frameDataCount;
     private transient StreamRecord<RowData> reuseStreamRecord;
+    private transient int cachedConnectedCount;
+    private transient ArrayDeque<Integer> readyEndpointQueue;
+    private transient boolean[] readyEndpointQueued;
+    private transient int lastFrameLen;
+    private transient int routingWidthHint;
+    private transient long[] lastMatchedTargetRowIdByEndpoint;
+    private transient boolean threadedReadEnabled;
+    private transient ArrayBlockingQueue<ResponseBlock> asyncResponseQueue;
+    private transient List<Thread> responseReaderThreads;
+    private transient volatile boolean responseReadersRunning;
+    private transient AtomicReference<IOException> asyncReadFailure;
+    private transient boolean consecutiveMissingSkipMode;
+    private transient long lastSkippedMissingRowId;
 
     public ExternalRuntimePostOperator(String conf, RowType rowType) {
         this(conf, rowType, rowType);
@@ -55,47 +93,81 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         final int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
         final int totalSubtasks = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         this.endpoints = tcpConfig.selectEndpoints(subtaskIndex, totalSubtasks);
+        this.dynamicRoutingEnabled = tcpConfig.isAutoFailoverEnabled() || tcpConfig.isAutoParallelismEnabled();
+        this.threadedReadEnabled = dynamicRoutingEnabled;
         this.ins = new ArrayList<>(endpoints.size());
         this.outs = new ArrayList<>(endpoints.size());
         this.sockets = new ArrayList<>(endpoints.size());
-        final String configJson = buildConfigJson();
-        for (ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint endpoint : endpoints) {
-            final int port = endpoint.getReceivePort();
-            final Socket sock =
-                    connectSocket(endpoint.getHost(), port, tcpConfig.getConnectTimeoutMs());
-            if (tcpConfig.getReadTimeoutMs() > 0) {
-                sock.setSoTimeout(tcpConfig.getReadTimeoutMs());
+        this.channels = dynamicRoutingEnabled && !threadedReadEnabled ? new ArrayList<>(endpoints.size()) : null;
+        this.channelFrameStates =
+                dynamicRoutingEnabled && !threadedReadEnabled ? new ArrayList<>(endpoints.size()) : null;
+        this.selector = dynamicRoutingEnabled && !threadedReadEnabled ? Selector.open() : null;
+        this.readyEndpointQueue =
+                dynamicRoutingEnabled && !threadedReadEnabled ? new ArrayDeque<>() : null;
+        this.readyEndpointQueued =
+                dynamicRoutingEnabled && !threadedReadEnabled ? new boolean[endpoints.size()] : null;
+        this.lastMatchedTargetRowIdByEndpoint = dynamicRoutingEnabled ? new long[endpoints.size()] : null;
+        this.endpointReconnectAtNanos = new long[endpoints.size()];
+        this.cachedConnectedCount = 0;
+        this.configJson = buildConfigJson();
+        this.asyncResponseQueue =
+                threadedReadEnabled
+                        ? new ArrayBlockingQueue<>(Math.max(1024, tcpConfig.getReorderMaxBuffer() * 2))
+                        : null;
+        this.responseReaderThreads = threadedReadEnabled ? new ArrayList<>(endpoints.size()) : null;
+        this.responseReadersRunning = threadedReadEnabled;
+        this.asyncReadFailure = threadedReadEnabled ? new AtomicReference<>() : null;
+        this.consecutiveMissingSkipMode = false;
+        this.lastSkippedMissingRowId = -1L;
+
+        for (int i = 0; i < endpoints.size(); i++) {
+            ins.add(null);
+            outs.add(null);
+            sockets.add(null);
+            if (dynamicRoutingEnabled && !threadedReadEnabled) {
+                channels.add(null);
+                channelFrameStates.add(new ChannelFrameState());
             }
-            final BufferedInputStream in =
-                    new BufferedInputStream(sock.getInputStream(), tcpConfig.getBufferSize());
-            final BufferedOutputStream postOut =
-                    new BufferedOutputStream(sock.getOutputStream(), tcpConfig.getBufferSize());
-            writeLengthPrefixedJson(postOut, configJson);
-            postOut.flush();
-            sockets.add(sock);
-            ins.add(in);
-            outs.add(postOut);
-        }
-        if (!sockets.isEmpty()) {
-            this.socket = sockets.get(0);
+            endpointReconnectAtNanos[i] = 0L;
+            if (dynamicRoutingEnabled) {
+                lastMatchedTargetRowIdByEndpoint[i] = -1L;
+            }
         }
 
-        this.reuseObjects =
-                getRuntimeContext().isObjectReuseEnabled() && !tcpConfig.isReorderResponses();
+        for (int i = 0; i < endpoints.size(); i++) {
+            try {
+                connectEndpoint(i);
+            } catch (IOException e) {
+                if (!dynamicRoutingEnabled) {
+                    throw e;
+                }
+                endpointReconnectAtNanos[i] = System.nanoTime()
+                        + tcpConfig.getFailoverReconnectBackoffMs() * 1_000_000L;
+                LOG.warn(
+                        "ExternalRuntimePostOperator could not connect to endpoint {}:{} at open; will retry.",
+                        endpoints.get(i).getHost(),
+                        endpoints.get(i).getReceivePort(),
+                        e);
+            }
+        }
+        if (cachedConnectedCount == 0) {
+            throw new IOException("ExternalRuntimePostOperator could not connect to any runtime endpoint.");
+        }
 
-        this.codec =
-                new ExternalRuntimeBinaryCodec(
-                        true,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                        null,
-                        resultWireTypes,
-                        resultReadTypes.toArray(new LogicalType[0]),
-                        resultFieldTypes.toArray(new LogicalType[0]),
-                        reuseObjects);
+        this.reuseObjects = getRuntimeContext().isObjectReuseEnabled();
+
+        this.codec = new ExternalRuntimeBinaryCodec(
+                true,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                resultWireTypes,
+                resultReadTypes.toArray(new LogicalType[0]),
+                resultFieldTypes.toArray(new LogicalType[0]),
+                reuseObjects);
 
         if (reuseObjects) {
             this.reuseRow = new GenericRowData(resultFieldTypes.size());
@@ -105,18 +177,20 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         this.frameBuf = new byte[tcpConfig.getBufferSize()];
 
         this.expectedRowId = 0L;
-        if (tcpConfig.isReorderResponses()) {
-            this.reorderBlockBuffers = new ArrayList<>(endpoints.size());
-            for (int i = 0; i < endpoints.size(); i++) {
-                reorderBlockBuffers.add(new HashMap<>());
-            }
+        if (dynamicRoutingEnabled) {
+            this.dynamicBlockBuffer = new HashMap<>();
         } else {
-            this.reorderBlockBuffers = null;
+            this.dynamicBlockBuffer = null;
+        }
+        this.lastFrameLen = 0;
+        this.routingWidthHint = dynamicRoutingEnabled ? 1 : 0;
+        if (threadedReadEnabled) {
+            startResponseReaderThreads();
         }
 
         LOG.info(
                 "ExternalRuntimePostOperator connected to {} runtime(s) (rowType={}, sentConfigBytes={})",
-                endpoints.size(),
+                connectedEndpointCount(),
                 inputRowType,
                 configJson.getBytes(StandardCharsets.UTF_8).length);
     }
@@ -131,91 +205,718 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     protected void processElementInternal(StreamRecord<RowData> element) throws Exception {
         final RowData inRow = element.getValue();
         final RowKind fallbackKind = inRow.getRowKind();
+        final long timestamp = element.hasTimestamp() ? element.getTimestamp() : 0L;
+        if (dynamicRoutingEnabled) {
+            if (threadedReadEnabled) {
+                readNextDynamicBlockFromQueue(fallbackKind, expectedRowId, timestamp);
+                expectedRowId++;
+                return;
+            }
+            if (channels == null || channels.isEmpty()) {
+                throw new IOException("ExternalRuntimePostOperator dynamic channels not initialized");
+            }
+            readNextDynamicBlockDirect(fallbackKind, expectedRowId, timestamp);
+            expectedRowId++;
+            return;
+        }
         if (ins == null || ins.isEmpty()) {
             throw new IOException("ExternalRuntimePostOperator input stream not initialized");
         }
-        final int endpointIndex = tcpConfig.selectEndpointIndex(expectedRowId, ins.size());
-        if (tcpConfig.isReorderResponses()) {
-            final ResponseBlock block =
-                    readNextOrderedBlock(endpointIndex, fallbackKind, expectedRowId);
-            expectedRowId++;
-            for (int i = 0; i < block.rows.size(); i++) {
-                emitWithTimestamp(block.rows.get(i), element);
-            }
-            return;
-        }
 
-        readAndEmitBlock(endpointIndex, fallbackKind, expectedRowId, element);
+        final int endpointIndex = tcpConfig.selectEndpointIndex(expectedRowId, ins.size());
+        readAndEmitBlock(endpointIndex, fallbackKind, expectedRowId, timestamp);
         expectedRowId++;
     }
 
-    private ResponseBlock readNextBlock(int endpointIndex, RowKind fallbackKind) throws IOException {
-        final BufferedInputStream in = ins.get(endpointIndex);
+    private void readNextDynamicBlockFromQueue(RowKind fallbackKind, long targetRowId, long timestamp)
+            throws IOException {
+        if (shouldSkipMissingRowImmediately(targetRowId)) {
+            markMissingRowSkipped(targetRowId);
+            return;
+        }
+        final long waitStartNanos = System.nanoTime();
+        if (!dynamicBlockBuffer.isEmpty()) {
+            final ResponseBlock buffered = dynamicBlockBuffer.remove(targetRowId);
+            if (buffered != null) {
+                emitBufferedBlock(buffered, fallbackKind, timestamp);
+                clearMissingSkipState();
+                return;
+            }
+        }
 
-        final int batchLen = readIntBE(in);
-        ensureFrameBuf(batchLen);
-        readFully(in, frameBuf, 0, batchLen);
+        while (true) {
+            final IOException failure =
+                    asyncReadFailure == null ? null : asyncReadFailure.getAndSet(null);
+            if (failure != null) {
+                throw failure;
+            }
+            final ResponseBlock block;
+            try {
+                block = asyncResponseQueue.poll(10L, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for async response block.", e);
+            }
+            if (block == null) {
+                if (shouldSkipMissingTargetRow(waitStartNanos)) {
+                    LOG.warn(
+                            "ExternalRuntimePostOperator skipping missing rowId {} after failover timeout ({} ms).",
+                            targetRowId,
+                            tcpConfig.getFailoverMissingRowTimeoutMs());
+                    markMissingRowSkipped(targetRowId);
+                    return;
+                }
+                continue;
+            }
+            clearMissingSkipState();
+            if (block.rowId == targetRowId) {
+                emitBufferedBlock(block, fallbackKind, timestamp);
+                return;
+            }
+            bufferBlock(block, targetRowId);
+            if (shouldSkipMissingTargetRow(waitStartNanos)) {
+                LOG.warn(
+                        "ExternalRuntimePostOperator skipping missing rowId {} after failover timeout ({} ms).",
+                        targetRowId,
+                        tcpConfig.getFailoverMissingRowTimeoutMs());
+                markMissingRowSkipped(targetRowId);
+                return;
+            }
+        }
+    }
 
+    private boolean shouldSkipMissingRowImmediately(long targetRowId) {
+        if (!consecutiveMissingSkipMode) {
+            return false;
+        }
+        if (targetRowId != lastSkippedMissingRowId + 1L) {
+            return false;
+        }
+        if (asyncResponseQueue != null && !asyncResponseQueue.isEmpty()) {
+            return false;
+        }
+        return dynamicBlockBuffer == null || dynamicBlockBuffer.isEmpty();
+    }
+
+    private void markMissingRowSkipped(long targetRowId) {
+        consecutiveMissingSkipMode = true;
+        lastSkippedMissingRowId = targetRowId;
+    }
+
+    private void clearMissingSkipState() {
+        consecutiveMissingSkipMode = false;
+        lastSkippedMissingRowId = -1L;
+    }
+
+    private boolean shouldSkipMissingTargetRow(long waitStartNanos) {
+        if (!tcpConfig.isAutoFailoverEnabled()) {
+            return false;
+        }
+        final int timeoutMs = tcpConfig.getFailoverMissingRowTimeoutMs();
+        if (timeoutMs <= 0) {
+            return false;
+        }
+        final long elapsedNanos = System.nanoTime() - waitStartNanos;
+        return elapsedNanos >= timeoutMs * 1_000_000L;
+    }
+
+    private void startResponseReaderThreads() {
+        for (int i = 0; i < endpoints.size(); i++) {
+            final int endpointIndex = i;
+            final Thread reader =
+                    new Thread(
+                            () -> runResponseReader(endpointIndex),
+                            "external-runtime-post-read-" + endpointIndex);
+            reader.setDaemon(true);
+            responseReaderThreads.add(reader);
+            reader.start();
+        }
+    }
+
+    private void runResponseReader(int endpointIndex) {
+        while (responseReadersRunning) {
+            try {
+                if (!isEndpointConnected(endpointIndex)) {
+                    maybeReconnectOneEndpoint(endpointIndex);
+                    TimeUnit.MILLISECONDS.sleep(2L);
+                    continue;
+                }
+                final BufferedInputStream in = ins.get(endpointIndex);
+                if (in == null) {
+                    TimeUnit.MILLISECONDS.sleep(2L);
+                    continue;
+                }
+                final int batchLen = readIntBE(in);
+                if (batchLen <= 0 || batchLen > MAX_FRAME_BYTES) {
+                    throw new IOException(
+                            "ExternalRuntimePostOperator received invalid frame size: " + batchLen);
+                }
+                final byte[] payload = new byte[batchLen];
+                readFully(in, payload, 0, batchLen);
+                final long blockRowId = parseBlockRowId(payload);
+                while (responseReadersRunning) {
+                    if (asyncResponseQueue.offer(
+                            new ResponseBlock(blockRowId, payload, endpointIndex),
+                            10L,
+                            TimeUnit.MILLISECONDS)) {
+                        break;
+                    }
+                }
+            } catch (IOException io) {
+                if (io instanceof SocketTimeoutException) {
+                    continue;
+                }
+                markEndpointDisconnected(endpointIndex, io);
+                if (!dynamicRoutingEnabled && asyncReadFailure != null) {
+                    asyncReadFailure.compareAndSet(null, io);
+                    return;
+                }
+            } catch (InterruptedException ie) {
+                if (!responseReadersRunning) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private long parseBlockRowId(byte[] payload) throws IOException {
+        if (payload.length < 12) {
+            throw new IOException("ExternalRuntimePostOperator received truncated frame");
+        }
+        return readLongBE(payload, 4);
+    }
+
+    private void maybeReconnectOneEndpoint(int endpointIndex) {
+        final long now = System.nanoTime();
+        if (endpointReconnectAtNanos[endpointIndex] > now) {
+            return;
+        }
+        try {
+            connectEndpoint(endpointIndex);
+        } catch (IOException e) {
+            endpointReconnectAtNanos[endpointIndex] =
+                    now + (long) tcpConfig.getFailoverReconnectBackoffMs() * 1_000_000L;
+            if (!dynamicRoutingEnabled && asyncReadFailure != null) {
+                asyncReadFailure.compareAndSet(null, e);
+            }
+        }
+    }
+
+    private void readNextDynamicBlockDirect(
+            RowKind fallbackKind, long targetRowId, long timestamp)
+            throws IOException {
+        // Check buffer for previously read out-of-order blocks
+        if (!dynamicBlockBuffer.isEmpty()) {
+            final ResponseBlock buffered = dynamicBlockBuffer.remove(targetRowId);
+            if (buffered != null) {
+                emitBufferedBlock(buffered, fallbackKind, timestamp);
+                observeMatchedTargetEndpoint(buffered.endpointIndex, targetRowId);
+                maybeRefreshRoutingWidthHint(targetRowId);
+                return;
+            }
+        }
+
+        if (tryReadHintedEndpoint(fallbackKind, targetRowId, timestamp)) {
+            return;
+        }
+
+        while (true) {
+            final int endpointIndex = pollNextReadyEndpoint();
+            if (endpointIndex < 0) {
+                if (tryReadHintedEndpoint(fallbackKind, targetRowId, timestamp)) {
+                    return;
+                }
+                continue;
+            }
+            try {
+                final Long blockRowId = tryReadFrameIntoBufferFromChannel(endpointIndex);
+                if (blockRowId == null) {
+                    continue;
+                }
+                if (blockRowId == targetRowId) {
+                    emitRowsFromBuffer(fallbackKind, timestamp);
+                    observeMatchedTargetEndpoint(endpointIndex, targetRowId);
+                    maybeRefreshRoutingWidthHint(targetRowId);
+                    return;
+                }
+                bufferBlock(materializeBlockFromBuffer(blockRowId, endpointIndex), targetRowId);
+            } catch (IOException io) {
+                markEndpointDisconnected(endpointIndex, io);
+            }
+        }
+    }
+
+    private boolean tryReadHintedEndpoint(RowKind fallbackKind, long targetRowId, long timestamp)
+            throws IOException {
+        if (channels == null || channels.isEmpty()) {
+            return false;
+        }
+        final int width = Math.max(1, Math.min(routingWidthHint, channels.size()));
+        final int endpointIndex = Math.floorMod(targetRowId, width);
+        if (!isEndpointConnected(endpointIndex)) {
+            return false;
+        }
+        try {
+            final Long blockRowId = tryReadFrameIntoBufferFromChannel(endpointIndex);
+            if (blockRowId == null) {
+                return false;
+            }
+            if (blockRowId == targetRowId) {
+                emitRowsFromBuffer(fallbackKind, timestamp);
+                observeMatchedTargetEndpoint(endpointIndex, targetRowId);
+                maybeRefreshRoutingWidthHint(targetRowId);
+                return true;
+            }
+            bufferBlock(materializeBlockFromBuffer(blockRowId, endpointIndex), targetRowId);
+            return false;
+        } catch (IOException io) {
+            markEndpointDisconnected(endpointIndex, io);
+            return false;
+        }
+    }
+
+    private Long tryReadFrameIntoBufferFromChannel(int endpointIndex) throws IOException {
+        final SocketChannel channel = channels.get(endpointIndex);
+        if (channel == null) {
+            throw new IOException(
+                    "ExternalRuntimePostOperator endpoint "
+                            + endpointIndex
+                            + " channel not initialized");
+        }
+        final ChannelFrameState state = channelFrameStates.get(endpointIndex);
+
+        if (!state.readingPayload) {
+            while (state.lenBuf.hasRemaining()) {
+                final int lenRead = channel.read(state.lenBuf);
+                if (lenRead < 0) {
+                    throw new IOException("EOF while reading dynamic frame length");
+                }
+                if (lenRead == 0) {
+                    return null;
+                }
+            }
+            state.lenBuf.flip();
+            final int batchLen = state.lenBuf.getInt();
+            state.lenBuf.clear();
+            if (batchLen <= 0 || batchLen > MAX_FRAME_BYTES) {
+                throw new IOException(
+                        "ExternalRuntimePostOperator received invalid frame size: " + batchLen);
+            }
+            state.ensurePayloadCapacity(batchLen);
+            state.payloadBuf.clear();
+            state.payloadBuf.limit(batchLen);
+            state.readingPayload = true;
+        }
+
+        while (state.payloadBuf.hasRemaining()) {
+            final int payloadRead = channel.read(state.payloadBuf);
+            if (payloadRead < 0) {
+                throw new IOException("EOF while reading dynamic frame payload");
+            }
+            if (payloadRead == 0) {
+                return null;
+            }
+        }
+
+        state.payloadBuf.flip();
+        final int batchLen = state.payloadBuf.remaining();
+        lastFrameLen = batchLen;
+
+        // decode directly from payloadBuf's backing array (heap buffer, see ChannelFrameState),
+        // no per-block copy
+        frameBuf = state.payloadBuf.array();
+
+        state.readingPayload = false;
+
+        return parseFrameHeaderFromFrameBuf();
+    }
+
+    /**
+     * Emits rows directly from frameBuf without allocating ResponseBlock/ArrayList.
+     */
+    private void emitRowsFromBuffer(RowKind fallbackKind, long timestamp) throws IOException {
+        int pos = frameDataPos;
+        final int count = frameDataCount;
+        final GenericRowData rowToEmit = reuseObjects ? reuseRow : null;
+        for (int i = 0; i < count; i++) {
+            pos = decodeAndEmitRow(
+                    frameBuf, pos, fallbackKind, rowToEmit, reuseStreamRecord, timestamp);
+        }
+    }
+
+    /**
+     * Copies the current frame for out-of-order buffering without decoding rows
+     * eagerly.
+     */
+    private ResponseBlock materializeBlockFromBuffer(long blockRowId, int endpointIndex) {
+        final byte[] payload = new byte[lastFrameLen];
+        System.arraycopy(frameBuf, 0, payload, 0, lastFrameLen);
+        return new ResponseBlock(blockRowId, payload, endpointIndex);
+    }
+
+    private void emitBufferedBlock(ResponseBlock block, RowKind fallbackKind, long timestamp)
+            throws IOException {
+        ensureFrameBuf(block.payload.length);
+        System.arraycopy(block.payload, 0, frameBuf, 0, block.payload.length);
+        lastFrameLen = block.payload.length;
+        final long blockRowId = parseFrameHeaderFromFrameBuf();
+        if (blockRowId != block.rowId) {
+            throw new IOException(
+                    "ExternalRuntimePostOperator buffered block rowId mismatch: expected "
+                            + block.rowId
+                            + " but parsed "
+                            + blockRowId);
+        }
+        emitRowsFromBuffer(fallbackKind, timestamp);
+    }
+
+    private void observeMatchedTargetEndpoint(int endpointIndex, long targetRowId) {
+        if (lastMatchedTargetRowIdByEndpoint == null
+                || endpointIndex < 0
+                || endpointIndex >= lastMatchedTargetRowIdByEndpoint.length) {
+            return;
+        }
+        lastMatchedTargetRowIdByEndpoint[endpointIndex] = targetRowId;
+    }
+
+    private void maybeRefreshRoutingWidthHint(long targetRowId) {
+        if (lastMatchedTargetRowIdByEndpoint == null || lastMatchedTargetRowIdByEndpoint.length == 0) {
+            return;
+        }
+        final long cutoff = targetRowId - ROUTING_HINT_RECENCY_ROWS;
+        int widest = 1;
+        for (int i = lastMatchedTargetRowIdByEndpoint.length - 1; i >= 0; i--) {
+            if (lastMatchedTargetRowIdByEndpoint[i] >= cutoff) {
+                widest = i + 1;
+                break;
+            }
+        }
+        routingWidthHint = Math.max(1, widest);
+    }
+
+    /** Polls selector for one readable endpoint, returns index or -1 on timeout. */
+    private int pollNextReadyEndpoint() throws IOException {
+        maybeReconnectEndpoints();
+        updateConnectedEndpointCount();
+
+        if (cachedConnectedCount <= 0) {
+            maybeReconnectEndpoints();
+            if (cachedConnectedCount <= 0) {
+                throw new IOException(
+                        "ExternalRuntimePostOperator has no connected runtime endpoints.");
+            }
+        }
+
+        if (selector == null) {
+            return -1;
+        }
+
+        if (readyEndpointQueue != null) {
+            while (!readyEndpointQueue.isEmpty()) {
+                final int endpointIndex = readyEndpointQueue.pollFirst();
+                if (readyEndpointQueued != null && endpointIndex >= 0 && endpointIndex < readyEndpointQueued.length) {
+                    readyEndpointQueued[endpointIndex] = false;
+                }
+                if (isEndpointConnected(endpointIndex)) {
+                    return endpointIndex;
+                }
+            }
+        }
+
+        // First do a non-blocking poll; in steady state this avoids a blocking select()
+        // call per row.
+        int ready = selector.selectNow();
+        if (ready <= 0) {
+            // Fall back to a blocking select with the configured timeout.
+            ready = selector.select(tcpConfig.getFailoverPollTimeoutMs());
+        }
+        if (ready <= 0) {
+            maybeReconnectEndpoints();
+            return -1;
+        }
+
+        final Iterator<SelectionKey> it = selector.selectedKeys().iterator();
+        while (it.hasNext()) {
+            final SelectionKey key = it.next();
+            it.remove();
+            if (!key.isValid() || !key.isReadable()) {
+                continue;
+            }
+            final int endpointIndex = (Integer) key.attachment();
+            if (isEndpointConnected(endpointIndex)) {
+                if (readyEndpointQueued == null
+                        || endpointIndex < 0
+                        || endpointIndex >= readyEndpointQueued.length
+                        || !readyEndpointQueued[endpointIndex]) {
+                    readyEndpointQueue.addLast(endpointIndex);
+                    if (readyEndpointQueued != null
+                            && endpointIndex >= 0
+                            && endpointIndex < readyEndpointQueued.length) {
+                        readyEndpointQueued[endpointIndex] = true;
+                    }
+                }
+            }
+        }
+        while (readyEndpointQueue != null && !readyEndpointQueue.isEmpty()) {
+            final int endpointIndex = readyEndpointQueue.pollFirst();
+            if (readyEndpointQueued != null && endpointIndex >= 0 && endpointIndex < readyEndpointQueued.length) {
+                readyEndpointQueued[endpointIndex] = false;
+            }
+            if (isEndpointConnected(endpointIndex)) {
+                return endpointIndex;
+            }
+        }
+        maybeReconnectEndpoints();
+        return -1;
+    }
+
+    private void bufferBlock(ResponseBlock block, long targetRowId) throws IOException {
+        if (block.rowId < targetRowId) {
+            LOG.debug(
+                    "ExternalRuntimePostOperator dropping stale dynamic block rowId={} (targetRowId={}).",
+                    block.rowId,
+                    targetRowId);
+            return;
+        }
+        dynamicBlockBuffer.put(block.rowId, block);
+        if (dynamicBlockBuffer.size() > tcpConfig.getReorderMaxBuffer()) {
+            throw new IOException(
+                    "ExternalRuntimePostOperator dynamic reorder buffer exceeded "
+                            + tcpConfig.getReorderMaxBuffer()
+                            + " entries; increase reorderMax or reduce failover lag.");
+        }
+    }
+
+    private long parseFrameHeaderFromFrameBuf() throws IOException {
         int pos = 0;
-
         pos += 4; // __op
         final long blockRowId = readLongBE(frameBuf, pos);
         pos += 8;
 
         final boolean countIsNull = (frameBuf[pos] & 1) != 0;
         pos += 1;
-
         if (countIsNull) {
             throw new IOException("ExternalRuntimePostOperator received null count");
         }
 
         final int count = readIntBE(frameBuf, pos);
         pos += 4;
-
         if (count < 0) {
             throw new IOException("ExternalRuntimePostOperator received negative count: " + count);
         }
 
-        final List<RowData> rows = new ArrayList<>(count);
-        for (int i = 0; i < count; i++) {
-            pos = decodeRowFromBuffer(frameBuf, pos, fallbackKind, rows);
-        }
-
-        return new ResponseBlock(blockRowId, rows);
+        this.frameDataPos = pos;
+        this.frameDataCount = count;
+        return blockRowId;
     }
 
-    private int decodeRowFromBuffer(byte[] buffer, int pos, RowKind fallbackKind, List<RowData> rows) throws IOException {
-        final int op = readIntBE(buffer, pos);
-        pos += 4;
-        pos += 8; // skip __rowId
+    private void updateConnectedEndpointCount() {
+        int count = 0;
+        for (int i = 0; i < endpoints.size(); i++) {
+            if (isEndpointConnected(i)) {
+                count++;
+            }
+        }
+        cachedConnectedCount = count;
+    }
 
-        final int nFields = resultFieldTypes.size();
-        final int nullBytes = (nFields + 7) >>> 3;
-        final int nullBitmapPos = pos;
-        pos += nullBytes;
+    private int connectedEndpointCount() {
+        if (sockets == null) {
+            return 0;
+        }
+        int connected = 0;
+        for (int i = 0; i < sockets.size(); i++) {
+            if (isEndpointConnected(i)) {
+                connected++;
+            }
+        }
+        return connected;
+    }
 
-        final GenericRowData outRow = new GenericRowData(nFields);
+    private boolean isEndpointConnected(int endpointIndex) {
+        if (endpointIndex < 0 || endpointIndex >= sockets.size()) {
+            return false;
+        }
+        if (dynamicRoutingEnabled) {
+            if (threadedReadEnabled) {
+                return sockets.get(endpointIndex) != null
+                        && ins.get(endpointIndex) != null
+                        && outs.get(endpointIndex) != null;
+            }
+            return sockets.get(endpointIndex) != null
+                    && outs.get(endpointIndex) != null
+                    && channels.get(endpointIndex) != null;
+        }
+        return endpointIndex >= 0
+                && endpointIndex < sockets.size()
+                && sockets.get(endpointIndex) != null
+                && ins.get(endpointIndex) != null
+                && outs.get(endpointIndex) != null;
+    }
 
-        for (int i = 0; i < nFields; i++) {
-            if (isNullBitSet(buffer, nullBitmapPos, i)) {
-                outRow.setField(i, null);
+    private void maybeReconnectEndpoints() {
+        if (!dynamicRoutingEnabled || threadedReadEnabled) {
+            return;
+        }
+        final long now = System.nanoTime();
+        for (int i = 0; i < endpoints.size(); i++) {
+            if (isEndpointConnected(i) || endpointReconnectAtNanos[i] > now) {
                 continue;
             }
+            try {
+                connectEndpoint(i);
+            } catch (IOException e) {
+                endpointReconnectAtNanos[i] = now + (long) tcpConfig.getFailoverReconnectBackoffMs() * 1_000_000L;
+                LOG.debug(
+                        "ExternalRuntimePostOperator reconnect attempt failed for endpoint {}:{}",
+                        endpoints.get(i).getHost(),
+                        endpoints.get(i).getReceivePort(),
+                        e);
+            }
+        }
+    }
 
-            final WireType wt = resultWireTypes[i];
-            pos = decodeFieldValueAndAdvance(buffer, pos, wt, resultReadTypes.get(i), resultFieldTypes.get(i), outRow, i);
+    private void connectEndpoint(int endpointIndex) throws IOException {
+        final ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint endpoint = endpoints.get(endpointIndex);
+
+        if (dynamicRoutingEnabled && !threadedReadEnabled) {
+            SocketChannel candidateChannel = null;
+            Socket candidateSocket = null;
+            BufferedOutputStream candidateOut = null;
+            try {
+                candidateChannel = SocketChannel.open();
+                candidateChannel.configureBlocking(true);
+                candidateSocket = candidateChannel.socket();
+                candidateSocket.setTcpNoDelay(true);
+                candidateSocket.connect(
+                        new InetSocketAddress(endpoint.getHost(), endpoint.getReceivePort()),
+                        tcpConfig.getConnectTimeoutMs());
+
+                candidateOut = new BufferedOutputStream(
+                        candidateSocket.getOutputStream(), tcpConfig.getBufferSize());
+                writeLengthPrefixedJson(candidateOut, configJson);
+                candidateOut.flush();
+
+                candidateChannel.configureBlocking(false);
+                selector.wakeup();
+                candidateChannel.register(selector, SelectionKey.OP_READ, endpointIndex);
+
+                closeQuietly(channels.get(endpointIndex));
+                closeQuietly(outs.get(endpointIndex));
+                closeQuietly(sockets.get(endpointIndex));
+
+                channels.set(endpointIndex, candidateChannel);
+                ins.set(endpointIndex, null);
+                outs.set(endpointIndex, candidateOut);
+                sockets.set(endpointIndex, candidateSocket);
+                endpointReconnectAtNanos[endpointIndex] = 0L;
+                refreshPrimarySocket();
+                updateConnectedEndpointCount();
+                return;
+            } catch (IOException e) {
+                closeQuietly(candidateOut);
+                closeQuietly(candidateSocket);
+                closeQuietly(candidateChannel);
+                throw e;
+            }
         }
 
-        outRow.setRowKind(ExternalRuntimeBinaryCodec.opToRowKind(op, fallbackKind));
-        rows.add(outRow);
-        return pos;
+        Socket candidateSocket = null;
+        BufferedInputStream candidateIn = null;
+        BufferedOutputStream candidateOut = null;
+        try {
+            candidateSocket = connectSocket(
+                    endpoint.getHost(),
+                    endpoint.getReceivePort(),
+                    tcpConfig.getConnectTimeoutMs());
+
+            final int readTimeoutMs = tcpConfig.getReadTimeoutMs() > 0
+                    ? tcpConfig.getReadTimeoutMs()
+                    : 0;
+            if (readTimeoutMs > 0) {
+                candidateSocket.setSoTimeout(readTimeoutMs);
+            }
+
+            candidateIn = new BufferedInputStream(candidateSocket.getInputStream(), tcpConfig.getBufferSize());
+            candidateOut = new BufferedOutputStream(candidateSocket.getOutputStream(), tcpConfig.getBufferSize());
+            writeLengthPrefixedJson(candidateOut, configJson);
+            candidateOut.flush();
+
+            closeQuietly(ins.get(endpointIndex));
+            closeQuietly(outs.get(endpointIndex));
+            closeQuietly(sockets.get(endpointIndex));
+
+            ins.set(endpointIndex, candidateIn);
+            outs.set(endpointIndex, candidateOut);
+            sockets.set(endpointIndex, candidateSocket);
+            endpointReconnectAtNanos[endpointIndex] = 0L;
+            refreshPrimarySocket();
+            updateConnectedEndpointCount();
+        } catch (IOException e) {
+            closeQuietly(candidateIn);
+            closeQuietly(candidateOut);
+            closeQuietly(candidateSocket);
+            throw e;
+        }
+    }
+
+    private void markEndpointDisconnected(int endpointIndex, IOException cause) {
+        final ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint endpoint = endpoints.get(endpointIndex);
+        if (dynamicRoutingEnabled) {
+            if (!threadedReadEnabled) {
+                closeQuietly(channels.get(endpointIndex));
+                channels.set(endpointIndex, null);
+                final ChannelFrameState frameState = channelFrameStates.get(endpointIndex);
+                frameState.lenBuf.clear();
+                frameState.readingPayload = false;
+                if (frameState.payloadBuf != null) {
+                    frameState.payloadBuf.clear();
+                }
+                if (readyEndpointQueue != null) {
+                    readyEndpointQueue.removeIf(idx -> idx == endpointIndex);
+                }
+                if (readyEndpointQueued != null
+                        && endpointIndex >= 0
+                        && endpointIndex < readyEndpointQueued.length) {
+                    readyEndpointQueued[endpointIndex] = false;
+                }
+            }
+        }
+        closeQuietly(ins.get(endpointIndex));
+        closeQuietly(outs.get(endpointIndex));
+        closeQuietly(sockets.get(endpointIndex));
+        ins.set(endpointIndex, null);
+        outs.set(endpointIndex, null);
+        sockets.set(endpointIndex, null);
+        endpointReconnectAtNanos[endpointIndex] = System.nanoTime()
+                + (long) tcpConfig.getFailoverReconnectBackoffMs() * 1_000_000L;
+        refreshPrimarySocket();
+        updateConnectedEndpointCount();
+        LOG.warn(
+                "ExternalRuntimePostOperator disconnected endpoint {}:{}; will retry.",
+                endpoint.getHost(),
+                endpoint.getReceivePort(),
+                cause);
+    }
+
+    private void refreshPrimarySocket() {
+        socket = null;
+        if (sockets == null) {
+            return;
+        }
+        for (Socket candidate : sockets) {
+            if (candidate != null) {
+                socket = candidate;
+                return;
+            }
+        }
     }
 
     private void readAndEmitBlock(
             int endpointIndex,
             RowKind fallbackKind,
             long targetRowId,
-            StreamRecord<RowData> element)
+            long timestamp)
             throws IOException {
         final BufferedInputStream in = ins.get(endpointIndex);
 
@@ -255,8 +956,6 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         }
 
         final GenericRowData rowToEmit = reuseObjects ? reuseRow : null;
-        final boolean hasTimestamp = element.hasTimestamp();
-        final long timestamp = hasTimestamp ? element.getTimestamp() : 0L;
 
         if (reuseObjects && reuseStreamRecord != null) {
             for (int i = 0; i < count; i++) {
@@ -264,7 +963,8 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
             }
         } else {
             for (int i = 0; i < count; i++) {
-                pos = decodeAndEmitRow(frameBuf, pos, fallbackKind, rowToEmit, null, timestamp);
+                pos = decodeAndEmitRow(
+                        frameBuf, pos, fallbackKind, rowToEmit, reuseStreamRecord, timestamp);
             }
         }
     }
@@ -287,10 +987,9 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         final int nullBitmapPos = pos;
         pos += nullBytes;
 
-        final GenericRowData outRow =
-                reuseRow != null && reuseRow.getArity() == nFields
-                        ? reuseRow
-                        : new GenericRowData(nFields);
+        final GenericRowData outRow = reuseRow != null && reuseRow.getArity() == nFields
+                ? reuseRow
+                : new GenericRowData(nFields);
 
         for (int i = 0; i < nFields; i++) {
             if (isNullBitSet(buffer, nullBitmapPos, i)) {
@@ -299,7 +998,8 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
             }
 
             final WireType wt = resultWireTypes[i];
-            pos = decodeFieldValueAndAdvance(buffer, pos, wt, resultReadTypes.get(i), resultFieldTypes.get(i), outRow, i);
+            pos = decodeFieldValueAndAdvance(buffer, pos, wt, resultReadTypes.get(i), resultFieldTypes.get(i), outRow,
+                    i);
         }
 
         outRow.setRowKind(ExternalRuntimeBinaryCodec.opToRowKind(op, fallbackKind));
@@ -359,8 +1059,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
             case DECIMAL_UNSCALED_I64: {
                 final long unscaled = readLongBE(buf, pos);
                 if (targetType instanceof org.apache.flink.table.types.logical.DecimalType) {
-                    final org.apache.flink.table.types.logical.DecimalType dt =
-                            (org.apache.flink.table.types.logical.DecimalType) targetType;
+                    final org.apache.flink.table.types.logical.DecimalType dt = (org.apache.flink.table.types.logical.DecimalType) targetType;
                     outRow.setField(fieldIndex, org.apache.flink.table.data.DecimalData.fromUnscaledLong(
                             unscaled, dt.getPrecision(), dt.getScale()));
                 } else {
@@ -373,8 +1072,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                 byte[] decBytes = new byte[decLen];
                 System.arraycopy(buf, pos + 4, decBytes, 0, decLen);
                 if (targetType instanceof org.apache.flink.table.types.logical.DecimalType) {
-                    final org.apache.flink.table.types.logical.DecimalType dt =
-                            (org.apache.flink.table.types.logical.DecimalType) targetType;
+                    final org.apache.flink.table.types.logical.DecimalType dt = (org.apache.flink.table.types.logical.DecimalType) targetType;
                     final java.math.BigInteger bi = new java.math.BigInteger(decBytes);
                     final java.math.BigDecimal bd = new java.math.BigDecimal(bi, dt.getScale());
                     outRow.setField(fieldIndex, org.apache.flink.table.data.DecimalData.fromBigDecimal(
@@ -395,42 +1093,32 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         return (payload[byteIndex] & (1 << bit)) != 0;
     }
 
-    private void emitWithTimestamp(RowData row, StreamRecord<RowData> input) {
-        if (input.hasTimestamp()) {
-            output.collect(new StreamRecord<>(row, input.getTimestamp()));
-        } else {
-            output.collect(new StreamRecord<>(row));
-        }
-    }
-
-    private ResponseBlock readNextOrderedBlock(
-            int endpointIndex, RowKind fallbackKind, long targetId) throws IOException {
-        final Map<Long, ResponseBlock> buffer = reorderBlockBuffers.get(endpointIndex);
-        ResponseBlock ready = buffer.remove(targetId);
-        while (ready == null) {
-            final ResponseBlock next = readNextBlock(endpointIndex, fallbackKind);
-            if (next.rowId == targetId) {
-                ready = next;
-            } else {
-                buffer.put(next.rowId, next);
-                if (buffer.size() > tcpConfig.getReorderMaxBuffer()) {
-                    throw new IOException(
-                            "ExternalRuntimePostOperator reorder buffer exceeded "
-                                    + tcpConfig.getReorderMaxBuffer()
-                                    + " entries; increase reorderMax or enforce ordered responses.");
-                }
-            }
-        }
-        return ready;
-    }
-
     private static final class ResponseBlock {
         private final long rowId;
-        private final List<RowData> rows;
+        private final byte[] payload;
+        private final int endpointIndex;
 
-        private ResponseBlock(long rowId, List<RowData> rows) {
+        private ResponseBlock(long rowId, byte[] payload, int endpointIndex) {
             this.rowId = rowId;
-            this.rows = rows;
+            this.payload = payload;
+            this.endpointIndex = endpointIndex;
+        }
+    }
+
+    private static final class ChannelFrameState {
+        private final ByteBuffer lenBuf = ByteBuffer.allocate(4);
+        private ByteBuffer payloadBuf = ByteBuffer.allocate(8 * 1024);
+        private boolean readingPayload;
+
+        private void ensurePayloadCapacity(int payloadSize) {
+            if (payloadBuf.capacity() >= payloadSize) {
+                return;
+            }
+            int cap = payloadBuf.capacity();
+            while (cap < payloadSize) {
+                cap <<= 1;
+            }
+            payloadBuf = ByteBuffer.allocate(cap);
         }
     }
 
@@ -486,30 +1174,77 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         }
     }
 
+    private void stopResponseReaderThreads() {
+        responseReadersRunning = false;
+        if (responseReaderThreads != null) {
+            for (int i = 0; i < responseReaderThreads.size(); i++) {
+                final Thread reader = responseReaderThreads.get(i);
+                if (reader != null) {
+                    reader.interrupt();
+                }
+            }
+            for (int i = 0; i < responseReaderThreads.size(); i++) {
+                final Thread reader = responseReaderThreads.get(i);
+                if (reader == null) {
+                    continue;
+                }
+                try {
+                    reader.join(1000L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            responseReaderThreads.clear();
+        }
+    }
+
     @Override
     protected void closeInternal() throws Exception {
         IOException error = null;
+
+        stopResponseReaderThreads();
 
         codec = null;
         reuseRow = null;
         reuseStreamRecord = null;
         frameBuf = null;
-        reorderBlockBuffers = null;
+        dynamicBlockBuffer = null;
+        endpointReconnectAtNanos = null;
+        configJson = null;
+        dynamicRoutingEnabled = false;
+        cachedConnectedCount = 0;
+        lastFrameLen = 0;
+        routingWidthHint = 0;
+        threadedReadEnabled = false;
+        asyncResponseQueue = null;
+        asyncReadFailure = null;
+        consecutiveMissingSkipMode = false;
+        lastSkippedMissingRowId = -1L;
 
-        if (outs != null) {
-            for (BufferedOutputStream out : outs) {
-                error = suppress(error, flushAndClose(out));
+        if (channels != null) {
+            for (SocketChannel channel : channels) {
+                error = suppress(error, closeQuietly(channel));
             }
         }
-        outs = null;
+        channels = null;
+        channelFrameStates = null;
+        responseReaderThreads = null;
 
-        if (ins != null) {
-            for (BufferedInputStream in : ins) {
-                error = suppress(error, closeQuietly(in));
-            }
+        if (selector != null) {
+            error = suppress(error, closeQuietly(selector));
         }
-        ins = null;
+        selector = null;
+        if (readyEndpointQueue != null) {
+            readyEndpointQueue.clear();
+        }
+        readyEndpointQueue = null;
+        readyEndpointQueued = null;
+        lastMatchedTargetRowIdByEndpoint = null;
 
+        // Close sockets first to sever connections, preventing
+        // BufferedOutputStream.close()
+        // from attempting a flush on a broken pipe during shutdown.
         if (sockets != null) {
             for (Socket sock : sockets) {
                 error = suppress(error, closeQuietly(sock));
@@ -518,10 +1253,24 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         sockets = null;
         socket = null;
 
+        // Now close streams; flush will fail harmlessly since sockets are already
+        // closed.
+        if (outs != null) {
+            for (BufferedOutputStream out : outs) {
+                closeQuietly(out);
+            }
+        }
+        outs = null;
+
+        if (ins != null) {
+            for (BufferedInputStream in : ins) {
+                closeQuietly(in);
+            }
+        }
+        ins = null;
+
         if (error != null) {
             throw error;
         }
     }
-
-
 }
