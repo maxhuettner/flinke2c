@@ -11,6 +11,8 @@ import org.apache.flink.table.runtime.functions.table.externalruntime.ExternalRu
 
 import javax.annotation.Nullable;
 
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.EOFException;
@@ -53,7 +55,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     private transient List<ChannelFrameState> channelFrameStates;
     private transient Selector selector;
     private transient long expectedRowId;
-    private transient Map<Long, ResponseBlock> dynamicBlockBuffer;
+    private transient Long2ObjectOpenHashMap<ResponseBlock> dynamicBlockBuffer;
     private transient boolean dynamicRoutingEnabled;
     private transient long[] endpointReconnectAtNanos;
     private transient String configJson;
@@ -96,11 +98,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         final int totalSubtasks = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         this.endpoints = tcpConfig.selectEndpoints(subtaskIndex, totalSubtasks);
         this.dynamicRoutingEnabled = tcpConfig.isAutoParallelismEnabled();
-        // Always use per-endpoint reader threads so that fixed-parallelism mode can also
-        // buffer out-of-order responses; this allows PRE's least-loaded routing to shift
-        // more work to faster endpoints without causing POST to stall on a slow endpoint's
-        // rows while holding up all subsequent (already-received) responses.
-        this.threadedReadEnabled = true;
+        this.threadedReadEnabled = dynamicRoutingEnabled;
         this.ins = new ArrayList<>(endpoints.size());
         this.outs = new ArrayList<>(endpoints.size());
         this.sockets = new ArrayList<>(endpoints.size());
@@ -183,8 +181,8 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         this.frameBuf = new byte[tcpConfig.getBufferSize()];
 
         this.expectedRowId = 0L;
-        if (threadedReadEnabled) {
-            this.dynamicBlockBuffer = new HashMap<>();
+        if (dynamicRoutingEnabled) {
+            this.dynamicBlockBuffer = new Long2ObjectOpenHashMap<>();
         } else {
             this.dynamicBlockBuffer = null;
         }
@@ -212,18 +210,12 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         final RowData inRow = element.getValue();
         final RowKind fallbackKind = inRow.getRowKind();
         final long timestamp = element.hasTimestamp() ? element.getTimestamp() : 0L;
-        // Threaded path: used for both auto-parallelism and fixed-parallelism modes.
-        // Reader threads buffer responses from all endpoints; the main thread matches by
-        // rowId so that out-of-order responses from faster endpoints are held and emitted
-        // without blocking while waiting for a slower endpoint's earlier rowId.
-        if (threadedReadEnabled) {
-            readNextDynamicBlockFromQueue(fallbackKind, expectedRowId, timestamp);
-            expectedRowId++;
-            return;
-        }
-        // NIO selector path (auto-parallelism without threaded reads — retained for
-        // reference but unreachable while threadedReadEnabled is always true).
         if (dynamicRoutingEnabled) {
+            if (threadedReadEnabled) {
+                readNextDynamicBlockFromQueue(fallbackKind, expectedRowId, timestamp);
+                expectedRowId++;
+                return;
+            }
             if (channels == null || channels.isEmpty()) {
                 throw new IOException("ExternalRuntimePostOperator dynamic channels not initialized");
             }
@@ -895,12 +887,6 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                     endpoint.getHost(),
                     endpoint.getReceivePort(),
                     tcpConfig.getConnectTimeoutMs());
-
-            candidateSocket.setTcpNoDelay(true);
-            // Mirror the PRE-side buffer cap so runtime→POST back-pressure also
-            // propagates at bufferSize boundaries rather than at the OS default.
-            candidateSocket.setReceiveBufferSize(tcpConfig.getBufferSize());
-            candidateSocket.setSendBufferSize(tcpConfig.getBufferSize());
 
             final int readTimeoutMs = tcpConfig.getReadTimeoutMs() > 0
                     ? tcpConfig.getReadTimeoutMs()
