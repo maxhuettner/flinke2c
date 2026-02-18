@@ -191,7 +191,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
             appendRowToAutoBatch(row, nowNanos);
             return;
         }
-        final int endpointIndex = selectActiveEndpointIndex();
+        final int endpointIndex = selectActiveEndpointIndex(nextRowId);
         final EndpointState endpointState = endpointStates.get(endpointIndex);
         if (endpointState.batchCount == 0) {
             endpointState.firstBufferedAtNanos = nowNanos;
@@ -230,26 +230,11 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         nextRowId++;
     }
 
-    private int selectActiveEndpointIndex() throws IOException {
+    private int selectActiveEndpointIndex(long rowId) throws IOException {
         ensureActiveEndpoints();
         final int activeCount = activeEndpointIndices.size();
-        if (activeCount == 1) {
-            return activeEndpointIndices.get(0);
-        }
-        int bestEndpoint = activeEndpointIndices.get(0);
-        int bestLoad = estimateEndpointLoad(bestEndpoint);
-        for (int i = 1; i < activeCount; i++) {
-            if (bestLoad == 0) {
-                break;
-            }
-            final int candidate = activeEndpointIndices.get(i);
-            final int load = estimateEndpointLoad(candidate);
-            if (load < bestLoad) {
-                bestLoad = load;
-                bestEndpoint = candidate;
-            }
-        }
-        return bestEndpoint;
+        final int routeIndex = tcpConfig.selectEndpointIndex(rowId, activeCount);
+        return activeEndpointIndices.get(routeIndex);
     }
 
     private void maybeReconnectAutoEndpoints() throws IOException {
@@ -509,6 +494,10 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         }
     }
 
+    private void handleEndpointFailure(int failedEndpointIndex, IOException cause) throws IOException {
+        handleEndpointFailure(failedEndpointIndex, cause, null, 0);
+    }
+
     private void handleEndpointFailure(
             int failedEndpointIndex, IOException cause, byte[] extraPendingBytes, int extraPendingRows)
             throws IOException {
@@ -696,8 +685,6 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
                             endpointState.endpoint.getSendPort(),
                             tcpConfig.getConnectTimeoutMs());
             candidateSocket.setTcpNoDelay(true);
-            candidateSocket.setSendBufferSize(tcpConfig.getBufferSize());
-            candidateSocket.setReceiveBufferSize(tcpConfig.getBufferSize());
             candidateOut =
                     new BufferedOutputStream(candidateSocket.getOutputStream(), tcpConfig.getBufferSize());
             writeLengthPrefixedJson(candidateOut, configJson);
