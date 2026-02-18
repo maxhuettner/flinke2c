@@ -96,7 +96,11 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         final int totalSubtasks = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         this.endpoints = tcpConfig.selectEndpoints(subtaskIndex, totalSubtasks);
         this.dynamicRoutingEnabled = tcpConfig.isAutoParallelismEnabled();
-        this.threadedReadEnabled = dynamicRoutingEnabled;
+        // Always use per-endpoint reader threads so that fixed-parallelism mode can also
+        // buffer out-of-order responses; this allows PRE's least-loaded routing to shift
+        // more work to faster endpoints without causing POST to stall on a slow endpoint's
+        // rows while holding up all subsequent (already-received) responses.
+        this.threadedReadEnabled = true;
         this.ins = new ArrayList<>(endpoints.size());
         this.outs = new ArrayList<>(endpoints.size());
         this.sockets = new ArrayList<>(endpoints.size());
@@ -179,7 +183,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         this.frameBuf = new byte[tcpConfig.getBufferSize()];
 
         this.expectedRowId = 0L;
-        if (dynamicRoutingEnabled) {
+        if (threadedReadEnabled) {
             this.dynamicBlockBuffer = new HashMap<>();
         } else {
             this.dynamicBlockBuffer = null;
@@ -208,12 +212,17 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         final RowData inRow = element.getValue();
         final RowKind fallbackKind = inRow.getRowKind();
         final long timestamp = element.hasTimestamp() ? element.getTimestamp() : 0L;
+        // Threaded path: used for both auto-parallelism and fixed-parallelism modes.
+        // Reader threads buffer responses from all endpoints; the main thread matches by
+        // rowId so that out-of-order responses from faster endpoints are held and emitted
+        // without blocking while waiting for a slower endpoint's earlier rowId.
+        if (threadedReadEnabled) {
+            readNextDynamicBlockFromQueue(fallbackKind, expectedRowId, timestamp);
+            expectedRowId++;
+            return;
+        }
+        // NIO selector path, unreachable while threadedReadEnabled is always true
         if (dynamicRoutingEnabled) {
-            if (threadedReadEnabled) {
-                readNextDynamicBlockFromQueue(fallbackKind, expectedRowId, timestamp);
-                expectedRowId++;
-                return;
-            }
             if (channels == null || channels.isEmpty()) {
                 throw new IOException("ExternalRuntimePostOperator dynamic channels not initialized");
             }
@@ -880,6 +889,11 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                     endpoint.getHost(),
                     endpoint.getReceivePort(),
                     tcpConfig.getConnectTimeoutMs());
+
+            candidateSocket.setTcpNoDelay(true);
+            // same buffer cap as PRE so runtime -> POST back-pressure kicks in at bufferSize
+            candidateSocket.setReceiveBufferSize(tcpConfig.getBufferSize());
+            candidateSocket.setSendBufferSize(tcpConfig.getBufferSize());
 
             final int readTimeoutMs = tcpConfig.getReadTimeoutMs() > 0
                     ? tcpConfig.getReadTimeoutMs()
