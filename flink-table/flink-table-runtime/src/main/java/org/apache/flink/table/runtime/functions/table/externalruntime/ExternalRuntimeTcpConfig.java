@@ -15,20 +15,17 @@ final class ExternalRuntimeTcpConfig {
     private static final int DEFAULT_REORDER_MAX_BUFFER = 100000;
     private static final int DEFAULT_FAILOVER_RECONNECT_BACKOFF_MS = 1000;
     private static final int DEFAULT_FAILOVER_POLL_TIMEOUT_MS = 10;
-    private static final int DEFAULT_FAILOVER_MISSING_ROW_TIMEOUT_MS = 0;
     private static final boolean DEFAULT_POST_ROLE_ONLY = true;
 
     private final List<ExternalRuntimeEndpoint> runtimes;
     private final int runtimeParallelism;
     private final boolean autoParallelismEnabled;
-    private final boolean autoFailoverEnabled;
     private final int batchSize;
     private final int bufferSize;
     private final int connectTimeoutMs;
     private final int readTimeoutMs;
     private final int failoverReconnectBackoffMs;
     private final int failoverPollTimeoutMs;
-    private final int failoverMissingRowTimeoutMs;
 
     private final String functionClass;
     private final String functionKind;
@@ -55,7 +52,6 @@ final class ExternalRuntimeTcpConfig {
             int readTimeoutMs,
             int failoverReconnectBackoffMs,
             int failoverPollTimeoutMs,
-            int failoverMissingRowTimeoutMs,
             String functionClass,
             String functionKind,
             List<Integer> argFieldIndices,
@@ -72,14 +68,12 @@ final class ExternalRuntimeTcpConfig {
             List<ExternalRuntimeEndpoint> runtimes,
             int runtimeParallelism,
             boolean autoParallelismEnabled,
-            boolean autoFailoverEnabled,
             int batchSize) {
         this.bufferSize = bufferSize;
         this.connectTimeoutMs = connectTimeoutMs;
         this.readTimeoutMs = readTimeoutMs;
         this.failoverReconnectBackoffMs = failoverReconnectBackoffMs;
         this.failoverPollTimeoutMs = failoverPollTimeoutMs;
-        this.failoverMissingRowTimeoutMs = failoverMissingRowTimeoutMs;
 
         this.functionClass = functionClass;
         this.functionKind = functionKind;
@@ -101,7 +95,6 @@ final class ExternalRuntimeTcpConfig {
         this.runtimes = runtimes;
         this.runtimeParallelism = runtimeParallelism;
         this.autoParallelismEnabled = autoParallelismEnabled;
-        this.autoFailoverEnabled = autoFailoverEnabled;
         this.batchSize = batchSize;
 
         this.postRoleOnly = postRoleOnly;
@@ -119,14 +112,6 @@ final class ExternalRuntimeTcpConfig {
                         DEFAULT_FAILOVER_RECONNECT_BACKOFF_MS);
         final int failoverPollTimeoutMs =
                 parseInt(firstNonNull(map, "failoverpolltimeoutms", "autofailoverpolltimeoutms"), DEFAULT_FAILOVER_POLL_TIMEOUT_MS);
-        final int failoverMissingRowTimeoutMs =
-                parseInt(
-                        firstNonNull(
-                                map,
-                                "failovermissingrowtimeoutms",
-                                "autofailovermissingrowtimeoutms",
-                                "missingrowtimeoutms"),
-                        DEFAULT_FAILOVER_MISSING_ROW_TIMEOUT_MS);
 
         final String functionClass = firstNonNull(map, "class", "functionclass");
         final String functionKind = firstNonNull(map, "type", "functionkind");
@@ -159,8 +144,6 @@ final class ExternalRuntimeTcpConfig {
                 parseBoolean(
                         firstNonNull(map, "autoparallelism", "parallelismauto"),
                         parallelismSpec.autoParallelism);
-        final boolean autoFailoverEnabled =
-                parseBoolean(firstNonNull(map, "autofailover", "failoverauto"), false);
         final int batchSize = parseInt(firstNonNull(map, "batchsize", "batchSize"), DEFAULT_BATCH_SIZE);
 
         return new ExternalRuntimeTcpConfig(
@@ -169,7 +152,6 @@ final class ExternalRuntimeTcpConfig {
                 readTimeoutMs,
                 failoverReconnectBackoffMs,
                 failoverPollTimeoutMs,
-                failoverMissingRowTimeoutMs,
                 functionClass,
                 functionKind,
                 argFieldIndices,
@@ -186,7 +168,6 @@ final class ExternalRuntimeTcpConfig {
                 runtimes,
                 parallelismSpec.parallelism,
                 autoParallelismEnabled,
-                autoFailoverEnabled,
                 batchSize);
     }
 
@@ -379,7 +360,7 @@ final class ExternalRuntimeTcpConfig {
         // With auto failover/auto parallelism enabled, all runtimes assigned to this
         // subtask must stay visible as candidate endpoints. Runtime parallelism still
         // controls the initial active width in PRE, but should not remove backups.
-        final boolean includeAllCandidates = autoFailoverEnabled || autoParallelismEnabled;
+        final boolean includeAllCandidates = autoParallelismEnabled;
         final int max =
                 includeAllCandidates
                         ? runtimes.size()
@@ -437,7 +418,8 @@ final class ExternalRuntimeTcpConfig {
     }
 
     public boolean isAutoFailoverEnabled() {
-        return autoFailoverEnabled;
+        // kept for compatibility, failover is implied by auto parallelism
+        return autoParallelismEnabled;
     }
 
     public int getFailoverReconnectBackoffMs() {
@@ -446,10 +428,6 @@ final class ExternalRuntimeTcpConfig {
 
     public int getFailoverPollTimeoutMs() {
         return failoverPollTimeoutMs;
-    }
-
-    public int getFailoverMissingRowTimeoutMs() {
-        return failoverMissingRowTimeoutMs;
     }
 
     public int getReadTimeoutMs() {
