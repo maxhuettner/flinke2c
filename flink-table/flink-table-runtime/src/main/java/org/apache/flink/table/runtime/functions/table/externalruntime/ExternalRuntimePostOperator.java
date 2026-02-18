@@ -13,6 +13,7 @@ import javax.annotation.Nullable;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -42,6 +43,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     private static final long serialVersionUID = 1L;
     private static final int MAX_FRAME_BYTES = 100_000_000;
     private static final long ROUTING_HINT_RECENCY_ROWS = 65_536L;
+    private static final int DYNAMIC_MISSING_ROW_TIMEOUT_MS = 500;
 
     private transient List<ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint> endpoints;
     private transient List<BufferedInputStream> ins;
@@ -93,7 +95,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         final int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
         final int totalSubtasks = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         this.endpoints = tcpConfig.selectEndpoints(subtaskIndex, totalSubtasks);
-        this.dynamicRoutingEnabled = tcpConfig.isAutoFailoverEnabled() || tcpConfig.isAutoParallelismEnabled();
+        this.dynamicRoutingEnabled = tcpConfig.isAutoParallelismEnabled();
         this.threadedReadEnabled = dynamicRoutingEnabled;
         this.ins = new ArrayList<>(endpoints.size());
         this.outs = new ArrayList<>(endpoints.size());
@@ -231,17 +233,26 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     private void readNextDynamicBlockFromQueue(RowKind fallbackKind, long targetRowId, long timestamp)
             throws IOException {
         if (shouldSkipMissingRowImmediately(targetRowId)) {
+            if (tryEmitTargetFromBufferedOrReadyQueue(fallbackKind, targetRowId, timestamp)) {
+                clearMissingSkipState();
+                return;
+            }
             markMissingRowSkipped(targetRowId);
             return;
         }
         final long waitStartNanos = System.nanoTime();
-        if (!dynamicBlockBuffer.isEmpty()) {
-            final ResponseBlock buffered = dynamicBlockBuffer.remove(targetRowId);
-            if (buffered != null) {
-                emitBufferedBlock(buffered, fallbackKind, timestamp);
-                clearMissingSkipState();
-                return;
-            }
+        if (tryEmitTargetFromBufferedOrReadyQueue(fallbackKind, targetRowId, timestamp)) {
+            clearMissingSkipState();
+            return;
+        }
+        // If newer blocks are already buffered and target rowId is still missing, waiting the full
+        // timeout would throttle all faster endpoints via head-of-line blocking.
+        if (!dynamicBlockBuffer.isEmpty() && hasDisconnectedEndpoint()) {
+            LOG.warn(
+                    "ExternalRuntimePostOperator skipping missing rowId {} immediately because newer buffered rows already exist.",
+                    targetRowId);
+            markMissingRowSkipped(targetRowId);
+            return;
         }
 
         while (true) {
@@ -258,44 +269,79 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                 throw new IOException("Interrupted while waiting for async response block.", e);
             }
             if (block == null) {
-                if (shouldSkipMissingTargetRow(waitStartNanos)) {
+                if (hasMissingRowTimedOut(waitStartNanos)) {
                     LOG.warn(
-                            "ExternalRuntimePostOperator skipping missing rowId {} after failover timeout ({} ms).",
+                            "ExternalRuntimePostOperator skipping missing rowId {} after {} ms timeout.",
                             targetRowId,
-                            tcpConfig.getFailoverMissingRowTimeoutMs());
+                            DYNAMIC_MISSING_ROW_TIMEOUT_MS);
                     markMissingRowSkipped(targetRowId);
                     return;
                 }
                 continue;
             }
-            clearMissingSkipState();
             if (block.rowId == targetRowId) {
                 emitBufferedBlock(block, fallbackKind, timestamp);
+                clearMissingSkipState();
                 return;
             }
             bufferBlock(block, targetRowId);
-            if (shouldSkipMissingTargetRow(waitStartNanos)) {
+            // As soon as we observe a newer rowId, skip the missing target immediately instead of
+            // waiting the timeout and slowing down healthy/faster runtimes.
+            if (block.rowId > targetRowId && hasDisconnectedEndpoint()) {
                 LOG.warn(
-                        "ExternalRuntimePostOperator skipping missing rowId {} after failover timeout ({} ms).",
+                        "ExternalRuntimePostOperator skipping missing rowId {} immediately after observing newer rowId {}.",
                         targetRowId,
-                        tcpConfig.getFailoverMissingRowTimeoutMs());
+                        block.rowId);
+                markMissingRowSkipped(targetRowId);
+                return;
+            }
+            if (hasDisconnectedEndpoint() && hasMissingRowTimedOut(waitStartNanos)) {
+                LOG.warn(
+                        "ExternalRuntimePostOperator skipping missing rowId {} after {} ms timeout.",
+                        targetRowId,
+                        DYNAMIC_MISSING_ROW_TIMEOUT_MS);
                 markMissingRowSkipped(targetRowId);
                 return;
             }
         }
     }
 
+    private boolean tryEmitTargetFromBufferedOrReadyQueue(
+            RowKind fallbackKind, long targetRowId, long timestamp) throws IOException {
+        if (!dynamicBlockBuffer.isEmpty()) {
+            final ResponseBlock buffered = dynamicBlockBuffer.remove(targetRowId);
+            if (buffered != null) {
+                emitBufferedBlock(buffered, fallbackKind, timestamp);
+                return true;
+            }
+        }
+        if (asyncResponseQueue == null) {
+            return false;
+        }
+        int drained = 0;
+        while (drained < 64) {
+            final ResponseBlock block = asyncResponseQueue.poll();
+            if (block == null) {
+                break;
+            }
+            if (block.rowId == targetRowId) {
+                emitBufferedBlock(block, fallbackKind, timestamp);
+                return true;
+            }
+            bufferBlock(block, targetRowId);
+            drained++;
+        }
+        return false;
+    }
+
     private boolean shouldSkipMissingRowImmediately(long targetRowId) {
+        if (!hasDisconnectedEndpoint()) {
+            return false;
+        }
         if (!consecutiveMissingSkipMode) {
             return false;
         }
-        if (targetRowId != lastSkippedMissingRowId + 1L) {
-            return false;
-        }
-        if (asyncResponseQueue != null && !asyncResponseQueue.isEmpty()) {
-            return false;
-        }
-        return dynamicBlockBuffer == null || dynamicBlockBuffer.isEmpty();
+        return targetRowId == lastSkippedMissingRowId + 1L;
     }
 
     private void markMissingRowSkipped(long targetRowId) {
@@ -308,16 +354,21 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         lastSkippedMissingRowId = -1L;
     }
 
-    private boolean shouldSkipMissingTargetRow(long waitStartNanos) {
-        if (!tcpConfig.isAutoFailoverEnabled()) {
-            return false;
-        }
-        final int timeoutMs = tcpConfig.getFailoverMissingRowTimeoutMs();
-        if (timeoutMs <= 0) {
-            return false;
-        }
+    private boolean hasMissingRowTimedOut(long waitStartNanos) {
         final long elapsedNanos = System.nanoTime() - waitStartNanos;
-        return elapsedNanos >= timeoutMs * 1_000_000L;
+        return elapsedNanos >= DYNAMIC_MISSING_ROW_TIMEOUT_MS * 1_000_000L;
+    }
+
+    private boolean hasDisconnectedEndpoint() {
+        if (sockets == null || sockets.isEmpty()) {
+            return true;
+        }
+        for (int i = 0; i < sockets.size(); i++) {
+            if (!isEndpointConnected(i)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void startResponseReaderThreads() {
@@ -897,11 +948,51 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                 + (long) tcpConfig.getFailoverReconnectBackoffMs() * 1_000_000L;
         refreshPrimarySocket();
         updateConnectedEndpointCount();
+        if (isExpectedDisconnect(cause)) {
+            LOG.info(
+                    "ExternalRuntimePostOperator disconnected endpoint {}:{} ({}); will retry.",
+                    endpoint.getHost(),
+                    endpoint.getReceivePort(),
+                    summarizeDisconnect(cause));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "ExternalRuntimePostOperator expected disconnect details for endpoint {}:{}.",
+                        endpoint.getHost(),
+                        endpoint.getReceivePort(),
+                        cause);
+            }
+            return;
+        }
         LOG.warn(
                 "ExternalRuntimePostOperator disconnected endpoint {}:{}; will retry.",
                 endpoint.getHost(),
                 endpoint.getReceivePort(),
                 cause);
+    }
+
+    private boolean isExpectedDisconnect(IOException cause) {
+        if (cause == null) {
+            return false;
+        }
+        if (cause instanceof EOFException) {
+            return true;
+        }
+        final String msg = cause.getMessage();
+        if (msg == null || msg.isEmpty()) {
+            return false;
+        }
+        return msg.contains("Connection reset") || msg.contains("Broken pipe");
+    }
+
+    private String summarizeDisconnect(IOException cause) {
+        if (cause == null) {
+            return "unknown";
+        }
+        final String message = cause.getMessage();
+        if (message == null || message.isEmpty()) {
+            return cause.getClass().getSimpleName();
+        }
+        return message;
     }
 
     private void refreshPrimarySocket() {
