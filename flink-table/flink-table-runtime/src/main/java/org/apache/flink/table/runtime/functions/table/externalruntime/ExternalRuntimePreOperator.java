@@ -48,6 +48,8 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     private static final long ASYNC_WRITE_TIMEOUT_SWEEP_NANOS = 50_000_000L;
     private static final long ACK_RETRY_INTERVAL_NANOS = 100_000_000L;
     private static final long ACK_RETRY_SWEEP_SLEEP_NANOS = 10_000_000L;
+    private static final int ACK_DRAIN_EVERY_ROWS = 64;
+    private static final long PENDING_ACK_NO_PROGRESS_TIMEOUT_MS = 30_000L;
     private static final int ACK_FRAME_LEN = 12;
     private static final int ACK_OP = -1;
 
@@ -66,6 +68,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     private transient List<ArrayBlockingQueue<PendingSendBatch>> endpointSendQueues;
     private transient AtomicIntegerArray endpointQueuedBatchCounts;
     private transient ArrayBlockingQueue<PendingSendBatch> sharedAutoSendQueue;
+    private transient ArrayBlockingQueue<PendingSendBatch> sharedAutoReplayQueue;
     private transient ArrayBlockingQueue<SendFailure> asyncSendFailures;
     private transient AtomicInteger pendingSendBatches;
     private transient List<Thread> sendWorkerThreads;
@@ -80,6 +83,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     private transient volatile boolean ackReadersRunning;
     private transient Thread resendPendingBatchesThread;
     private transient volatile boolean resendPendingBatchesRunning;
+    private transient int ackDrainCountdown;
     private transient ListState<PendingBatchState> pendingBatchesState;
     private transient ListState<Long> nextRowIdState;
 
@@ -176,6 +180,10 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
                 autoParallelismEnabled
                         ? new ArrayBlockingQueue<>(ASYNC_SEND_QUEUE_CAPACITY * Math.max(1, endpoints.size()))
                         : null;
+        this.sharedAutoReplayQueue =
+                autoParallelismEnabled
+                        ? new ArrayBlockingQueue<>(ASYNC_SEND_QUEUE_CAPACITY * Math.max(1, endpoints.size()))
+                        : null;
         this.asyncSendFailures = new ArrayBlockingQueue<>(ASYNC_SEND_QUEUE_CAPACITY);
         this.pendingSendBatches = new AtomicInteger(0);
         this.sendWorkerThreads = new ArrayList<>(endpoints.size());
@@ -196,6 +204,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         this.ackReadersRunning = autoParallelismEnabled;
         this.resendPendingBatchesThread = null;
         this.resendPendingBatchesRunning = false;
+        this.ackDrainCountdown = ACK_DRAIN_EVERY_ROWS;
         if (autoParallelismEnabled && pendingBatches == null) {
             this.pendingBatches = new ConcurrentHashMap<>();
         } else if (!autoParallelismEnabled) {
@@ -282,7 +291,10 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     @Override
     protected RowData processRow(RowData inRow) throws Exception {
         if (tcpConfig.isAutoParallelismEnabled()) {
-            drainAckedBatchFirstRowIds();
+            if (--ackDrainCountdown <= 0) {
+                drainAckedBatchFirstRowIds();
+                ackDrainCountdown = ACK_DRAIN_EVERY_ROWS;
+            }
             appendRowToBinary(inRow);
             return createPlaceholderRow(inRow.getRowKind());
         }
@@ -320,7 +332,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         final long nowNanos = System.nanoTime();
         for (PendingBatch pendingBatch : pendingBatches.values()) {
             pendingBatch.lastSendNanos = nowNanos;
-            enqueueAutoSendBatch(pendingBatch.payload, pendingBatch.rowCount, true);
+            enqueueAutoReplayBatch(pendingBatch.payload, pendingBatch.rowCount, true);
         }
     }
 
@@ -356,7 +368,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
                             continue;
                         }
                         pendingBatch.lastSendNanos = now;
-                        enqueueAutoSendBatch(pendingBatch.payload, pendingBatch.rowCount, true);
+                        enqueueAutoReplayBatch(pendingBatch.payload, pendingBatch.rowCount, true);
                     }
                 }
                 TimeUnit.NANOSECONDS.sleep(ACK_RETRY_SWEEP_SLEEP_NANOS);
@@ -409,9 +421,23 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     }
 
     private void waitForPendingBatchAcknowledgements() throws IOException {
+        long lastPendingCount = pendingBatches == null ? 0L : pendingBatches.size();
+        long lastProgressNanos = System.nanoTime();
         while (hasUnacknowledgedPendingBatches()) {
             drainAckedBatchFirstRowIds();
             drainAsyncSendFailures();
+            final long pendingCount = pendingBatches == null ? 0L : pendingBatches.size();
+            final long now = System.nanoTime();
+            if (pendingCount < lastPendingCount) {
+                lastPendingCount = pendingCount;
+                lastProgressNanos = now;
+            } else if (pendingCount > 0
+                    && now - lastProgressNanos >= pendingAckNoProgressTimeoutNanos()) {
+                throw new IOException(
+                        "Timed out waiting for pending external runtime batch acknowledgements; "
+                                + pendingCount
+                                + " batch(es) still outstanding.");
+            }
             try {
                 TimeUnit.NANOSECONDS.sleep(ASYNC_DRAIN_WAIT_SLEEP_NANOS);
             } catch (InterruptedException e) {
@@ -423,6 +449,14 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
 
     private boolean hasUnacknowledgedPendingBatches() {
         return pendingBatches != null && !pendingBatches.isEmpty();
+    }
+
+    private long pendingAckNoProgressTimeoutNanos() {
+        final long timeoutMs =
+                Math.max(
+                        PENDING_ACK_NO_PROGRESS_TIMEOUT_MS,
+                        (long) tcpConfig.getFailoverReconnectBackoffMs() * 10L);
+        return timeoutMs * 1_000_000L;
     }
 
     private long readAckRowId(BufferedInputStream in) throws IOException {
@@ -663,23 +697,45 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
 
     private void enqueueAutoSendBatch(byte[] payload, int rowsInBatch, boolean forceFlush)
             throws IOException {
-        if (!sendWorkerRunning || sharedAutoSendQueue == null) {
+        enqueueAutoBatch(sharedAutoSendQueue, payload, rowsInBatch, forceFlush, false);
+    }
+
+    private void enqueueAutoReplayBatch(byte[] payload, int rowsInBatch, boolean forceFlush)
+            throws IOException {
+        enqueueAutoBatch(sharedAutoReplayQueue, payload, rowsInBatch, forceFlush, true);
+    }
+
+    private void enqueueAutoBatch(
+            ArrayBlockingQueue<PendingSendBatch> queue,
+            byte[] payload,
+            int rowsInBatch,
+            boolean forceFlush,
+            boolean replay)
+            throws IOException {
+        if (!sendWorkerRunning || queue == null) {
             throw new IOException("ExternalRuntimePreOperator auto async sender is not running.");
         }
         drainAsyncSendFailures();
         final PendingSendBatch batch = new PendingSendBatch(-1, payload, rowsInBatch, forceFlush);
         try {
             while (sendWorkerRunning) {
-                if (sharedAutoSendQueue.offer(batch, ASYNC_SEND_ENQUEUE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                if (queue.offer(batch, ASYNC_SEND_ENQUEUE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                     pendingSendBatches.incrementAndGet();
                     return;
                 }
                 drainAsyncSendFailures();
             }
-            throw new IOException("ExternalRuntimePreOperator auto sender stopped while enqueueing.");
+            throw new IOException(
+                    replay
+                            ? "ExternalRuntimePreOperator auto replay sender stopped while enqueueing."
+                            : "ExternalRuntimePreOperator auto sender stopped while enqueueing.");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while enqueueing auto async send batch.", e);
+            throw new IOException(
+                    replay
+                            ? "Interrupted while enqueueing auto replay batch."
+                            : "Interrupted while enqueueing auto async send batch.",
+                    e);
         }
     }
 
@@ -735,7 +791,9 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     }
 
     private void runAutoSendWorker(int endpointIndex) {
-        while (sendWorkerRunning || (sharedAutoSendQueue != null && !sharedAutoSendQueue.isEmpty())) {
+        while (sendWorkerRunning
+                || (sharedAutoReplayQueue != null && !sharedAutoReplayQueue.isEmpty())
+                || (sharedAutoSendQueue != null && !sharedAutoSendQueue.isEmpty())) {
             final EndpointState endpointState = endpointStates.get(endpointIndex);
             final BufferedOutputStream out = endpointState.out;
             if (out == null) {
@@ -751,9 +809,15 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
             }
             final PendingSendBatch batch;
             try {
-                batch = sharedAutoSendQueue == null
-                        ? null
-                        : sharedAutoSendQueue.poll(50L, TimeUnit.MILLISECONDS);
+                PendingSendBatch nextBatch =
+                        sharedAutoReplayQueue == null ? null : sharedAutoReplayQueue.poll();
+                if (nextBatch == null) {
+                    nextBatch =
+                            sharedAutoSendQueue == null
+                                    ? null
+                                    : sharedAutoSendQueue.poll(50L, TimeUnit.MILLISECONDS);
+                }
+                batch = nextBatch;
             } catch (InterruptedException e) {
                 if (!sendWorkerRunning) {
                     break;
@@ -813,7 +877,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         closeEndpoint(failedState, true);
         updatePrimarySocket();
         if (extraPendingBytes != null && extraPendingBytes.length > 0) {
-            enqueueAutoSendBatch(extraPendingBytes, Math.max(1, extraPendingRows), true);
+            enqueueAutoReplayBatch(extraPendingBytes, Math.max(1, extraPendingRows), true);
         }
     }
 
@@ -1235,6 +1299,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         endpointSendQueues = null;
         endpointQueuedBatchCounts = null;
         sharedAutoSendQueue = null;
+        sharedAutoReplayQueue = null;
         ackedBatchFirstRowIds = null;
         asyncSendFailures = null;
         pendingSendBatches = null;
