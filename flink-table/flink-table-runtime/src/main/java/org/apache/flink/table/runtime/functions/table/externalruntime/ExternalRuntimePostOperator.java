@@ -56,6 +56,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     private static final int MAX_FRAME_BYTES = 100_000_000;
     private static final long ROUTING_HINT_RECENCY_ROWS = 65_536L;
     private static final int DYNAMIC_MISSING_ROW_TIMEOUT_MS = 500;
+    private static final long MISSING_BATCH_NO_PROGRESS_TIMEOUT_MS = 5_000L;
 
     private transient List<ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint> endpoints;
     private transient List<BufferedInputStream> ins;
@@ -318,6 +319,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
             return;
         }
 
+        long waitStartNanos = System.nanoTime();
         while (true) {
             final IOException failure =
                     asyncReadFailure == null ? null : asyncReadFailure.getAndSet(null);
@@ -339,6 +341,12 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                     expectedRowId++;
                     return;
                 }
+                if (System.nanoTime() - waitStartNanos >= missingBatchNoProgressTimeoutNanos()) {
+                    throw new IOException(
+                            "Timed out waiting for external runtime batch with firstRowId="
+                                    + targetRowId
+                                    + "; still missing after failover/retry window.");
+                }
                 continue;
             }
             bufferOrAckResult(block);
@@ -349,6 +357,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                 expectedRowId++;
                 return;
             }
+            waitStartNanos = Math.max(waitStartNanos, System.nanoTime());
         }
     }
 
@@ -639,6 +648,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         final ByteArrayOutputStream ackBuffer =
                 new ByteArrayOutputStream(Math.max(256, ACK_FRAME_LEN * ACK_BATCH_SIZE));
         final ArrayList<Long> ackBatchRowIds = new ArrayList<>(ACK_BATCH_SIZE);
+        byte[] pendingAckBytes = null;
         while (ackWritersRunning || (ackQueue != null && !ackQueue.isEmpty())) {
             try {
                 if (!isEndpointConnected(endpointIndex)) {
@@ -651,51 +661,68 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                     TimeUnit.MILLISECONDS.sleep(2L);
                     continue;
                 }
-                final Long firstRowId = ackQueue.poll(50L, TimeUnit.MILLISECONDS);
-                if (firstRowId == null) {
-                    continue;
-                }
-                ackBuffer.reset();
-                ackBatchRowIds.clear();
-                writeAck(ackBuffer, firstRowId);
-                ackBatchRowIds.add(firstRowId);
-                int ackCount = 1;
-                final long flushDeadline = System.nanoTime() + ACK_FLUSH_LINGER_MS * 1_000_000L;
-                while (ackCount < ACK_BATCH_SIZE) {
-                    final Long nextRowId = ackQueue.poll();
-                    if (nextRowId == null) {
-                        if (System.nanoTime() >= flushDeadline) {
-                            break;
-                        }
-                        TimeUnit.MICROSECONDS.sleep(100L);
+                if (pendingAckBytes == null) {
+                    final Long firstRowId = ackQueue.poll(50L, TimeUnit.MILLISECONDS);
+                    if (firstRowId == null) {
                         continue;
                     }
-                    writeAck(ackBuffer, nextRowId);
-                    ackBatchRowIds.add(nextRowId);
-                    ackCount++;
+                    ackBuffer.reset();
+                    ackBatchRowIds.clear();
+                    writeAck(ackBuffer, firstRowId);
+                    ackBatchRowIds.add(firstRowId);
+                    int ackCount = 1;
+                    final long flushDeadline = System.nanoTime() + ACK_FLUSH_LINGER_MS * 1_000_000L;
+                    while (ackCount < ACK_BATCH_SIZE) {
+                        final Long nextRowId = ackQueue.poll();
+                        if (nextRowId == null) {
+                            if (System.nanoTime() >= flushDeadline) {
+                                break;
+                            }
+                            TimeUnit.MICROSECONDS.sleep(100L);
+                            continue;
+                        }
+                        writeAck(ackBuffer, nextRowId);
+                        ackBatchRowIds.add(nextRowId);
+                        ackCount++;
+                    }
+                    pendingAckBytes = ackBuffer.toByteArray();
                 }
-                out.write(ackBuffer.toByteArray());
+                out.write(pendingAckBytes);
                 out.flush();
+                pendingAckBytes = null;
                 ackBatchRowIds.clear();
             } catch (InterruptedException e) {
                 if (!ackWritersRunning) {
                     return;
                 }
             } catch (IOException e) {
-                for (Long ackRowId : ackBatchRowIds) {
-                    if (ackRowId == null) {
-                        continue;
-                    }
-                    while (ackWritersRunning && !ackQueue.offer(ackRowId)) {
-                        ackQueue.poll();
-                    }
-                }
-                ackBatchRowIds.clear();
+                markEndpointDisconnected(endpointIndex, e);
                 if (LOG.isDebugEnabled()) {
-                    LOG.debug("ExternalRuntimePostOperator ACK writer failed for endpoint {}", endpointIndex, e);
+                    LOG.debug(
+                            "ExternalRuntimePostOperator ACK writer failed for endpoint {}; retrying {} pending ACK(s) after reconnect.",
+                            endpointIndex,
+                            ackBatchRowIds.size(),
+                            e);
+                }
+                try {
+                    TimeUnit.MILLISECONDS.sleep(2L);
+                } catch (InterruptedException ie) {
+                    if (!ackWritersRunning) {
+                        return;
+                    }
                 }
             }
         }
+    }
+
+    private long missingBatchNoProgressTimeoutNanos() {
+        final long timeoutMs =
+                Math.max(
+                        MISSING_BATCH_NO_PROGRESS_TIMEOUT_MS,
+                        Math.max(
+                                (long) DYNAMIC_MISSING_ROW_TIMEOUT_MS,
+                                (long) tcpConfig.getFailoverReconnectBackoffMs() * 4L));
+        return timeoutMs * 1_000_000L;
     }
 
     private long parseBlockRowId(byte[] payload) throws IOException {
