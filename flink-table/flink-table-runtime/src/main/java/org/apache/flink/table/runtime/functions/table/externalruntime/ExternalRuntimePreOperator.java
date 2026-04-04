@@ -145,7 +145,10 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         }
         if (sharedAutoSendQueue != null && autoBatchCount > 0 && autoBatchBuffer != null) {
             pendingSnapshot.add(
-                    new PendingBatchState(autoBatchFirstRowId, autoBatchCount, autoBatchBuffer.toByteArray()));
+                    new PendingBatchState(
+                            autoBatchFirstRowId,
+                            autoBatchCount,
+                            autoBatchBuffer.toByteArray()));
         }
         pendingBatchesState.update(pendingSnapshot);
         nextRowIdState.update(java.util.Collections.singletonList(nextRowId));
@@ -291,7 +294,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     public void endInput() throws Exception {
         final IOException error = tryFlushRemaining();
         if (tcpConfig.isAutoParallelismEnabled()) {
-            waitForPendingBatches();
+            waitForPendingBatchAcknowledgements();
         }
         waitForPendingSends();
         drainAsyncSendFailures();
@@ -405,8 +408,8 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         }
     }
 
-    private void waitForPendingBatches() throws IOException {
-        while (pendingBatches != null && !pendingBatches.isEmpty()) {
+    private void waitForPendingBatchAcknowledgements() throws IOException {
+        while (hasUnacknowledgedPendingBatches()) {
             drainAckedBatchFirstRowIds();
             drainAsyncSendFailures();
             try {
@@ -416,6 +419,10 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
                 throw new IOException("Interrupted while waiting for pending batch acknowledgements.", e);
             }
         }
+    }
+
+    private boolean hasUnacknowledgedPendingBatches() {
+        return pendingBatches != null && !pendingBatches.isEmpty();
     }
 
     private long readAckRowId(BufferedInputStream in) throws IOException {
@@ -574,7 +581,8 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         autoBatchFirstBufferedAtNanos = 0L;
         if (pendingBatches != null) {
             pendingBatches.put(
-                    batchFirstRowId, new PendingBatch(batchFirstRowId, rowsInBatch, payload, System.nanoTime()));
+                    batchFirstRowId,
+                    new PendingBatch(batchFirstRowId, rowsInBatch, payload, System.nanoTime()));
         }
         enqueueAutoSendBatch(payload, rowsInBatch, forceFlush);
     }
@@ -1174,7 +1182,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         // Best-effort flush during close; ignore errors since remote may have
         // disconnected
         try {
-            waitForPendingBatches();
+            waitForPendingBatchAcknowledgements();
             waitForPendingSends();
             drainAckedBatchFirstRowIds();
             drainAsyncSendFailures();
