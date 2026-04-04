@@ -341,20 +341,13 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                 }
                 continue;
             }
-            if (block.rowId < targetRowId) {
-                continue;
-            }
-            if (block.rowId == targetRowId) {
-                emitBufferedBlock(block, fallbackKind, timestamp);
+            bufferOrAckResult(block);
+
+            final ResponseBlock accepted = bufferedResults.remove(targetRowId);
+            if (accepted != null) {
+                emitBufferedBlock(accepted, fallbackKind, timestamp);
                 expectedRowId++;
                 return;
-            }
-            bufferedResults.putIfAbsent(block.rowId, block);
-            if (bufferedResults.size() > tcpConfig.getReorderMaxBuffer()) {
-                throw new IOException(
-                        "ExternalRuntimePostOperator dynamic reorder buffer exceeded "
-                                + tcpConfig.getReorderMaxBuffer()
-                                + " entries; increase reorderMax or reduce retry lag.");
             }
         }
     }
@@ -377,17 +370,32 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
 
     private void bufferOrAckResult(ResponseBlock block) throws IOException {
         if (block.rowId < expectedRowId) {
+            acknowledgeResult(block);
             return;
         }
         final ResponseBlock previous = bufferedResults.putIfAbsent(block.rowId, block);
         if (previous != null) {
+            acknowledgeResult(block);
             return;
         }
+        acknowledgeResult(block);
         if (bufferedResults.size() > tcpConfig.getReorderMaxBuffer()) {
             throw new IOException(
                     "ExternalRuntimePostOperator dynamic reorder buffer exceeded "
                             + tcpConfig.getReorderMaxBuffer()
                             + " entries; increase reorderMax or reduce retry lag.");
+        }
+    }
+
+    private void acknowledgeResult(ResponseBlock block) throws IOException {
+        if (block == null || block.endpointIndex < 0) {
+            return;
+        }
+        try {
+            enqueueAck(block.endpointIndex, block.rowId);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while queueing post acknowledgement.", e);
         }
     }
 
@@ -588,7 +596,6 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                 final byte[] payload = new byte[batchLen];
                 readFully(in, payload, 0, batchLen);
                 final long blockRowId = parseBlockRowId(payload);
-                enqueueAck(endpointIndex, blockRowId);
                 while (responseReadersRunning) {
                     if (asyncResponseQueue.offer(
                             new ResponseBlock(blockRowId, payload, endpointIndex),
@@ -631,6 +638,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     private void runAckWriter(int endpointIndex, ArrayBlockingQueue<Long> ackQueue) {
         final ByteArrayOutputStream ackBuffer =
                 new ByteArrayOutputStream(Math.max(256, ACK_FRAME_LEN * ACK_BATCH_SIZE));
+        final ArrayList<Long> ackBatchRowIds = new ArrayList<>(ACK_BATCH_SIZE);
         while (ackWritersRunning || (ackQueue != null && !ackQueue.isEmpty())) {
             try {
                 if (!isEndpointConnected(endpointIndex)) {
@@ -648,7 +656,9 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                     continue;
                 }
                 ackBuffer.reset();
+                ackBatchRowIds.clear();
                 writeAck(ackBuffer, firstRowId);
+                ackBatchRowIds.add(firstRowId);
                 int ackCount = 1;
                 final long flushDeadline = System.nanoTime() + ACK_FLUSH_LINGER_MS * 1_000_000L;
                 while (ackCount < ACK_BATCH_SIZE) {
@@ -661,15 +671,26 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                         continue;
                     }
                     writeAck(ackBuffer, nextRowId);
+                    ackBatchRowIds.add(nextRowId);
                     ackCount++;
                 }
                 out.write(ackBuffer.toByteArray());
                 out.flush();
+                ackBatchRowIds.clear();
             } catch (InterruptedException e) {
                 if (!ackWritersRunning) {
                     return;
                 }
             } catch (IOException e) {
+                for (Long ackRowId : ackBatchRowIds) {
+                    if (ackRowId == null) {
+                        continue;
+                    }
+                    while (ackWritersRunning && !ackQueue.offer(ackRowId)) {
+                        ackQueue.poll();
+                    }
+                }
+                ackBatchRowIds.clear();
                 if (LOG.isDebugEnabled()) {
                     LOG.debug("ExternalRuntimePostOperator ACK writer failed for endpoint {}", endpointIndex, e);
                 }
