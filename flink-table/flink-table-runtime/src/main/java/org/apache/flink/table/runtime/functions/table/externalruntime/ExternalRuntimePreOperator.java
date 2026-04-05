@@ -23,6 +23,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -78,12 +79,13 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     private transient volatile boolean writeTimeoutWatcherRunning;
     private transient int nextFailoverEndpointCursor;
     private transient ConcurrentMap<Long, PendingBatch> pendingBatches;
-    private transient ArrayBlockingQueue<Long> ackedBatchFirstRowIds;
+    private transient ArrayBlockingQueue<Long> ackedRowWatermarks;
     private transient List<Thread> ackReaderThreads;
     private transient volatile boolean ackReadersRunning;
     private transient Thread resendPendingBatchesThread;
     private transient volatile boolean resendPendingBatchesRunning;
     private transient int ackDrainCountdown;
+    private transient long highestAckedRowId;
     private transient ListState<PendingBatchState> pendingBatchesState;
     private transient ListState<Long> nextRowIdState;
 
@@ -124,6 +126,9 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
                         restoredPendingBatch.firstRowId,
                         new PendingBatch(
                                 restoredPendingBatch.firstRowId,
+                                restoredPendingBatch.firstRowId
+                                        + Math.max(1, restoredPendingBatch.rowCount)
+                                        - 1L,
                                 restoredPendingBatch.rowCount,
                                 restoredPendingBatch.payload,
                                 0L));
@@ -134,7 +139,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     @Override
     public void snapshotState(StateSnapshotContext context) throws Exception {
         super.snapshotState(context);
-        drainAckedBatchFirstRowIds();
+        drainAckedRowWatermarks();
 
         final List<PendingBatchState> pendingSnapshot =
                 new ArrayList<>(pendingBatches == null ? 0 : pendingBatches.size() + 1);
@@ -196,7 +201,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         this.autoBatchCount = 0;
         this.autoBatchFirstRowId = 0L;
         this.autoBatchFirstBufferedAtNanos = 0L;
-        this.ackedBatchFirstRowIds =
+        this.ackedRowWatermarks =
                 autoParallelismEnabled
                         ? new ArrayBlockingQueue<>(ASYNC_SEND_QUEUE_CAPACITY * Math.max(1, endpoints.size()))
                         : null;
@@ -205,6 +210,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         this.resendPendingBatchesThread = null;
         this.resendPendingBatchesRunning = false;
         this.ackDrainCountdown = ACK_DRAIN_EVERY_ROWS;
+        this.highestAckedRowId = -1L;
         if (autoParallelismEnabled && pendingBatches == null) {
             this.pendingBatches = new ConcurrentHashMap<>();
         } else if (!autoParallelismEnabled) {
@@ -292,7 +298,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     protected RowData processRow(RowData inRow) throws Exception {
         if (tcpConfig.isAutoParallelismEnabled()) {
             if (--ackDrainCountdown <= 0) {
-                drainAckedBatchFirstRowIds();
+                drainAckedRowWatermarks();
                 ackDrainCountdown = ACK_DRAIN_EVERY_ROWS;
             }
             appendRowToBinary(inRow);
@@ -315,13 +321,27 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         }
     }
 
-    private void drainAckedBatchFirstRowIds() {
-        if (ackedBatchFirstRowIds == null || pendingBatches == null) {
+    private void drainAckedRowWatermarks() {
+        if (ackedRowWatermarks == null || pendingBatches == null) {
             return;
         }
-        Long batchFirstRowId;
-        while ((batchFirstRowId = ackedBatchFirstRowIds.poll()) != null) {
-            pendingBatches.remove(batchFirstRowId);
+        long newHighestAckedRowId = highestAckedRowId;
+        Long ackedRowWatermark;
+        while ((ackedRowWatermark = ackedRowWatermarks.poll()) != null) {
+            if (ackedRowWatermark > newHighestAckedRowId) {
+                newHighestAckedRowId = ackedRowWatermark;
+            }
+        }
+        if (newHighestAckedRowId <= highestAckedRowId) {
+            return;
+        }
+        highestAckedRowId = newHighestAckedRowId;
+        for (Map.Entry<Long, PendingBatch> entry : pendingBatches.entrySet()) {
+            final PendingBatch pendingBatch = entry.getValue();
+            if (pendingBatch == null || pendingBatch.lastRowId > highestAckedRowId) {
+                continue;
+            }
+            pendingBatches.remove(entry.getKey(), pendingBatch);
         }
     }
 
@@ -360,7 +380,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     private void runPendingBatchResender() {
         while (resendPendingBatchesRunning) {
             try {
-                drainAckedBatchFirstRowIds();
+                drainAckedRowWatermarks();
                 final long now = System.nanoTime();
                 if (pendingBatches != null) {
                     for (PendingBatch pendingBatch : pendingBatches.values()) {
@@ -400,7 +420,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
                 }
                 final long rowId = readAckRowId(in);
                 while (ackReadersRunning) {
-                    if (ackedBatchFirstRowIds.offer(rowId, 10L, TimeUnit.MILLISECONDS)) {
+                    if (ackedRowWatermarks.offer(rowId, 10L, TimeUnit.MILLISECONDS)) {
                         break;
                     }
                 }
@@ -424,7 +444,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         long lastPendingCount = pendingBatches == null ? 0L : pendingBatches.size();
         long lastProgressNanos = System.nanoTime();
         while (hasUnacknowledgedPendingBatches()) {
-            drainAckedBatchFirstRowIds();
+            drainAckedRowWatermarks();
             drainAsyncSendFailures();
             final long pendingCount = pendingBatches == null ? 0L : pendingBatches.size();
             final long now = System.nanoTime();
@@ -616,7 +636,12 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         if (pendingBatches != null) {
             pendingBatches.put(
                     batchFirstRowId,
-                    new PendingBatch(batchFirstRowId, rowsInBatch, payload, System.nanoTime()));
+                    new PendingBatch(
+                            batchFirstRowId,
+                            batchFirstRowId + rowsInBatch - 1L,
+                            rowsInBatch,
+                            payload,
+                            System.nanoTime()));
         }
         enqueueAutoSendBatch(payload, rowsInBatch, forceFlush);
     }
@@ -1248,7 +1273,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         try {
             waitForPendingBatchAcknowledgements();
             waitForPendingSends();
-            drainAckedBatchFirstRowIds();
+            drainAckedRowWatermarks();
             drainAsyncSendFailures();
         } catch (Exception e) {
             LOG.debug("ExternalRuntimePreOperator best-effort flush failed during close.", e);
@@ -1300,12 +1325,13 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         endpointQueuedBatchCounts = null;
         sharedAutoSendQueue = null;
         sharedAutoReplayQueue = null;
-        ackedBatchFirstRowIds = null;
+        ackedRowWatermarks = null;
         asyncSendFailures = null;
         pendingSendBatches = null;
         sendWorkerRunning = false;
         ackReadersRunning = false;
         ackReaderThreads = null;
+        highestAckedRowId = -1L;
         endpointWriteStartedAtNanos = null;
         writeTimeoutWatcherRunning = false;
         writeTimeoutWatcherThread = null;
@@ -1356,12 +1382,19 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
 
     private static final class PendingBatch {
         private final long firstRowId;
+        private final long lastRowId;
         private final int rowCount;
         private final byte[] payload;
         private volatile long lastSendNanos;
 
-        private PendingBatch(long firstRowId, int rowCount, byte[] payload, long lastSendNanos) {
+        private PendingBatch(
+                long firstRowId,
+                long lastRowId,
+                int rowCount,
+                byte[] payload,
+                long lastSendNanos) {
             this.firstRowId = firstRowId;
+            this.lastRowId = lastRowId;
             this.rowCount = rowCount;
             this.payload = payload;
             this.lastSendNanos = lastSendNanos;

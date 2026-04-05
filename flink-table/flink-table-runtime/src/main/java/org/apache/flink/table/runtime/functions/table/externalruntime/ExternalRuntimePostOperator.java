@@ -35,10 +35,8 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -95,11 +93,14 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     private transient List<ArrayBlockingQueue<Long>> ackQueues;
     private transient List<Thread> ackWriterThreads;
     private transient volatile boolean ackWritersRunning;
+    private transient ExternalRuntimeAckTracker ackTracker;
+    private transient Thread ackBroadcastThread;
+    private transient volatile boolean ackBroadcastRunning;
 
     private static final int ACK_FRAME_LEN = 12;
     private static final int ACK_OP = -1;
-    private static final int ACK_BATCH_SIZE = 256;
     private static final long ACK_FLUSH_LINGER_MS = 1L;
+    private static final long ACK_BROADCAST_POLL_SLEEP_NANOS = 1_000_000L;
 
     public ExternalRuntimePostOperator(String conf, RowType rowType) {
         this(conf, rowType, rowType);
@@ -154,6 +155,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
             return;
         }
         drainAsyncQueueIntoBufferedResults();
+        flushPendingAcks(true);
 
         final List<BufferedResultState> bufferedSnapshot = new ArrayList<>(bufferedResults.size());
         for (ResponseBlock responseBlock : bufferedResults.values()) {
@@ -203,6 +205,15 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         this.ackQueues = dynamicRoutingEnabled ? new ArrayList<>(endpoints.size()) : null;
         this.ackWriterThreads = dynamicRoutingEnabled ? new ArrayList<>(endpoints.size()) : null;
         this.ackWritersRunning = dynamicRoutingEnabled;
+        this.ackTracker =
+                dynamicRoutingEnabled
+                        ? new ExternalRuntimeAckTracker(
+                                tcpConfig.getAckEveryRows(),
+                                tcpConfig.getAckFlushTimeoutMs(),
+                                tcpConfig.getReorderMaxBuffer())
+                        : null;
+        this.ackBroadcastThread = null;
+        this.ackBroadcastRunning = dynamicRoutingEnabled;
         if (dynamicRoutingEnabled && bufferedResults == null) {
             this.bufferedResults = new ConcurrentHashMap<>();
         } else if (!dynamicRoutingEnabled) {
@@ -281,6 +292,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         if (threadedReadEnabled) {
             startResponseReaderThreads();
             startAckWriterThreads();
+            startAckBroadcastThread();
         }
 
         LOG.info(
@@ -379,15 +391,15 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
 
     private void bufferOrAckResult(ResponseBlock block) throws IOException {
         if (block.rowId < expectedRowId) {
-            acknowledgeResult(block);
+            recordReceivedResult(block.rowId);
             return;
         }
         final ResponseBlock previous = bufferedResults.putIfAbsent(block.rowId, block);
         if (previous != null) {
-            acknowledgeResult(block);
+            recordReceivedResult(block.rowId);
             return;
         }
-        acknowledgeResult(block);
+        recordReceivedResult(block.rowId);
         if (bufferedResults.size() > tcpConfig.getReorderMaxBuffer()) {
             throw new IOException(
                     "ExternalRuntimePostOperator dynamic reorder buffer exceeded "
@@ -396,22 +408,42 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         }
     }
 
-    private void acknowledgeResult(ResponseBlock block) throws IOException {
-        if (block == null || block.endpointIndex < 0) {
+    private void recordReceivedResult(long rowId) throws IOException {
+        if (ackTracker == null || rowId < 0L) {
             return;
         }
         try {
-            enqueueAck(block.endpointIndex, block.rowId);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while queueing post acknowledgement.", e);
+            ackTracker.markReceived(rowId, System.nanoTime());
+        } catch (IllegalStateException e) {
+            throw new IOException("ExternalRuntimePostOperator cumulative ACK tracking failed.", e);
         }
+        flushPendingAcks(false);
     }
 
     private void writeAck(OutputStream out, long rowId) throws IOException {
         writeIntBE(out, ACK_FRAME_LEN);
         writeIntBE(out, ACK_OP);
         writeLongBE(out, rowId);
+    }
+
+    private void flushPendingAcks(boolean force) {
+        if (ackTracker == null) {
+            return;
+        }
+        final long ackRowId = ackTracker.pollReadyAck(System.nanoTime(), force);
+        if (ackRowId < 0L) {
+            return;
+        }
+        broadcastAck(ackRowId);
+    }
+
+    private void broadcastAck(long rowId) {
+        if (ackQueues == null || rowId < 0L) {
+            return;
+        }
+        for (int endpointIndex = 0; endpointIndex < ackQueues.size(); endpointIndex++) {
+            enqueueAck(endpointIndex, rowId);
+        }
     }
 
     private void readNextDynamicBlockFromQueue(RowKind fallbackKind, long targetRowId, long timestamp)
@@ -584,6 +616,28 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         }
     }
 
+    private void startAckBroadcastThread() {
+        if (!ackBroadcastRunning) {
+            return;
+        }
+        ackBroadcastThread = new Thread(this::runAckBroadcastLoop, "external-runtime-post-ack-broadcast");
+        ackBroadcastThread.setDaemon(true);
+        ackBroadcastThread.start();
+    }
+
+    private void runAckBroadcastLoop() {
+        while (ackBroadcastRunning) {
+            flushPendingAcks(false);
+            try {
+                TimeUnit.NANOSECONDS.sleep(ACK_BROADCAST_POLL_SLEEP_NANOS);
+            } catch (InterruptedException e) {
+                if (!ackBroadcastRunning) {
+                    return;
+                }
+            }
+        }
+    }
+
     private void runResponseReader(int endpointIndex) {
         while (responseReadersRunning) {
             try {
@@ -629,7 +683,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         }
     }
 
-    private void enqueueAck(int endpointIndex, long rowId) throws InterruptedException {
+    private void enqueueAck(int endpointIndex, long rowId) {
         if (ackQueues == null || endpointIndex < 0 || endpointIndex >= ackQueues.size()) {
             return;
         }
@@ -638,17 +692,17 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
             return;
         }
         while (ackWritersRunning) {
-            if (ackQueue.offer(rowId, 10L, TimeUnit.MILLISECONDS)) {
+            if (ackQueue.offer(rowId)) {
                 return;
             }
+            ackQueue.poll();
         }
     }
 
     private void runAckWriter(int endpointIndex, ArrayBlockingQueue<Long> ackQueue) {
-        final ByteArrayOutputStream ackBuffer =
-                new ByteArrayOutputStream(Math.max(256, ACK_FRAME_LEN * ACK_BATCH_SIZE));
-        final ArrayList<Long> ackBatchRowIds = new ArrayList<>(ACK_BATCH_SIZE);
+        final ByteArrayOutputStream ackBuffer = new ByteArrayOutputStream(ACK_FRAME_LEN);
         byte[] pendingAckBytes = null;
+        long pendingAckRowId = -1L;
         while (ackWritersRunning || (ackQueue != null && !ackQueue.isEmpty())) {
             try {
                 if (!isEndpointConnected(endpointIndex)) {
@@ -666,13 +720,10 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                     if (firstRowId == null) {
                         continue;
                     }
+                    long latestAckRowId = firstRowId;
                     ackBuffer.reset();
-                    ackBatchRowIds.clear();
-                    writeAck(ackBuffer, firstRowId);
-                    ackBatchRowIds.add(firstRowId);
-                    int ackCount = 1;
                     final long flushDeadline = System.nanoTime() + ACK_FLUSH_LINGER_MS * 1_000_000L;
-                    while (ackCount < ACK_BATCH_SIZE) {
+                    while (true) {
                         final Long nextRowId = ackQueue.poll();
                         if (nextRowId == null) {
                             if (System.nanoTime() >= flushDeadline) {
@@ -681,16 +732,18 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                             TimeUnit.MICROSECONDS.sleep(100L);
                             continue;
                         }
-                        writeAck(ackBuffer, nextRowId);
-                        ackBatchRowIds.add(nextRowId);
-                        ackCount++;
+                        if (nextRowId > latestAckRowId) {
+                            latestAckRowId = nextRowId;
+                        }
                     }
+                    writeAck(ackBuffer, latestAckRowId);
                     pendingAckBytes = ackBuffer.toByteArray();
+                    pendingAckRowId = latestAckRowId;
                 }
                 out.write(pendingAckBytes);
                 out.flush();
                 pendingAckBytes = null;
-                ackBatchRowIds.clear();
+                pendingAckRowId = -1L;
             } catch (InterruptedException e) {
                 if (!ackWritersRunning) {
                     return;
@@ -699,9 +752,9 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                 markEndpointDisconnected(endpointIndex, e);
                 if (LOG.isDebugEnabled()) {
                     LOG.debug(
-                            "ExternalRuntimePostOperator ACK writer failed for endpoint {}; retrying {} pending ACK(s) after reconnect.",
+                            "ExternalRuntimePostOperator ACK writer failed for endpoint {}; retrying cumulative ACK {} after reconnect.",
                             endpointIndex,
-                            ackBatchRowIds.size(),
+                            pendingAckRowId,
                             e);
                 }
                 try {
@@ -1560,6 +1613,19 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         ackWriterThreads = null;
     }
 
+    private void stopAckBroadcastThread() {
+        ackBroadcastRunning = false;
+        if (ackBroadcastThread != null) {
+            ackBroadcastThread.interrupt();
+            try {
+                ackBroadcastThread.join(1000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        ackBroadcastThread = null;
+    }
+
     private static void writeIntBE(OutputStream out, int value) throws IOException {
         out.write((value >>> 24) & 0xff);
         out.write((value >>> 16) & 0xff);
@@ -1648,6 +1714,8 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     protected void closeInternal() throws Exception {
         IOException error = null;
 
+        flushPendingAcks(true);
+        stopAckBroadcastThread();
         stopAckWriterThreads();
         stopResponseReaderThreads();
 
@@ -1669,6 +1737,9 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         ackQueues = null;
         ackWriterThreads = null;
         ackWritersRunning = false;
+        ackTracker = null;
+        ackBroadcastThread = null;
+        ackBroadcastRunning = false;
         consecutiveMissingSkipMode = false;
         lastSkippedMissingRowId = -1L;
 
