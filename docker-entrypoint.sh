@@ -27,6 +27,11 @@ for f in /conf/*; do
     ln -sf "$f" "$FLINK_HOME/conf/$(basename "$f")"
 done
 
+if [[ "${CAPSYS_ENABLE_NODE_EXPORTER:-true}" == "true" ]]; then
+    /usr/bin/prometheus-node-exporter \
+        --web.listen-address="0.0.0.0:9100" &
+fi
+
 echo "Starting Flink $COMPONENT"
 
 case "$COMPONENT" in

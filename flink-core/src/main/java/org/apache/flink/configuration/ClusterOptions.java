@@ -140,11 +140,22 @@ public class ClusterOptions {
                     .defaultValue(PlacementMethod.DEFAULT)
                     .withDescription(
                             String.format(
-                                    "Defines which placement method should be used  (%s, %s, %s or %s)",
+                                    "Defines which placement method should be used  (%s, %s, %s, %s or %s)",
                                     PlacementMethod.DEFAULT.name(),
                                     PlacementMethod.TOP_DOWN.name(),
                                     PlacementMethod.BOTTOM_UP.name(),
-                                    PlacementMethod.TOPOLOGY.name()));
+                                    PlacementMethod.TOPOLOGY.name(),
+                                    PlacementMethod.CAPSYS.name()));
+
+    @Documentation.Section(Documentation.Sections.PLACEMENT_METHOD)
+    public static final ConfigOption<String> CAPSYS_SCHEDULER_CFG_PATH =
+            ConfigOptions.key("cluster.capsys.scheduler-cfg.path")
+                    .stringType()
+                    .defaultValue("schedulercfg")
+                    .withDescription(
+                            "Path to the CAPSYS scheduler config file. Each non-empty line must map"
+                                    + " an operator name to a TaskManager address via 'operator; address'"
+                                    + " or 'operator: address'.");
 
     @Documentation.Section(Documentation.Sections.EXECUTION_SLOT_ALLOCATOR_TYPE)
     public static final ConfigOption<ExecutionSlotAllocatorType> EXECUTION_SLOT_ALLOCATOR_TYPE =
@@ -256,6 +267,7 @@ public class ClusterOptions {
         DEFAULT,
         TOP_DOWN,
         BOTTOM_UP,
-        TOPOLOGY
+        TOPOLOGY,
+        CAPSYS
     }
 }

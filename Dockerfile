@@ -3,6 +3,7 @@ FROM eclipse-temurin:17-jre-jammy
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     curl \
+    prometheus-node-exporter \
     && rm -rf /var/lib/apt/lists/*
 
 ENV FLINK_HOME=/opt/flink
