@@ -60,7 +60,12 @@ rest:
 
 topology:
   graphml:
-    path: /home/mhuttner/flink/build-target/conf/cloud.graphml
+    path: /mnt/labstore/aelmansoury/flinke2c/conf/cloud.graphml
+
+cluster:
+  placement-method: BOTTOM_UP
+  placement:
+    capability-sort: true
 
 # =============================================================================
 # JVM
@@ -86,7 +91,7 @@ state:
     incremental: true
     local-recovery: true
   checkpoints:
-    dir: file:///mnt/labstore/mhuttner/checkpoint
+    dir: file:///mnt/labstore/aelmansoury/flinke2c/checkpoint
 
 # RocksDB local dir is still commonly configured as a flat key.
 state.backend.rocksdb.localdir: /tmp

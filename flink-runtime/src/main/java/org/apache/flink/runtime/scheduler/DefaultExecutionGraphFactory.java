@@ -161,12 +161,14 @@ public class DefaultExecutionGraphFactory implements ExecutionGraphFactory {
         ClusterOptions.PlacementMethod placementMethod = configuration.get(ClusterOptions.PLACEMENT_METHOD);
         LOG.debug("Placement method {}", placementMethod);
         String graphMlPath = configuration.getString("topology.graphml.path", "/topology.graphml");
+        boolean capabilitySort = configuration.get(ClusterOptions.PLACEMENT_CAPABILITY_SORT);
 
         ExecutionGraphPlacement executionGraphPlacement = null;
         switch (placementMethod) {
             case TOP_DOWN:
             case BOTTOM_UP:
-                executionGraphPlacement = new TopDownBottomUpExecutionGraphPlacement(placementMethod, graphMlPath);
+                executionGraphPlacement = new TopDownBottomUpExecutionGraphPlacement(
+                        placementMethod, graphMlPath, capabilitySort);
                 break;
             case TOPOLOGY:
                 executionGraphPlacement = new TopologyExecutionGraphPlacement();

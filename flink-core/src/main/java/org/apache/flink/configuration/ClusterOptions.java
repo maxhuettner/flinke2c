@@ -146,6 +146,17 @@ public class ClusterOptions {
                                     PlacementMethod.BOTTOM_UP.name(),
                                     PlacementMethod.TOPOLOGY.name()));
 
+    @Documentation.Section(Documentation.Sections.PLACEMENT_METHOD)
+    public static final ConfigOption<Boolean> PLACEMENT_CAPABILITY_SORT =
+            ConfigOptions.key("cluster.placement.capability-sort")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "When true, the TOP_DOWN/BOTTOM_UP placement orders compute nodes "
+                                    + "by computeCapability (descending) before assigning operators, "
+                                    + "so heavy operators land on the fastest nodes. When false, the "
+                                    + "raw BFS order is used (original behaviour).");
+
     @Documentation.Section(Documentation.Sections.EXECUTION_SLOT_ALLOCATOR_TYPE)
     public static final ConfigOption<ExecutionSlotAllocatorType> EXECUTION_SLOT_ALLOCATOR_TYPE =
             ConfigOptions.key("cluster.execution-slot-allocator-type")
@@ -251,6 +262,7 @@ public class ClusterOptions {
         SLOT_SHARING,
         SIMPLE
     }
+
     /** @see ClusterOptions#PLACEMENT_METHOD */
     public enum PlacementMethod {
         DEFAULT,

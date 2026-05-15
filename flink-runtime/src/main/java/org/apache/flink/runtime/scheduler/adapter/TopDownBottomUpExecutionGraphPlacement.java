@@ -40,10 +40,19 @@ public class TopDownBottomUpExecutionGraphPlacement implements ExecutionGraphPla
 
     private final Graph<TopologyNode, DefaultEdge> processingTopology;
     private final ClusterOptions.PlacementMethod placementMethod;
+    private final boolean capabilitySort;
 
     public TopDownBottomUpExecutionGraphPlacement(ClusterOptions.PlacementMethod placementMethod, String graphMlPath) {
+        this(placementMethod, graphMlPath, true);
+    }
+
+    public TopDownBottomUpExecutionGraphPlacement(
+            ClusterOptions.PlacementMethod placementMethod,
+            String graphMlPath,
+            boolean capabilitySort) {
         this.placementMethod = placementMethod;
         this.processingTopology = loadTopologyFromGraphML(graphMlPath);
+        this.capabilitySort = capabilitySort;
     }
 
     private Graph<TopologyNode, DefaultEdge> loadTopologyFromGraphML(String path) {
@@ -306,12 +315,20 @@ public class TopDownBottomUpExecutionGraphPlacement implements ExecutionGraphPla
             Collections.reverse(finalOpOrder);
         }
 
+        if (capabilitySort) {
+            bfsNodes.sort(Comparator.comparingDouble((ComputeNode n) -> n.computeCapability).reversed());
+            LOG.info("Capability-sorted compute nodes: {}",
+                    bfsNodes.stream()
+                            .map(n -> n.getId() + "(cap=" + n.computeCapability + ")")
+                            .collect(Collectors.joining(", ")));
+        }
+
         Map<ComputeNode, Integer> slots = processingTopology.vertexSet().stream()
                 .filter(ComputeNode.class::isInstance)
                 .map(n -> (ComputeNode) n)
                 .collect(Collectors.toMap(n -> n, n -> n.numSlots));
 
-        LOG.debug("Placement method: {}", placementMethod);
+        LOG.debug("Placement method: {}, capability-sort: {}", placementMethod, capabilitySort);
         int idx = 0;
         for (JobVertexID vertexId : finalOpOrder) {
             while (idx < bfsNodes.size() && slots.get(bfsNodes.get(idx)) <= 0) {
