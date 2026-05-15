@@ -48,7 +48,7 @@ taskmanager:
   memory:
     process:
       size: 8G
-  # numberOfTaskSlots: 1
+  numberOfTaskSlots: 2
 
 # =============================================================================
 # REST
@@ -60,7 +60,7 @@ rest:
 
 topology:
   graphml:
-    path: /mnt/labstore/aelmansoury/flinke2c/conf/cloud.graphml
+    path: /mnt/labstore/aelmansoury/flinke2c/build-target/conf/cloud.graphml
 
 cluster:
   placement-method: BOTTOM_UP
