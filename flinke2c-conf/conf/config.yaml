@@ -60,7 +60,9 @@ rest:
 
 topology:
   graphml:
-    path: /mnt/labstore/aelmansoury/flinke2c/build-target/conf/cloud.graphml
+    # Generated at cluster bootstrap by scripts/bench-cluster.sh + generate-graphml.py.
+    # Lives outside the git repo so per-cluster bench results don't pollute the branch.
+    path: /mnt/labstore/aelmansoury/conf/cloud.graphml
 
 cluster:
   placement-method: BOTTOM_UP
