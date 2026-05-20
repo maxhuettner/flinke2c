@@ -119,3 +119,9 @@ table:
     distinct-agg:
       split:
         enabled: true
+
+# =============================================================================
+# Web UI (CORS — let the FlinkE2C dashboard at :8082 fetch /jobs from :8081)
+# =============================================================================
+web:
+  access-control-allow-origin: '*'
