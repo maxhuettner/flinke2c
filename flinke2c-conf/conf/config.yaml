@@ -58,6 +58,17 @@ rest:
   bind-address: 0.0.0.0
   port: 8081
 
+# =============================================================================
+# Metrics — REST/WebUI metric fetcher cadence.
+# Default is 10 s, which makes /jobs/{id}/vertices/{vid} counters (write-records,
+# accumulated-busy-time, ...) refresh only every ~10 s. The E2cMonitor samples at
+# 1 s, so a slow fetcher makes per-operator throughput stair-step (0 between
+# refreshes, a spike on the jump). Drop it to 1 s so the counters refresh near
+# the monitor's tick. The monitor also carries rates forward between changes, so
+# this is an accuracy/latency improvement, not a correctness requirement.
+# =============================================================================
+metrics.fetcher.update-interval: 1 s
+
 topology:
   graphml:
     # Generated at cluster bootstrap by scripts/bench-cluster.sh + generate-graphml.py.

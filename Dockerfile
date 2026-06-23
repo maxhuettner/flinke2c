@@ -29,8 +29,10 @@ COPY ${FLINK_DIST}/conf/log4j-session.properties      $FLINK_HOME/conf/
 COPY ${FLINK_DIST}/conf/logback.xml                   $FLINK_HOME/conf/
 COPY ${FLINK_DIST}/conf/logback-console.xml           $FLINK_HOME/conf/
 COPY ${FLINK_DIST}/conf/logback-session.xml           $FLINK_HOME/conf/
-COPY ${FLINK_DIST}/conf/masters                       $FLINK_HOME/conf/
-COPY ${FLINK_DIST}/conf/workers                       $FLINK_HOME/conf/
+# `masters` / `workers` intentionally omitted: those are symlinks to absolute paths under
+# `flinke2c-conf/` (used only by `start-cluster.sh` standalone mode) and BuildKit rejects
+# absolute-path symlinks. Container deployment uses the per-service entrypoint, not the
+# standalone scripts, so the files aren't needed at runtime.
 COPY ${FLINK_DIST}/conf/zoo.cfg                       $FLINK_HOME/conf/
 
 COPY docker-entrypoint.sh $FLINK_HOME/bin/docker-entrypoint.sh

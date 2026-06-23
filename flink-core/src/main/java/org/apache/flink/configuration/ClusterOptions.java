@@ -157,6 +157,20 @@ public class ClusterOptions {
                                     + "so heavy operators land on the fastest nodes. When false, the "
                                     + "raw BFS order is used (original behaviour).");
 
+    @Documentation.Section(Documentation.Sections.PLACEMENT_METHOD)
+    public static final ConfigOption<String> PLACEMENT_STICKY_STATE_PATH =
+            ConfigOptions.key("cluster.placement.sticky-state-path")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Path to the sticky placement state file. The placement records "
+                                    + "the operator-name -> host map here after each assignment "
+                                    + "and uses it on the next submission to keep operators "
+                                    + "pinned to their previous hosts unless those hosts are "
+                                    + "now `excluded`. Empty / unset = derive from "
+                                    + "`topology.graphml.path` (sibling `placement-state.tsv`). "
+                                    + "Missing file = fresh positional fill (today's behaviour).");
+
     @Documentation.Section(Documentation.Sections.EXECUTION_SLOT_ALLOCATOR_TYPE)
     public static final ConfigOption<ExecutionSlotAllocatorType> EXECUTION_SLOT_ALLOCATOR_TYPE =
             ConfigOptions.key("cluster.execution-slot-allocator-type")

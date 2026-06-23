@@ -1,15 +1,25 @@
-# Exclude everything by default, then whitelist what Docker needs
+# Exclude everything by default, then whitelist what Docker needs.
+#
+# BuildKit gotcha: `**` followed by `!path/**` does NOT include the intermediate directories.
+# Each parent dir on the whitelist path must be re-included explicitly, otherwise BuildKit
+# filters the dir entries out and COPYs of leaf files inside silently fail ("not found").
 **
 
-# Entrypoint script
+# Entrypoint script.
 !docker-entrypoint.sh
 
-# Flink distribution (real path behind the build-target symlink)
+# Flink distribution (real path behind the build-target symlink). Whitelist the intermediate
+# dirs first so BuildKit can descend into them, then the leaf contents.
+!flink-dist
+!flink-dist/target
+!flink-dist/target/flink-2.2-SNAPSHOT-bin
+!flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT
 !flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/bin/**
 !flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/lib/**
 !flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/opt/**
 !flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/plugins/**
 !flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/examples/**
 !flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/conf/**
-# Exclude config.yaml from conf — it is supplied externally
+
+# Re-exclude config.yaml — it is supplied externally at runtime via /conf bind mount.
 flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/conf/config.yaml

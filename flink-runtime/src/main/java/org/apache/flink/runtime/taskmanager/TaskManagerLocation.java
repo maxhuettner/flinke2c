@@ -126,15 +126,28 @@ public class TaskManagerLocation implements Comparable<TaskManagerLocation>, jav
             final ResolutionMode resolutionMode)
             throws UnknownHostException {
 
-        InetAddress inetAddress = InetAddress.getByName(unresolvedLocation.getExternalAddress());
+        String externalAddress = unresolvedLocation.getExternalAddress();
+        InetAddress inetAddress = InetAddress.getByName(externalAddress);
+
+        // If `taskmanager.host` was set to a hostname (not an IP literal), trust it as the
+        // canonical hostname rather than reverse-DNSing the resolved IP. Under Docker Swarm
+        // overlay networks, reverse DNS on the overlay IP returns the auto-generated task DNS
+        // name (`<service>.<task-id>.<container-id>.<net>`), which the placer's
+        // `taskManagerAddress=zsXX` hints can never match, breaking BOTTOM_UP + capability-sort.
+        // Bare-metal users typically set `taskmanager.host` to an IP, which falls through to
+        // the original DefaultHostNameSupplier path — so behaviour there is unchanged.
+        boolean externalIsHostname = !externalAddress.equals(inetAddress.getHostAddress());
 
         switch (resolutionMode) {
             case RETRIEVE_HOST_NAME:
+                HostNameSupplier supplier = externalIsHostname
+                        ? new ConfiguredHostNameSupplier(externalAddress)
+                        : new DefaultHostNameSupplier(inetAddress);
                 return new TaskManagerLocation(
                         unresolvedLocation.getResourceID(),
                         inetAddress,
                         unresolvedLocation.getDataPort(),
-                        new DefaultHostNameSupplier(inetAddress),
+                        supplier,
                         unresolvedLocation.getNodeId());
             case USE_IP_ONLY:
                 return new TaskManagerLocation(
@@ -414,6 +427,38 @@ public class TaskManagerLocation implements Comparable<TaskManagerLocation>, jav
             if (fqdnHostName == null) {
                 fqdnHostName = TaskManagerLocation.getFqdnHostName(inetAddress);
             }
+            return fqdnHostName;
+        }
+    }
+
+    /**
+     * Returns a caller-supplied hostname verbatim, bypassing reverse DNS. Used when
+     * {@code taskmanager.host} is set to a hostname (rather than an IP literal) and the
+     * deployment environment's reverse DNS would otherwise return something useless — e.g.
+     * Docker Swarm overlay nets reverse-DNS an overlay IP to the auto-generated task DNS
+     * name {@code <service>.<task-id>.<container-id>.<net>}, which the placer's
+     * {@code taskManagerAddress=zs0X} hints would never match.
+     *
+     * <p>Pure rename / FQDN-trim: the FQDN form is whatever the caller passed; the short
+     * form is the first DNS segment (matches {@link DefaultHostNameSupplier} semantics).
+     */
+    @VisibleForTesting
+    public static class ConfiguredHostNameSupplier implements HostNameSupplier {
+        private final String hostName;
+        private final String fqdnHostName;
+
+        public ConfiguredHostNameSupplier(String configuredHostName) {
+            this.fqdnHostName = configuredHostName;
+            this.hostName = NetUtils.getHostnameFromFQDN(configuredHostName);
+        }
+
+        @Override
+        public String getHostName() {
+            return hostName;
+        }
+
+        @Override
+        public String getFqdnHostName() {
             return fqdnHostName;
         }
     }
