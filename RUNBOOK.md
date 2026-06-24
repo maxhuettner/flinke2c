@@ -3,9 +3,32 @@
 How to operate the **FlinkE2C cluster** on the TUDa lab cluster (zs01–zs08).
 Audience: future you, post-meeting, post-coffee.
 
+This runbook covers the **bare-metal** FlinkE2C deployment (the original SSH-fanout flow).
+The Docker Swarm deployment of the same FlinkE2C dist (since 2026-06-22) is operated through
+[`flink-runtime-monitor/docker/RUNBOOK-docker.md`](../flink-runtime-monitor/docker/RUNBOOK-docker.md);
+both share the same patched source tree on branch `flinke2c-computeCapabiilityPlacement`.
+
 For the **runtime monitor** (CpuMetricSender + E2cMonitor + detection/redeploy pipeline),
-see [`flink-runtime-monitor/RUNBOOK.md`](../flink-runtime-monitor/RUNBOOK.md) — separate
-repo, separate concerns.
+see [`flink-runtime-monitor/RUNBOOK.md`](../flink-runtime-monitor/RUNBOOK.md) (bare-metal)
+or `flink-runtime-monitor/docker/RUNBOOK-docker.md` (Swarm) — separate repo, separate concerns.
+
+## 2026-06-22 patches landed on `flinke2c-computeCapabiilityPlacement`
+
+- **`TaskManagerLocation.fromUnresolvedLocation`** — new `ConfiguredHostNameSupplier` inner
+  class. When `taskmanager.host` is set to a hostname (not an IP literal), the supplier
+  returns it verbatim instead of reverse-DNSing the resolved IP. Bare-metal users typically
+  set `taskmanager.host` to an IP and fall through to the original `DefaultHostNameSupplier`
+  unchanged; Swarm overlay deployments (where `taskmanager.host=zs02..zs08` and reverse DNS
+  on the overlay IP returns the swarm task DNS name) now correctly use the configured value
+  as the canonical hostname so slot matching against `taskManagerAddress=zsXX` placer hints
+  succeeds. This unblocks `cluster.placement-method: BOTTOM_UP + capability-sort: true` on
+  Swarm. Build with `scripts/build-flinke2c-runtime.sh` and then surgically replace the
+  `TaskManagerLocation*.class` files inside `build-target/lib/flink-dist-*.jar` with
+  `scripts/patch-dist-jar.sh` (the FlinkE2C image build picks them up from build-target).
+- **Sticky placement** (`TopDownBottomUpExecutionGraphPlacement`) — already shipped 2026-06-08
+  (see `STICKY-PLACEMENT-DESIGN.md`). Unchanged by today's work but operationally still
+  current: the placer pins each operator to its previous host if eligible, only relocates
+  the controller's flagged-and-excluded culprit.
 
 ---
 

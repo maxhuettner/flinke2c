@@ -1,13 +1,13 @@
 # FlinkE2C changed files
 
 Generated on 2026-03-01 from commits ahead of origin/release-2.2 (PR base).
+Snapshot only — list does NOT reflect later changes (e.g. the 2026-06-22
+`TaskManagerLocation.fromUnresolvedLocation` patch). For current state run:
+`git diff --name-only origin/release-2.2...HEAD`.
 
-Source command: `git diff --name-only origin/release-2.2...HEAD`
-
-Total files: 38
+Total files in the 2026-03-01 snapshot: 37
 
 - .dockerignore
-- Docker.md
 - Dockerfile
 - docker-entrypoint.sh
 - flink-dist/pom.xml
