@@ -40,6 +40,7 @@ import org.apache.flink.runtime.jobmaster.ExecutionDeploymentTracker;
 import org.apache.flink.runtime.jobmaster.ExecutionDeploymentTrackerDeploymentListenerAdapter;
 import org.apache.flink.runtime.metrics.groups.JobManagerJobMetricGroup;
 import org.apache.flink.runtime.scheduler.adaptivebatch.ExecutionPlanSchedulingContext;
+import org.apache.flink.runtime.scheduler.adapter.CapsysExecutionGraphPlacement;
 import org.apache.flink.runtime.scheduler.adapter.DefaultExecutionGraphPlacement;
 import org.apache.flink.runtime.scheduler.adapter.TopDownBottomUpExecutionGraphPlacement;
 import org.apache.flink.runtime.scheduler.adapter.TopologyExecutionGraphPlacement;
@@ -161,6 +162,7 @@ public class DefaultExecutionGraphFactory implements ExecutionGraphFactory {
         ClusterOptions.PlacementMethod placementMethod = configuration.get(ClusterOptions.PLACEMENT_METHOD);
         LOG.debug("Placement method {}", placementMethod);
         String graphMlPath = configuration.getString("topology.graphml.path", "/topology.graphml");
+        String schedulerCfgPath = configuration.get(ClusterOptions.CAPSYS_SCHEDULER_CFG_PATH);
 
         ExecutionGraphPlacement executionGraphPlacement = null;
         switch (placementMethod) {
@@ -170,6 +172,9 @@ public class DefaultExecutionGraphFactory implements ExecutionGraphFactory {
                 break;
             case TOPOLOGY:
                 executionGraphPlacement = new TopologyExecutionGraphPlacement();
+                break;
+            case CAPSYS:
+                executionGraphPlacement = new CapsysExecutionGraphPlacement(schedulerCfgPath);
                 break;
             default:
                 executionGraphPlacement = new DefaultExecutionGraphPlacement();
