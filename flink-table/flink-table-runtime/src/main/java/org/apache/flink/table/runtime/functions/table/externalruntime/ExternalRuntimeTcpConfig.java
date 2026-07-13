@@ -15,6 +15,8 @@ final class ExternalRuntimeTcpConfig {
     private static final int DEFAULT_REORDER_MAX_BUFFER = 100000;
     private static final int DEFAULT_FAILOVER_RECONNECT_BACKOFF_MS = 1000;
     private static final int DEFAULT_FAILOVER_POLL_TIMEOUT_MS = 10;
+    private static final int DEFAULT_ACK_EVERY_ROWS = 256;
+    private static final int DEFAULT_ACK_FLUSH_TIMEOUT_MS = 5;
     private static final boolean DEFAULT_POST_ROLE_ONLY = true;
 
     private final List<ExternalRuntimeEndpoint> runtimes;
@@ -26,6 +28,8 @@ final class ExternalRuntimeTcpConfig {
     private final int readTimeoutMs;
     private final int failoverReconnectBackoffMs;
     private final int failoverPollTimeoutMs;
+    private final int ackEveryRows;
+    private final int ackFlushTimeoutMs;
 
     private final String functionClass;
     private final String functionKind;
@@ -52,6 +56,8 @@ final class ExternalRuntimeTcpConfig {
             int readTimeoutMs,
             int failoverReconnectBackoffMs,
             int failoverPollTimeoutMs,
+            int ackEveryRows,
+            int ackFlushTimeoutMs,
             String functionClass,
             String functionKind,
             List<Integer> argFieldIndices,
@@ -74,6 +80,8 @@ final class ExternalRuntimeTcpConfig {
         this.readTimeoutMs = readTimeoutMs;
         this.failoverReconnectBackoffMs = failoverReconnectBackoffMs;
         this.failoverPollTimeoutMs = failoverPollTimeoutMs;
+        this.ackEveryRows = ackEveryRows;
+        this.ackFlushTimeoutMs = ackFlushTimeoutMs;
 
         this.functionClass = functionClass;
         this.functionKind = functionKind;
@@ -112,6 +120,14 @@ final class ExternalRuntimeTcpConfig {
                         DEFAULT_FAILOVER_RECONNECT_BACKOFF_MS);
         final int failoverPollTimeoutMs =
                 parseInt(firstNonNull(map, "failoverpolltimeoutms", "autofailoverpolltimeoutms"), DEFAULT_FAILOVER_POLL_TIMEOUT_MS);
+        final int ackEveryRows =
+                parseInt(
+                        firstNonNull(map, "ackeveryrows", "postackeveryrows"),
+                        DEFAULT_ACK_EVERY_ROWS);
+        final int ackFlushTimeoutMs =
+                parseInt(
+                        firstNonNull(map, "ackflushms", "postackflushms"),
+                        DEFAULT_ACK_FLUSH_TIMEOUT_MS);
 
         final String functionClass = firstNonNull(map, "class", "functionclass");
         final String functionKind = firstNonNull(map, "type", "functionkind");
@@ -152,6 +168,8 @@ final class ExternalRuntimeTcpConfig {
                 readTimeoutMs,
                 failoverReconnectBackoffMs,
                 failoverPollTimeoutMs,
+                ackEveryRows,
+                ackFlushTimeoutMs,
                 functionClass,
                 functionKind,
                 argFieldIndices,
@@ -432,6 +450,14 @@ final class ExternalRuntimeTcpConfig {
 
     public int getReadTimeoutMs() {
         return this.readTimeoutMs;
+    }
+
+    public int getAckEveryRows() {
+        return ackEveryRows;
+    }
+
+    public int getAckFlushTimeoutMs() {
+        return ackFlushTimeoutMs;
     }
 
     public int getReorderMaxBuffer() {

@@ -59,5 +59,15 @@ class ExternalRuntimeTcpConfigTest {
         assertThat(config.getRuntimeParallelism()).isEqualTo(2);
         assertThat(config.selectEndpoints(0, 1)).hasSize(2);
     }
-}
 
+    @Test
+    void testParseAckThresholds() {
+        final ExternalRuntimeTcpConfig config =
+                ExternalRuntimeTcpConfig.from(
+                        "runtimes=host1:9000,host2:9001;"
+                                + "postAckEveryRows=1024;postAckFlushMs=17");
+
+        assertThat(config.getAckEveryRows()).isEqualTo(1024);
+        assertThat(config.getAckFlushTimeoutMs()).isEqualTo(17);
+    }
+}
