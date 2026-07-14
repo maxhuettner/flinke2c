@@ -46,6 +46,8 @@ import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodeUtil;
 import org.apache.flink.table.planner.utils.JavaScalaConversionUtil;
 import org.apache.flink.table.runtime.functions.table.externalruntime.ExternalRuntimePostOperator;
 import org.apache.flink.table.runtime.functions.table.externalruntime.ExternalRuntimePreOperator;
+import org.apache.flink.table.runtime.functions.table.externalruntime.RdmaPostOperator;
+import org.apache.flink.table.runtime.functions.table.externalruntime.RdmaPreOperator;
 import org.apache.flink.table.runtime.operators.CodeGenOperatorFactory;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -272,15 +274,19 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
             @Nullable RowType postOutputRowType) {
         final RowType inputRowType = extractRowType(input);
         final RowType outputRowType = postOutputRowType == null ? inputRowType : postOutputRowType;
+        final boolean rdma = isRdmaTransport(conf);
+        LOG.info("External runtime transport selected: {} (conf={})", rdma ? "RDMA" : "TCP", conf);
         final OneInputTransformation<RowData, RowData> pre =
                 ExecNodeUtil.createOneInputTransformation(
                         input,
                         createTransformationMeta(
                                 "external-runtime-pre",
-                                "ExternalRuntimePre",
-                                "ExternalRuntimePre",
+                                rdma ? "RdmaPre" : "ExternalRuntimePre",
+                                rdma ? "RdmaPre" : "ExternalRuntimePre",
                                 config),
-                        new ExternalRuntimePreOperator(conf, inputRowType),
+                        rdma
+                                ? new RdmaPreOperator(conf, inputRowType)
+                                : new ExternalRuntimePreOperator(conf, inputRowType),
                         input.getOutputType(),
                         input.getParallelism(),
                         input.isParallelismConfigured());
@@ -295,10 +301,12 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                         pre,
                         createTransformationMeta(
                                 "external-runtime-post",
-                                "ExternalRuntimePost",
-                                "ExternalRuntimePost",
+                                rdma ? "RdmaPost" : "ExternalRuntimePost",
+                                rdma ? "RdmaPost" : "ExternalRuntimePost",
                                 config),
-                        new ExternalRuntimePostOperator(conf, inputRowType, outputRowType),
+                        rdma
+                                ? new RdmaPostOperator(conf, inputRowType, outputRowType)
+                                : new ExternalRuntimePostOperator(conf, inputRowType, outputRowType),
                         InternalTypeInfo.of(outputRowType),
                         pre.getParallelism(),
                         pre.isParallelismConfigured());
@@ -309,6 +317,25 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         setMaxParallelismIfConfigured(input, post);
 
         return post;
+    }
+
+    private static boolean isRdmaTransport(@Nullable String conf) {
+        if (conf == null) {
+            return false;
+        }
+        for (String part : conf.split(";")) {
+            int equals = part.indexOf('=');
+            if (equals <= 0) {
+                continue;
+            }
+            String key = part.substring(0, equals).trim();
+            String value = part.substring(equals + 1).trim();
+            if (("type".equalsIgnoreCase(key) || "transport".equalsIgnoreCase(key))
+                    && "rdma".equalsIgnoreCase(value)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     protected Transformation<RowData> createExternalRuntimeChain(
