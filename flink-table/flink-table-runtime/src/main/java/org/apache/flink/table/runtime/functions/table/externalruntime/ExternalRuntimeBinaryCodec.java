@@ -149,6 +149,41 @@ final class ExternalRuntimeBinaryCodec {
         out.write(outBuf.buf(), 0, payloadLen);
     }
 
+    /** Encodes one frame without constructing a temporary ByteArrayOutputStream. */
+    byte[] encodeFramedRow(RowData row, int[] payloadFieldIndices, long rowId) throws IOException {
+        if (writeWireTypes == null) {
+            throw new IOException("ExternalRuntimeBinaryCodec not configured for writing");
+        }
+        final int nFields = writeWireTypes.length;
+        final int nullBytes = (nFields + 7) >>> 3;
+        outBuf.reset();
+        outBuf.putIntBE(rowKindToOp(row.getRowKind()));
+        if (includeRowId) {
+            outBuf.putLongBE(rowId);
+        }
+        final int nullBitmapPos = outBuf.position();
+        outBuf.ensureCapacity(nullBytes);
+        for (int i = 0; i < nullBytes; i++) {
+            outBuf.putByte((byte) 0);
+        }
+        for (int i = 0; i < nFields; i++) {
+            final int sourceIndex = payloadFieldIndices[i];
+            if (row.isNullAt(sourceIndex)) {
+                setNullBit(outBuf.buf(), nullBitmapPos, i);
+            } else {
+                writeValue(i, row, sourceIndex);
+            }
+        }
+        final int payloadLen = outBuf.position();
+        final byte[] frame = new byte[payloadLen + Integer.BYTES];
+        frame[0] = (byte) (payloadLen >>> 24);
+        frame[1] = (byte) (payloadLen >>> 16);
+        frame[2] = (byte) (payloadLen >>> 8);
+        frame[3] = (byte) payloadLen;
+        System.arraycopy(outBuf.buf(), 0, frame, Integer.BYTES, payloadLen);
+        return frame;
+    }
+
     private void writeValue(int fieldPos, RowData row, int sourceIndex) throws IOException {
         final WireType wt = writeWireTypes[fieldPos];
         final LogicalType targetType = writeTargetTypes[fieldPos];
@@ -213,7 +248,12 @@ final class ExternalRuntimeBinaryCodec {
                 final int srcScale = writeSourceScale[fieldPos];
                 if (sourceRoot == LogicalTypeRoot.DECIMAL && srcScale == dt.getScale()) {
                     final DecimalData dec = row.getDecimal(sourceIndex, srcPrecision, srcScale);
-                    final byte[] bytes = dec.toUnscaledBytes();
+                    byte[] bytes = dec.toUnscaledBytes();
+                    // DECIMAL_UNSCALED_BYTES must never use a zero-length
+                    // representation. BigInteger zero is encoded as 00.
+                    if (bytes.length == 0) {
+                        bytes = new byte[] {0};
+                    }
                     outBuf.putIntBE(bytes.length);
                     outBuf.putBytes(bytes);
                 } else {
@@ -245,14 +285,33 @@ final class ExternalRuntimeBinaryCodec {
         ensureReadBuf(frameLen);
         readFully(in, frameReadBuf, 0, frameLen);
 
-        int p = 0;
+        return decodeFrame(frameReadBuf, 0, frameLen, fallbackKind, reuseRow);
+    }
 
-        final int op = readIntBE(frameReadBuf, p);
+    /** Decodes a complete RDMA slot directly, avoiding a ByteArrayInputStream allocation. */
+    RowWithId readFramedRow(byte[] frame, RowKind fallbackKind, @Nullable GenericRowData reuseRow)
+            throws IOException {
+        if (frame.length < Integer.BYTES) {
+            throw new IOException("Truncated frame header");
+        }
+        final int frameLen = readIntBE(frame, 0);
+        if (frameLen < 0 || frameLen > DEFAULT_MAX_FRAME_SIZE || frameLen + 4 > frame.length) {
+            throw new IOException("Invalid frame length: " + frameLen);
+        }
+        return decodeFrame(frame, Integer.BYTES, frameLen, fallbackKind, reuseRow);
+    }
+
+    private RowWithId decodeFrame(
+            byte[] frame, int frameOffset, int frameLen, RowKind fallbackKind,
+            @Nullable GenericRowData reuseRow) throws IOException {
+        int p = frameOffset;
+
+        final int op = readIntBE(frame, p);
         p += 4;
 
         final long rowId;
         if (includeRowId) {
-            rowId = readLongBE(frameReadBuf, p);
+            rowId = readLongBE(frame, p);
             p += 8;
         } else {
             rowId = -1L;
@@ -261,7 +320,7 @@ final class ExternalRuntimeBinaryCodec {
         final int nFields = readWireTypes.length;
         final int nullBytes = (nFields + 7) >>> 3;
 
-        if (p + nullBytes > frameLen) {
+        if (p + nullBytes > frameOffset + frameLen) {
             throw new IOException("Truncated payload: missing nullBitmap");
         }
 
@@ -273,11 +332,11 @@ final class ExternalRuntimeBinaryCodec {
                         ? reuseRow
                         : new GenericRowData(nFields);
         for (int i = 0; i < nFields; i++) {
-            if (isNullBitSet(frameReadBuf, nullBitmapPos, i)) {
+            if (isNullBitSet(frame, nullBitmapPos, i)) {
                 outRow.setField(i, null);
                 continue;
             }
-            p = readValueIntoRow(i, frameReadBuf, p, frameLen, outRow);
+            p = readValueIntoRow(i, frame, p, frameOffset + frameLen, outRow);
         }
 
         final RowKind kind = opToRowKind(op, fallbackKind);
