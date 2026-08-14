@@ -91,9 +91,6 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
 
     public static final String CALC_TRANSFORMATION = "calc";
 
-    public static final String CUSTOM_EXTERNAL_RUNTIME_FUNCTION_CLASS_NAME =
-            "org.example.flinke2c.CurrencyConversionFunction";
-
     protected static final ConfigOption<String> EXTERNAL_RUNTIME_CONF_OPTION =
             ConfigOptions.key("table.exec.external-runtime.conf").stringType().noDefaultValue();
     public static final String EXTERNAL_RUNTIME_CONF_KEY_PREFIX = "table.exec.external-runtime.conf.";
@@ -569,8 +566,7 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
     }
 
     public static List<String> resolveExternalRuntimeFunctionClasses(ReadableConfig config) {
-        return parseExternalRuntimeFunctionClasses(
-                resolveFunctionClassConfig(config), CUSTOM_EXTERNAL_RUNTIME_FUNCTION_CLASS_NAME);
+        return parseExternalRuntimeFunctionClasses(resolveFunctionClassConfig(config), null);
     }
 
     public static @Nullable Integer resolveExternalRuntimeCalcParallelism(
