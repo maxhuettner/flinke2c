@@ -48,6 +48,7 @@ import org.apache.flink.table.runtime.functions.table.externalruntime.ExternalRu
 import org.apache.flink.table.runtime.functions.table.externalruntime.ExternalRuntimePreOperator;
 import org.apache.flink.table.runtime.functions.table.externalruntime.RdmaPostOperator;
 import org.apache.flink.table.runtime.functions.table.externalruntime.RdmaPreOperator;
+import org.apache.flink.table.runtime.functions.table.gpuruntime.GpuRuntimeOperator;
 import org.apache.flink.table.runtime.operators.CodeGenOperatorFactory;
 import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -111,6 +112,16 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
     public static final String EXTERNAL_RUNTIME_FUNCTION_KIND_SCALAR = "scalar";
     public static final String EXTERNAL_RUNTIME_FUNCTION_KIND_FILTER = "filter";
 
+    // GPU runtime: the matched UDF is replaced by a single in-process GpuRuntimeOperator that
+    // loads a GpuRuntimeFunction implementation by class name ("impl" conf key).
+    protected static final ConfigOption<String> GPU_RUNTIME_CONF_OPTION =
+            ConfigOptions.key("table.exec.gpu-runtime.conf").stringType().noDefaultValue();
+    public static final String GPU_RUNTIME_CONF_KEY_PREFIX = "table.exec.gpu-runtime.conf.";
+    public static final ConfigOption<String> GPU_RUNTIME_FUNCTION_CLASS_OPTION =
+            ConfigOptions.key("table.exec.gpu-runtime.function-class")
+                    .stringType()
+                    .noDefaultValue();
+
     public static final String FIELD_NAME_PROJECTION = "projection";
     public static final String FIELD_NAME_CONDITION = "condition";
 
@@ -166,10 +177,46 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         }
 
         final RowType inputRowType = extractRowType(inputTransform);
-        final RowType outputRowType = (RowType) getOutputType();
+
+        // GPU runtime first; if not configured or not matched fall through to the
+        // external-runtime / plain Calc path. GPU options are not in the persisted ExecNodeConfig,
+        // so read them from the planner configuration.
+        final ReadableConfig runtimeConfig = planner.getTableConfig();
+        final List<String> gpuRuntimeFunctionClasses = resolveGpuRuntimeFunctionClasses(runtimeConfig);
+        if (!gpuRuntimeFunctionClasses.isEmpty()) {
+            final Transformation<RowData> gpuResult =
+                    translateWithRuntimeChain(
+                            planner,
+                            config,
+                            inputTransform,
+                            inputRowType,
+                            gpuRuntimeFunctionClasses,
+                            true);
+            if (gpuResult != null) {
+                return gpuResult;
+            }
+        }
+
         final List<String> externalRuntimeFunctionClasses = resolveExternalRuntimeFunctionClasses(config);
+        return translateWithRuntimeChain(
+                planner, config, inputTransform, inputRowType, externalRuntimeFunctionClasses, false);
+    }
+
+    /**
+     * Rewrites {@link #projection}/{@link #condition} against {@code targetFunctionClasses} and, if
+     * matched, injects a {@link GpuRuntimeOperator} ({@code gpu == true}) or the RDMA/TCP PRE/POST
+     * pair ahead of the Calc. Returns {@code null} only if {@code gpu} is true and nothing matched.
+     */
+    private @Nullable Transformation<RowData> translateWithRuntimeChain(
+            PlannerBase planner,
+            ExecNodeConfig config,
+            Transformation<RowData> inputTransform,
+            RowType inputRowType,
+            List<String> targetFunctionClasses,
+            boolean gpu) {
+        final RowType outputRowType = (RowType) getOutputType();
         final ExternalRuntimeScalarFunctionRewriter rewriter =
-                new ExternalRuntimeScalarFunctionRewriter(externalRuntimeFunctionClasses, inputRowType, outputRowType);
+                new ExternalRuntimeScalarFunctionRewriter(targetFunctionClasses, inputRowType, outputRowType);
         final List<RexNode> rewrittenProjection = new ArrayList<>(projection.size());
         for (int i = 0; i < projection.size(); i++) {
             rewriter.setCurrentOutputFieldIndex(i);
@@ -179,37 +226,52 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         final @Nullable RexNode rewrittenCondition =
                 condition == null ? null : condition.accept(rewriter);
 
-        final boolean hasExternalRuntimeFunction = rewriter.hasExternalRuntimeFunction();
+        final boolean hasRuntimeFunction = rewriter.hasExternalRuntimeFunction();
+        if (gpu && !hasRuntimeFunction) {
+            return null;
+        }
+
         final List<RexNode> effectiveProjection =
-                hasExternalRuntimeFunction ? rewrittenProjection : projection;
+                hasRuntimeFunction ? rewrittenProjection : projection;
         final @Nullable RexNode effectiveCondition =
-                hasExternalRuntimeFunction ? rewrittenCondition : condition;
-        final @Nullable String resolvedExternalRuntimeConf;
-        if (hasExternalRuntimeFunction) {
-            String externalRuntimeConf = rewriter.getExternalRuntimeConf();
-            if (externalRuntimeConf.isEmpty()) {
-                externalRuntimeConf = resolveExternalRuntimeConf(config, rewriter.getExternalRuntimeFunctionClass());
+                hasRuntimeFunction ? rewrittenCondition : condition;
+        final @Nullable String resolvedRuntimeConf;
+        if (hasRuntimeFunction) {
+            final String kindLabel = gpu ? "GPU" : "External";
+            final String confOptionName =
+                    gpu ? "table.exec.gpu-runtime.conf" : "table.exec.external-runtime.conf";
+            String runtimeConf = rewriter.getExternalRuntimeConf();
+            if (runtimeConf.isEmpty()) {
+                runtimeConf =
+                        gpu
+                                ? resolveGpuRuntimeConf(
+                                        planner.getTableConfig(),
+                                        rewriter.getExternalRuntimeFunctionClass())
+                                : resolveExternalRuntimeConf(config, rewriter.getExternalRuntimeFunctionClass());
             }
-            if (externalRuntimeConf.isEmpty()) {
+            if (runtimeConf.isEmpty()) {
                 throw new TableException(
-                        "External runtime function requires a TCP conf literal, "
-                                + "table.exec.external-runtime.conf, "
-                                + "or table.exec.external-runtime.conf.<functionClass>.");
+                        kindLabel
+                                + " runtime function requires a conf literal, "
+                                + confOptionName
+                                + ", or "
+                                + confOptionName
+                                + ".<functionClass>.");
             }
-            externalRuntimeConf =
+            runtimeConf =
                     appendExternalRuntimeFunctionMetadata(
-                            externalRuntimeConf,
+                            runtimeConf,
                             rewriter.getExternalRuntimeFunctionClass(),
                             rewriter.getExternalRuntimeFunctionKind());
-            externalRuntimeConf =
+            runtimeConf =
                     appendExternalRuntimeFunctionArgsMetadata(
-                            externalRuntimeConf,
+                            runtimeConf,
                             rewriter.getExternalRuntimeArgFieldIndices(),
                             rewriter.getExternalRuntimeArgFieldNames(),
                             rewriter.getExternalRuntimeArgFieldTypes());
-            externalRuntimeConf =
+            runtimeConf =
                     appendExternalRuntimeFunctionResultMetadata(
-                            externalRuntimeConf,
+                            runtimeConf,
                             rewriter.getExternalRuntimeResultFieldIndices(),
                             rewriter.getExternalRuntimeResultFieldNames(),
                             rewriter.getExternalRuntimeResultFieldTypes(),
@@ -217,29 +279,39 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
                             rewriter.getExternalRuntimeResultUdfFieldIndices());
             if (LOG.isDebugEnabled()) {
                 LOG.debug(
-                        "External runtime rewrite injecting pre/post operators: functionClass={}, functionKind={}, resultFieldIndices={}",
+                        "{} runtime rewrite injecting operator(s): functionClass={}, functionKind={}, resultFieldIndices={}",
+                        kindLabel,
                         rewriter.getExternalRuntimeFunctionClass(),
                         rewriter.getExternalRuntimeFunctionKind(),
                         rewriter.getExternalRuntimeResultFieldIndices());
             }
-            resolvedExternalRuntimeConf = externalRuntimeConf;
+            resolvedRuntimeConf = runtimeConf;
         } else {
-            resolvedExternalRuntimeConf = null;
+            resolvedRuntimeConf = null;
         }
 
-        final Transformation<RowData> externalRuntimeInputTransform;
-        if (resolvedExternalRuntimeConf != null) {
-            final RowType externalRuntimeOutputRowType =
+        final Transformation<RowData> runtimeInputTransform;
+        if (resolvedRuntimeConf != null) {
+            final RowType runtimeOutputRowType =
                     applyResultTypes(
                             inputRowType,
                             rewriter.getExternalRuntimeResultFieldIndices(),
                             rewriter.getExternalRuntimeResultFieldTypes(),
                             planner.getFlinkContext().getClassLoader());
-            externalRuntimeInputTransform =
-                    createExternalRuntimeChain(
-                            inputTransform, resolvedExternalRuntimeConf, config, externalRuntimeOutputRowType);
+            runtimeInputTransform =
+                    gpu
+                            ? createGpuRuntimeChain(
+                                    inputTransform, resolvedRuntimeConf, config, runtimeOutputRowType)
+                            : createExternalRuntimeChain(
+                                    inputTransform, resolvedRuntimeConf, config, runtimeOutputRowType);
         } else {
-            externalRuntimeInputTransform = inputTransform;
+            runtimeInputTransform = inputTransform;
+        }
+
+        // Identity projection after the rewrite: CalcCodeGenerator refuses that shape, so skip the
+        // Calc and pass the runtime chain's output through.
+        if (hasRuntimeFunction && isIdentityProjection(effectiveProjection, inputRowType) && effectiveCondition == null) {
+            return runtimeInputTransform;
         }
 
         final CodeGeneratorContext ctx =
@@ -249,19 +321,57 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
         final CodeGenOperatorFactory<RowData> substituteStreamOperator =
                 CalcCodeGenerator.generateCalcOperator(
                         ctx,
-                        externalRuntimeInputTransform,
+                        runtimeInputTransform,
                         (RowType) getOutputType(),
                         JavaScalaConversionUtil.toScala(effectiveProjection),
                         JavaScalaConversionUtil.toScala(Optional.ofNullable(effectiveCondition)),
                         retainHeader,
                         getClass().getSimpleName());
         return ExecNodeUtil.createOneInputTransformation(
-                        externalRuntimeInputTransform,
+                        runtimeInputTransform,
                         createTransformationMeta(CALC_TRANSFORMATION, config),
                         substituteStreamOperator,
                         InternalTypeInfo.of(getOutputType()),
-                        externalRuntimeInputTransform.getParallelism(),
+                        runtimeInputTransform.getParallelism(),
                         false);
+    }
+
+    /**
+     * True if {@code projection} is exactly {@code [$0, $1, ..., $(n-1)]} for an n-field {@code
+     * inputRowType} (CalcCodeGenerator refuses to build an operator for that).
+     */
+    protected static boolean isIdentityProjection(List<RexNode> projection, RowType inputRowType) {
+        if (projection.size() != inputRowType.getFieldCount()) {
+            return false;
+        }
+        for (int i = 0; i < projection.size(); i++) {
+            final RexNode node = projection.get(i);
+            if (!(node instanceof RexInputRef) || ((RexInputRef) node).getIndex() != i) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Injects a single {@link GpuRuntimeOperator}, like {@link #createExternalRuntimeChain} without PRE/POST. */
+    protected Transformation<RowData> createGpuRuntimeChain(
+            Transformation<RowData> input,
+            String conf,
+            ExecNodeConfig config,
+            @Nullable RowType resultRowType) {
+        final RowType inputRowType = extractRowType(input);
+        final RowType outputRowType = resultRowType == null ? inputRowType : resultRowType;
+        final OneInputTransformation<RowData, RowData> gpuRuntime =
+                ExecNodeUtil.createOneInputTransformation(
+                        input,
+                        createTransformationMeta("gpu-runtime", "GpuRuntime", "GpuRuntime", config),
+                        new GpuRuntimeOperator(conf, inputRowType, outputRowType),
+                        InternalTypeInfo.of(outputRowType),
+                        input.getParallelism(),
+                        input.isParallelismConfigured());
+        copyPlacementConstraints(input, gpuRuntime);
+        setMaxParallelismIfConfigured(input, gpuRuntime);
+        return gpuRuntime;
     }
 
     protected Transformation<RowData> createExternalRuntimeChain(
@@ -625,6 +735,19 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
     public static String resolveExternalRuntimeConf(ReadableConfig config, @Nullable String functionClass) {
         return resolveExternalRuntimeConfWithPrefix(
                 config, functionClass, EXTERNAL_RUNTIME_CONF_KEY_PREFIX, EXTERNAL_RUNTIME_CONF_OPTION);
+    }
+
+    public static @Nullable String resolveGpuRuntimeFunctionClassConfig(ReadableConfig config) {
+        return config.getOptional(GPU_RUNTIME_FUNCTION_CLASS_OPTION).orElse(null);
+    }
+
+    public static List<String> resolveGpuRuntimeFunctionClasses(ReadableConfig config) {
+        return parseExternalRuntimeFunctionClasses(resolveGpuRuntimeFunctionClassConfig(config), null);
+    }
+
+    public static String resolveGpuRuntimeConf(ReadableConfig config, @Nullable String functionClass) {
+        return resolveExternalRuntimeConfWithPrefix(
+                config, functionClass, GPU_RUNTIME_CONF_KEY_PREFIX, GPU_RUNTIME_CONF_OPTION);
     }
 
     private static String resolveExternalRuntimeConfWithPrefix(
