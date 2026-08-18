@@ -949,7 +949,10 @@ public final class ExternalRuntimeBinaryCodec {
         } else {
             out = new byte[len];
         }
-        for (int i = 0; i < len; i++) out[i] = buf.get(p + i);
+        // bulk get; duplicate() keeps the caller's position untouched
+        final java.nio.ByteBuffer view = buf.duplicate();
+        view.position(p);
+        view.get(out, 0, len);
         return out;
     }
 
