@@ -31,12 +31,31 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-/** Simple file-driven placement for CAPSYS. */
+/**
+ * Simple file-driven placement for CAPSYS.
+ *
+ * <p>Each line of the scheduler config maps an operator name to a TaskManager address, e.g.
+ * {@code Calc[4]; 192.168.1.20}. An entry that includes the {@code [id]} suffix (the ExecNode id
+ * that Flink appends to simplified operator names) is matched exactly against a single operator.
+ * An entry without the suffix, e.g. {@code Calc; 192.168.1.20}, is treated as a name prefix: it
+ * matches any operator whose name starts with that prefix and has not already been claimed by an
+ * exact-match entry. When several such prefix entries share the same base name, they are handed
+ * out in the order they appear in the file to the matching operators in the order those operators
+ * are visited (topological order), so the first "Calc" entry goes to the first unclaimed Calc
+ * operator, the second to the next one, and so on. Operators for which no entry is left unmatched
+ * keep the default placement.
+ */
 public class CapsysExecutionGraphPlacement implements ExecutionGraphPlacement {
     private static final Logger LOG = LoggerFactory.getLogger(CapsysExecutionGraphPlacement.class);
+
+    private static final Pattern OPERATOR_ID_SUFFIX = Pattern.compile("^(.*)\\[\\d+\\]$");
 
     private final String schedulerCfgPath;
 
@@ -46,7 +65,7 @@ public class CapsysExecutionGraphPlacement implements ExecutionGraphPlacement {
 
     @Override
     public void assignPlacement(ExecutionGraph executionGraph) {
-        final Map<String, String> configuredPlacements = readPlacements(schedulerCfgPath);
+        final PlacementConfig configuredPlacements = readPlacements(schedulerCfgPath);
 
         LOG.info("Applying CAPSYS placement from {}: {}", schedulerCfgPath, configuredPlacements);
 
@@ -71,12 +90,35 @@ public class CapsysExecutionGraphPlacement implements ExecutionGraphPlacement {
         }
     }
 
-    static Map<String, String> readPlacements(String path) {
+    /** Holds the parsed scheduler config, split into exact-match and prefix-match entries. */
+    static final class PlacementConfig {
+        private final Map<String, String> exactMatches;
+        private final Map<String, Deque<String>> prefixMatches;
+
+        PlacementConfig(
+                Map<String, String> exactMatches, Map<String, Deque<String>> prefixMatches) {
+            this.exactMatches = exactMatches;
+            this.prefixMatches = prefixMatches;
+        }
+
+        @Override
+        public String toString() {
+            return "PlacementConfig{"
+                    + "exactMatches="
+                    + exactMatches
+                    + ", prefixMatches="
+                    + prefixMatches
+                    + '}';
+        }
+    }
+
+    static PlacementConfig readPlacements(String path) {
         if (path == null || path.trim().isEmpty()) {
             throw new IllegalArgumentException("CAPSYS scheduler config path must be provided.");
         }
 
-        final Map<String, String> placements = new LinkedHashMap<>();
+        final Map<String, String> exactMatches = new LinkedHashMap<>();
+        final Map<String, Deque<String>> prefixMatches = new LinkedHashMap<>();
         final Path schedulerCfgPath = Path.of(path);
         try (BufferedReader bufferedReader =
                 Files.newBufferedReader(schedulerCfgPath, StandardCharsets.UTF_8)) {
@@ -106,19 +148,45 @@ public class CapsysExecutionGraphPlacement implements ExecutionGraphPlacement {
                                     + ": operator name and TaskManager address must both be set.");
                 }
 
-                placements.put(operatorName, taskManagerAddress);
+                if (OPERATOR_ID_SUFFIX.matcher(operatorName).matches()) {
+                    exactMatches.put(operatorName, taskManagerAddress);
+                } else {
+                    prefixMatches
+                            .computeIfAbsent(operatorName, key -> new ArrayDeque<>())
+                            .addLast(taskManagerAddress);
+                }
             }
         } catch (IOException e) {
             throw new UncheckedIOException(
                     "Failed to read CAPSYS scheduler config from " + path, e);
         }
 
-        return placements;
+        return new PlacementConfig(exactMatches, prefixMatches);
     }
 
-    static String findTaskManagerAddress(
-            String operatorName, Map<String, String> configuredPlacements) {
-        return configuredPlacements.get(operatorName);
+    /**
+     * Resolves the TaskManager address for an operator, preferring an exact match (an entry that
+     * included the {@code [id]} suffix) and otherwise consuming the next address queued for the
+     * operator's name prefix, if any.
+     */
+    static String findTaskManagerAddress(String operatorName, PlacementConfig configuredPlacements) {
+        final String exactMatch = configuredPlacements.exactMatches.get(operatorName);
+        if (exactMatch != null) {
+            return exactMatch;
+        }
+
+        final String baseName = stripOperatorIdSuffix(operatorName);
+        final Deque<String> candidates = configuredPlacements.prefixMatches.get(baseName);
+        if (candidates != null && !candidates.isEmpty()) {
+            return candidates.pollFirst();
+        }
+
+        return null;
+    }
+
+    private static String stripOperatorIdSuffix(String operatorName) {
+        final Matcher matcher = OPERATOR_ID_SUFFIX.matcher(operatorName);
+        return matcher.matches() ? matcher.group(1) : operatorName;
     }
 
     private static int findSeparatorIndex(String line) {

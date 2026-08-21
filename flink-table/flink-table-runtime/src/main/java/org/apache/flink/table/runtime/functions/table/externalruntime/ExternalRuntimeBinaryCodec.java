@@ -98,6 +98,7 @@ public final class ExternalRuntimeBinaryCodec {
                 reuseObjects && readWireTypes != null ? new byte[readWireTypes.length][] : null;
     }
 
+
     // ---------------------------------------------------------------------
     // PRE: write one framed row
     // ---------------------------------------------------------------------
@@ -226,10 +227,184 @@ public final class ExternalRuntimeBinaryCodec {
         destination.put(offset + 1, (byte) (payloadLen >>> 16));
         destination.put(offset + 2, (byte) (payloadLen >>> 8));
         destination.put(offset + 3, (byte) payloadLen);
-        for (int i = 0; i < payloadLen; i++) {
-            destination.put(offset + Integer.BYTES + i, outBuf.buf()[i]);
-        }
+        // Bulk relative put is JIT-intrinsified for a direct destination buffer;
+        // the byte-at-a-time loop this replaced ran on the Flink task thread for
+        // every input row, on the same critical path that has to keep up with
+        // the source rate - the same class of bug as copyBytes() on the decode
+        // side, just on the hot ingest path instead of the completer thread.
+        // Absolute bulk put avoids allocating a duplicate ByteBuffer for every
+        // encoded row. The caller owns the destination position, and this
+        // method already uses absolute header writes.
+        destination.put(offset + Integer.BYTES, outBuf.buf(), 0, payloadLen);
         return frameLen;
+    }
+
+    /**
+     * Extracts one row's payload values without framing them, so the framing
+     * step (null-bitmap layout, wire-format packing, buffer writes) can run
+     * on a different thread than the one that read the row. Reading the row
+     * itself cannot be deferred - {@code pipeline.object-reuse} means its
+     * backing memory is not guaranteed to survive past this call - but once
+     * a value is out as an independent boxed Java object, nothing about
+     * packing it into bytes touches Flink's row abstraction or its
+     * reuse/lifecycle rules, so that part is safe to hand off. See
+     * {@link #writeExtractedRow} for the other half; used by
+     * {@code ImputationGpuFunction} to keep its Flink-thread-side
+     * {@code processElement} to just these getter calls, moving the actual
+     * byte-packing work onto its submitter thread.
+     *
+     * @return one entry per configured write field, null for a null source
+     *     field, otherwise a boxed value in the representation
+     *     {@link #writeValueBytes} expects for that field's {@link WireType}
+     */
+    public Object[] extractRowValues(RowData row, int[] payloadFieldIndices) {
+        if (writeWireTypes == null) {
+            throw new IllegalStateException("ExternalRuntimeBinaryCodec not configured for writing");
+        }
+        final int nFields = writeWireTypes.length;
+        final Object[] values = new Object[nFields];
+        for (int i = 0; i < nFields; i++) {
+            final int sourceIndex = payloadFieldIndices[i];
+            values[i] = row.isNullAt(sourceIndex) ? null : extractValue(i, row, sourceIndex);
+        }
+        return values;
+    }
+
+    private Object extractValue(int fieldPos, RowData row, int sourceIndex) {
+        final WireType wt = writeWireTypes[fieldPos];
+        final LogicalType targetType = writeTargetTypes[fieldPos];
+        final LogicalTypeRoot sourceRoot = writeSourceRoots[fieldPos];
+
+        switch (wt) {
+            case BOOL:
+                return row.getBoolean(sourceIndex);
+            case INT32:
+                switch (sourceRoot) {
+                    case TINYINT:
+                        return (int) row.getByte(sourceIndex);
+                    case SMALLINT:
+                        return (int) row.getShort(sourceIndex);
+                    default:
+                        return row.getInt(sourceIndex);
+                }
+            case INT64:
+                return row.getLong(sourceIndex);
+            case FLOAT32:
+                return row.getFloat(sourceIndex);
+            case FLOAT64:
+                return row.getDouble(sourceIndex);
+            case STRING:
+                return row.getString(sourceIndex).toBytes();
+            case BYTES:
+                return row.getBinary(sourceIndex);
+            case TIMESTAMP_MILLIS: {
+                final int precision = writeTimestampPrecision[fieldPos];
+                return row.getTimestamp(sourceIndex, precision).getMillisecond();
+            }
+            case DECIMAL_UNSCALED_I64: {
+                final DecimalType dt = (DecimalType) targetType;
+                final int srcPrecision = writeSourcePrecision[fieldPos];
+                final int srcScale = writeSourceScale[fieldPos];
+                return toUnscaledLong(row, sourceIndex, sourceRoot, dt.getPrecision(), dt.getScale(),
+                        srcPrecision, srcScale);
+            }
+            case DECIMAL_UNSCALED_BYTES: {
+                final DecimalType dt = (DecimalType) targetType;
+                final int srcPrecision = writeSourcePrecision[fieldPos];
+                final int srcScale = writeSourceScale[fieldPos];
+                if (sourceRoot == LogicalTypeRoot.DECIMAL && srcScale == dt.getScale()) {
+                    final DecimalData dec = row.getDecimal(sourceIndex, srcPrecision, srcScale);
+                    byte[] bytes = dec.toUnscaledBytes();
+                    // DECIMAL_UNSCALED_BYTES must never use a zero-length
+                    // representation. BigInteger zero is encoded as 00.
+                    if (bytes.length == 0) {
+                        bytes = new byte[] {0};
+                    }
+                    return bytes;
+                }
+                final BigInteger unscaled = toUnscaledBigInt(row, sourceIndex, sourceRoot, dt.getPrecision(),
+                        dt.getScale(), srcPrecision, srcScale);
+                return unscaled.toByteArray(); // two's complement big-endian
+            }
+            default:
+                throw new IllegalStateException("Unsupported wire type: " + wt);
+        }
+    }
+
+    /**
+     * Frames values previously returned by {@link #extractRowValues} into
+     * the wire format and writes them directly into a caller-owned buffer -
+     * the deferred half of {@link #encodeFramedRow}'s work, safe to call
+     * from a thread other than the one that read the row, since every value
+     * here is already an independent Java object with no tie back to the
+     * source {@code RowData}.
+     *
+     * @return complete frame length, including the four-byte length prefix
+     */
+    public int writeExtractedRow(
+            Object[] values, RowKind rowKind, long rowId,
+            java.nio.ByteBuffer destination, int offset, int maxFrameLength) throws IOException {
+        if (writeWireTypes == null) {
+            throw new IOException("ExternalRuntimeBinaryCodec not configured for writing");
+        }
+        final int nFields = writeWireTypes.length;
+        final int nullBytes = (nFields + 7) >>> 3;
+        outBuf.reset();
+        outBuf.putIntBE(rowKindToOp(rowKind));
+        if (includeRowId) outBuf.putLongBE(rowId);
+        final int nullBitmapPos = outBuf.position();
+        outBuf.ensureCapacity(nullBytes);
+        for (int i = 0; i < nullBytes; i++) outBuf.putByte((byte) 0);
+        for (int i = 0; i < nFields; i++) {
+            final Object value = values[i];
+            if (value == null) setNullBit(outBuf.buf(), nullBitmapPos, i);
+            else writeValueBytes(i, value);
+        }
+        final int payloadLen = outBuf.position();
+        final int frameLen = payloadLen + Integer.BYTES;
+        if (frameLen > maxFrameLength || offset < 0 || offset > destination.limit() - frameLen) {
+            throw new IOException("destination buffer is too small for encoded row");
+        }
+        destination.put(offset, (byte) (payloadLen >>> 24));
+        destination.put(offset + 1, (byte) (payloadLen >>> 16));
+        destination.put(offset + 2, (byte) (payloadLen >>> 8));
+        destination.put(offset + 3, (byte) payloadLen);
+        final java.nio.ByteBuffer view = destination.duplicate();
+        view.position(offset + Integer.BYTES);
+        view.put(outBuf.buf(), 0, payloadLen);
+        return frameLen;
+    }
+
+    private void writeValueBytes(int fieldPos, Object value) {
+        switch (writeWireTypes[fieldPos]) {
+            case BOOL:
+                outBuf.putByte((byte) (((Boolean) value) ? 1 : 0));
+                return;
+            case INT32:
+                outBuf.putIntBE((Integer) value);
+                return;
+            case INT64:
+            case TIMESTAMP_MILLIS:
+            case DECIMAL_UNSCALED_I64:
+                outBuf.putLongBE((Long) value);
+                return;
+            case FLOAT32:
+                outBuf.putIntBE(Float.floatToIntBits((Float) value));
+                return;
+            case FLOAT64:
+                outBuf.putLongBE(Double.doubleToLongBits((Double) value));
+                return;
+            case STRING:
+            case BYTES:
+            case DECIMAL_UNSCALED_BYTES: {
+                final byte[] bytes = (byte[]) value;
+                outBuf.putIntBE(bytes.length);
+                outBuf.putBytes(bytes);
+                return;
+            }
+            default:
+                throw new IllegalStateException("Unsupported wire type: " + writeWireTypes[fieldPos]);
+        }
     }
 
     private void writeValue(int fieldPos, RowData row, int sourceIndex) throws IOException {
@@ -547,28 +722,41 @@ public final class ExternalRuntimeBinaryCodec {
     private int readValueIntoRow(
             int i, java.nio.ByteBuffer buf, int p, int limit, GenericRowData outRow)
             throws IOException {
+        return readValueIntoRow(i, buf, p, limit, outRow, i);
+    }
+
+    /**
+     * Same decode as the four-arg overload, but writes to {@code targetField} in
+     * {@code outRow} instead of {@code i}. Lets a caller with its own wire-index ->
+     * result-field-index mapping (e.g. one that reorders or drops fields) decode
+     * straight into its final row instead of an intermediate one it would otherwise
+     * have to copy out of field-by-field afterward.
+     */
+    private int readValueIntoRow(
+            int i, java.nio.ByteBuffer buf, int p, int limit, GenericRowData outRow, int targetField)
+            throws IOException {
         final WireType wt = readWireTypes[i];
         switch (wt) {
             case BOOL:
                 if (p + 1 > limit) throw new IOException("Truncated BOOL");
-                outRow.setField(i, castIfNeeded(buf.get(p) != 0, readSourceTypes[i], readTargetTypes[i]));
+                outRow.setField(targetField, castIfNeeded(buf.get(p) != 0, readSourceTypes[i], readTargetTypes[i]));
                 return p + 1;
             case INT32:
                 if (p + 4 > limit) throw new IOException("Truncated INT32");
-                outRow.setField(i, castIfNeeded(readIntBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
+                outRow.setField(targetField, castIfNeeded(readIntBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
                 return p + 4;
             case INT64:
             case TIMESTAMP_MILLIS:
                 if (p + 8 > limit) throw new IOException("Truncated INT64");
-                outRow.setField(i, castIfNeeded(readLongBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
+                outRow.setField(targetField, castIfNeeded(readLongBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
                 return p + 8;
             case FLOAT32:
                 if (p + 4 > limit) throw new IOException("Truncated FLOAT32");
-                outRow.setField(i, castIfNeeded(Float.intBitsToFloat(readIntBE(buf, p)), readSourceTypes[i], readTargetTypes[i]));
+                outRow.setField(targetField, castIfNeeded(Float.intBitsToFloat(readIntBE(buf, p)), readSourceTypes[i], readTargetTypes[i]));
                 return p + 4;
             case FLOAT64:
                 if (p + 8 > limit) throw new IOException("Truncated FLOAT64");
-                outRow.setField(i, castIfNeeded(Double.longBitsToDouble(readLongBE(buf, p)), readSourceTypes[i], readTargetTypes[i]));
+                outRow.setField(targetField, castIfNeeded(Double.longBitsToDouble(readLongBE(buf, p)), readSourceTypes[i], readTargetTypes[i]));
                 return p + 8;
             case STRING: {
                 if (p + 4 > limit) throw new IOException("Truncated STRING len");
@@ -577,7 +765,7 @@ public final class ExternalRuntimeBinaryCodec {
                 if (len < 0 || p + len > limit) throw new IOException("Invalid STRING len: " + len);
                 final byte[] bytes = copyBytes(i, buf, p, len);
                 final StringData sd = StringData.fromBytes(bytes, 0, len);
-                outRow.setField(i, castIfNeeded(sd, readSourceTypes[i], readTargetTypes[i]));
+                outRow.setField(targetField, castIfNeeded(sd, readSourceTypes[i], readTargetTypes[i]));
                 return p + len;
             }
             case BYTES: {
@@ -585,24 +773,112 @@ public final class ExternalRuntimeBinaryCodec {
                 final int len = readIntBE(buf, p);
                 p += 4;
                 if (len < 0 || p + len > limit) throw new IOException("Invalid BYTES len: " + len);
-                outRow.setField(i, castIfNeeded(copyBytes(i, buf, p, len), readSourceTypes[i], readTargetTypes[i]));
+                outRow.setField(targetField, castIfNeeded(copyBytes(i, buf, p, len), readSourceTypes[i], readTargetTypes[i]));
                 return p + len;
             }
             case DECIMAL_UNSCALED_I64:
                 if (p + 8 > limit) throw new IOException("Truncated DECIMAL_UNSCALED_I64");
-                outRow.setField(i, castIfNeeded(readLongBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
+                outRow.setField(targetField, castIfNeeded(readLongBE(buf, p), readSourceTypes[i], readTargetTypes[i]));
                 return p + 8;
             case DECIMAL_UNSCALED_BYTES: {
                 if (p + 4 > limit) throw new IOException("Truncated DECIMAL_UNSCALED_BYTES len");
                 final int len = readIntBE(buf, p);
                 p += 4;
                 if (len < 0 || p + len > limit) throw new IOException("Invalid DECIMAL bytes len: " + len);
-                outRow.setField(i, castIfNeeded(copyBytes(i, buf, p, len), readSourceTypes[i], readTargetTypes[i]));
+                outRow.setField(targetField, castIfNeeded(copyBytes(i, buf, p, len), readSourceTypes[i], readTargetTypes[i]));
                 return p + len;
             }
             default:
                 throw new IOException("Unsupported read wire type: " + wt);
         }
+    }
+
+    /** Advances past one wire field's bytes without materializing or casting a value. */
+    private int skipValue(int i, java.nio.ByteBuffer buf, int p, int limit) throws IOException {
+        switch (readWireTypes[i]) {
+            case BOOL:
+                if (p + 1 > limit) throw new IOException("Truncated BOOL");
+                return p + 1;
+            case INT32:
+            case FLOAT32:
+                if (p + 4 > limit) throw new IOException("Truncated INT32/FLOAT32");
+                return p + 4;
+            case INT64:
+            case TIMESTAMP_MILLIS:
+            case FLOAT64:
+            case DECIMAL_UNSCALED_I64:
+                if (p + 8 > limit) throw new IOException("Truncated INT64/FLOAT64/DECIMAL_UNSCALED_I64");
+                return p + 8;
+            case STRING:
+            case BYTES:
+            case DECIMAL_UNSCALED_BYTES: {
+                if (p + 4 > limit) throw new IOException("Truncated length prefix");
+                final int len = readIntBE(buf, p);
+                p += 4;
+                if (len < 0 || p + len > limit) throw new IOException("Invalid length: " + len);
+                return p + len;
+            }
+            default:
+                throw new IOException("Unsupported read wire type: " + readWireTypes[i]);
+        }
+    }
+
+    /**
+     * Decodes a frame directly into a caller-owned result row via
+     * {@code wireIndexToTargetField}, instead of building the usual intermediate
+     * row and making the caller copy every field out of it afterward. Wire field
+     * {@code i} is written to {@code outRow} field {@code wireIndexToTargetField[i]},
+     * or - if that's negative, meaning the wire field isn't part of the result row -
+     * parsed just enough to stay correctly positioned for the fields after it,
+     * without allocating or casting a value for it. Row kind is intentionally not
+     * touched here: callers of the packed local-GPU path derive it from their own
+     * per-row metadata rather than the wire's {@code __op}, since a reuse-safe
+     * result row's kind is set once by the caller regardless of what's decoded.
+     *
+     * @return the frame's row id ({@code includeRowId} must be true)
+     */
+    public long readFramedRowInto(
+            java.nio.ByteBuffer frame, int offset, GenericRowData outRow, int[] wireIndexToTargetField)
+            throws IOException {
+        if (readWireTypes == null) {
+            throw new IOException("ExternalRuntimeBinaryCodec not configured for reading");
+        }
+        if (offset < 0 || offset > frame.limit() - Integer.BYTES) {
+            throw new IOException("Truncated frame header");
+        }
+        final int frameLen = readIntBE(frame, offset);
+        if (frameLen < 0 || frameLen > DEFAULT_MAX_FRAME_SIZE
+                || frameLen > frame.limit() - offset - Integer.BYTES) {
+            throw new IOException("Invalid frame length: " + frameLen);
+        }
+        int p = offset + Integer.BYTES;
+        final int limit = p + frameLen;
+        if (p + 4 > limit) throw new IOException("Truncated payload: missing operation");
+        p += 4; // __op: the caller sets row kind from its own metadata, not the wire.
+        final long rowId;
+        if (includeRowId) {
+            if (p + 8 > limit) throw new IOException("Truncated payload: missing row id");
+            rowId = readLongBE(frame, p);
+            p += 8;
+        } else {
+            rowId = -1L;
+        }
+        final int nFields = readWireTypes.length;
+        final int nullBytes = (nFields + 7) >>> 3;
+        if (p + nullBytes > limit) throw new IOException("Truncated payload: missing nullBitmap");
+        final int nullBitmapPos = p;
+        p += nullBytes;
+        for (int i = 0; i < nFields; i++) {
+            final int targetField = wireIndexToTargetField[i];
+            if (isNullBitSet(frame, nullBitmapPos, i)) {
+                if (targetField >= 0) outRow.setField(targetField, null);
+                continue; // no bytes on the wire for a null field - nothing to skip.
+            }
+            p = targetField >= 0
+                    ? readValueIntoRow(i, frame, p, limit, outRow, targetField)
+                    : skipValue(i, frame, p, limit);
+        }
+        return rowId;
     }
 
     private static Object castIfNeeded(Object value, LogicalType sourceType, LogicalType targetType) {
@@ -624,9 +900,28 @@ public final class ExternalRuntimeBinaryCodec {
 
             if (tr == LogicalTypeRoot.DECIMAL) {
                 final DecimalType dt = (DecimalType) targetType;
-                // The wire bytes have the scale of the source schema (for the packed imputer,
-                // DECIMAL(23,3)); materializing with targetType would silently interpret those
-                // bytes at the result scale before the cast.
+                // The wire bytes have the scale of the source schema; materializing with
+                // targetType would silently interpret those bytes at the result scale
+                // before the cast.
+                final DecimalType st = (DecimalType) sourceType;
+                // DecimalDataUtils.castFrom always round-trips through BigDecimal, even
+                // when nothing actually needs rescaling - confirmed in Flink source: it's
+                // unconditional, no same-precision/same-scale fast path. Worse, whenever
+                // the target precision exceeds the 18-digit compact threshold (as with
+                // this codec's packed-decimal wire types, wired narrow specifically to
+                // stay compact, cast up to a wider declared result type), the resulting
+                // DecimalData is non-compact for the rest of its life, not just for this
+                // call. That widening is unavoidable when the target's declared precision
+                // demands it - but going through materializeFromWire first builds a
+                // compact DecimalData(source-scale) only to immediately discard it inside
+                // castFrom's toBigDecimal() call. When value is already the raw unscaled
+                // long (the DECIMAL_UNSCALED_I64 wire case) and the scale isn't changing,
+                // build the BigDecimal directly and skip that throwaway allocation -
+                // bit-identical result, one fewer object per row.
+                if (value instanceof Long && dt.getScale() == st.getScale()) {
+                    final BigDecimal bd = BigDecimal.valueOf((Long) value, st.getScale());
+                    return DecimalData.fromBigDecimal(bd, dt.getPrecision(), dt.getScale());
+                }
                 final DecimalData d = (DecimalData) materializeFromWire(value, sourceType);
                 return DecimalDataUtils.castFrom(d, dt.getPrecision(), dt.getScale());
             }
@@ -949,14 +1244,9 @@ public final class ExternalRuntimeBinaryCodec {
         } else {
             out = new byte[len];
         }
-        // Bulk relative get is JIT-intrinsified (backed by Unsafe.copyMemory for a
-        // direct buffer); a byte-at-a-time loop is not and dominated STRING/BYTES
-        // decode cost on wide payloads. duplicate() gives an independent
-        // position/limit so this doesn't disturb the caller's absolute indexing
-        // into the same buffer.
-        final java.nio.ByteBuffer view = buf.duplicate();
-        view.position(p);
-        view.get(out, 0, len);
+        // Absolute bulk get avoids allocating a duplicate ByteBuffer for every
+        // variable-length field while preserving the caller's position.
+        buf.get(p, out, 0, len);
         return out;
     }
 
