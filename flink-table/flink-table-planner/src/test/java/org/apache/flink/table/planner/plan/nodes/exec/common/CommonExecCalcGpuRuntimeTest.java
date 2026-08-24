@@ -114,12 +114,13 @@ class CommonExecCalcGpuRuntimeTest {
     /** No-op impl, only its class name is used (methods are never called during translation). */
     public static final class NoopGpuRuntimeFunction implements GpuRuntimeFunction {
         @Override
-        public void open(GpuRuntimeFunctionContext context) {}
+        public void open(GpuRuntimeFunctionContext context, Emitter emitter) {}
 
         @Override
-        public RowData[] processBatch(RowData[] batch) {
-            return batch;
-        }
+        public void processElement(RowData row, boolean hasTimestamp, long timestamp) {}
+
+        @Override
+        public void flush() {}
 
         @Override
         public void close() {}
