@@ -40,6 +40,7 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
     private transient int pendingSlotCount;
     private transient ArrayDeque<StreamRecord<RowData>> pendingElements;
     private transient long nextRowId;
+    private transient RdmaPerfLogger perf;
 
     public RdmaPreOperator(String conf, RowType rowType) {
         super(conf, rowType, null, RustRdmaRingBuffer.Factory.PRE);
@@ -74,6 +75,11 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
         this.pendingSlotCount = 0;
         this.pendingElements = new ArrayDeque<>(rdmaConfig.batchSize);
         this.nextRowId = 0L;
+        this.perf = RdmaPerfLogger.maybeCreate(
+                conf, RdmaPerfLogger.PRE_CSV_PATH, "RdmaPreOperator", "encode", "publish", "collect");
+        if (perf != null) {
+            perf.start();
+        }
         LOG.info(
                 "RdmaPreOperator opened {}:{} (batchSize={}, ringElements={}, maxItemSize={})",
                 rdmaConfig.host,
@@ -85,6 +91,7 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
 
     @Override
     protected RowData processRow(RowData inRow) throws Exception {
+        long t0 = perf == null ? 0L : System.nanoTime();
         final byte[] slot = codec.encodeFramedRow(inRow, payloadFieldIndicesArray, nextRowId++);
         if (slot.length > rdmaConfig.maxItemSize) {
             throw new IOException(
@@ -95,6 +102,10 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
         }
         writeInputSlot(slot);
         pendingSlotCount++;
+        if (perf != null) {
+            perf.record("encode", System.nanoTime() - t0);
+            perf.addRow();
+        }
         return placeholder(inRow.getRowKind());
     }
 
@@ -142,10 +153,19 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
         }
         // Publish first. output.collect() may synchronously enter a chained
         // POST operator, which waits for this batch's RDMA response.
+        long t0 = perf == null ? 0L : System.nanoTime();
         publishInputBatch(count);
         pendingSlotCount = 0;
+        if (perf != null) {
+            perf.record("publish", System.nanoTime() - t0);
+            perf.addBatch();
+        }
+        long collectStart = perf == null ? 0L : System.nanoTime();
         while (!pendingElements.isEmpty()) {
             output.collect(pendingElements.removeFirst());
+        }
+        if (perf != null) {
+            perf.record("collect", System.nanoTime() - collectStart);
         }
     }
 
@@ -198,6 +218,10 @@ public final class RdmaPreOperator extends RdmaOperator implements BoundedOneInp
         pendingSlotCount = 0;
         pendingElements = null;
         codec = null;
+        if (perf != null) {
+            perf.close();
+            perf = null;
+        }
         if (error != null) {
             throw error;
         }

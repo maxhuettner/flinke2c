@@ -42,6 +42,7 @@ public final class RdmaPostOperator extends RdmaOperator {
     private transient long expectedRowId;
     private transient boolean reuseObjects;
     private transient GenericRowData reuseRow;
+    private transient RdmaPerfLogger perf;
 
     public RdmaPostOperator(String conf, RowType rowType) {
         super(conf, rowType, rowType, RustRdmaRingBuffer.Factory.POST);
@@ -90,6 +91,11 @@ public final class RdmaPostOperator extends RdmaOperator {
         this.completedSlots = new ArrayDeque<>(rdmaConfig.batchSize);
         this.expectedRowId = 0L;
         this.reuseRow = reuseObjects ? new GenericRowData(resultFieldTypes.size()) : null;
+        this.perf = RdmaPerfLogger.maybeCreate(
+                conf, RdmaPerfLogger.POST_CSV_PATH, "RdmaPostOperator", "receive", "decode", "collect");
+        if (perf != null) {
+            perf.start();
+        }
         LOG.info(
                 "RdmaPostOperator joined {}:{} (batchSize={}, no application ACKs)",
                 rdmaConfig.host,
@@ -106,12 +112,18 @@ public final class RdmaPostOperator extends RdmaOperator {
     @Override
     protected void processElementInternal(StreamRecord<RowData> element) throws Exception {
         if (completedSlots.isEmpty()) {
+            long receiveStart = perf == null ? 0L : System.nanoTime();
             final List<byte[]> batch = receiveBatch();
             completedSlots.addAll(batch);
+            if (perf != null) {
+                perf.record("receive", System.nanoTime() - receiveStart);
+                perf.addBatch();
+            }
         }
 
         final byte[] slot = completedSlots.removeFirst();
         final RowKind fallbackKind = element.getValue().getRowKind();
+        long decodeStart = perf == null ? 0L : System.nanoTime();
         final ExternalRuntimeBinaryCodec.RowWithId decoded =
                 codec.readFramedRow(slot, fallbackKind, reuseRow);
         if (decoded.rowId != expectedRowId) {
@@ -122,7 +134,15 @@ public final class RdmaPostOperator extends RdmaOperator {
                             + decoded.rowId);
         }
         expectedRowId++;
+        if (perf != null) {
+            perf.record("decode", System.nanoTime() - decodeStart);
+            perf.addRow();
+        }
+        long collectStart = perf == null ? 0L : System.nanoTime();
         output.collect(element.replace(decoded.row));
+        if (perf != null) {
+            perf.record("collect", System.nanoTime() - collectStart);
+        }
     }
 
     @Override
@@ -130,6 +150,10 @@ public final class RdmaPostOperator extends RdmaOperator {
         completedSlots = null;
         reuseRow = null;
         codec = null;
+        if (perf != null) {
+            perf.close();
+            perf = null;
+        }
         closeRdmaSession();
     }
 }
