@@ -81,11 +81,12 @@ public class StreamCEPlessOperator<IN> extends AbstractUdfStreamOperator<IN, Fil
 	@Override
 	public void processElement(StreamRecord<IN> element) throws Exception {
 		String value = "" + element.getValue();
-		if (this.operatorAddress == null) {
+		CustomOperatorAddress addr = this.operatorAddress;
+		if (addr == null) {
 			LOG.debug("CEPless operator not ready to receive events yet, dropping event");
 			return;
 		}
-		operatorInterface.sendEvent(value, operatorAddress);
+		operatorInterface.sendEvent(value, addr);
 	}
 
 	@Override
