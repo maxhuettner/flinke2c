@@ -184,6 +184,10 @@ public final class DecimalDataUtils {
     }
 
     public static DecimalData castFrom(DecimalData dec, int precision, int scale) {
+        // widening at unchanged scale can't overflow or round, keep the unscaled long
+        if (dec.isCompact() && dec.scale == scale && precision >= dec.precision) {
+            return new DecimalData(precision, scale, dec.longVal, null);
+        }
         return fromBigDecimal(dec.toBigDecimal(), precision, scale);
     }
 
