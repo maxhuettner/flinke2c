@@ -274,6 +274,32 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
         final RowType inputRowType = extractRowType(inputTransform);
         final RowType outputRowType = (RowType) getOutputType();
 
+        // GPU runtime takes priority, same as CommonExecCalc's shared path: if configured and
+        // this Calc actually calls the target UDF, replace it with a single GpuRuntimeOperator
+        // instead of falling into the external-runtime PRE/POST rewrite below. StreamExecCalc
+        // fully overrides CommonExecCalc.translateToPlanInternal (to support the compiled-plan
+        // persisted external-runtime fields above), so this check has to be duplicated here
+        // rather than inherited.
+        // GPU runtime options are custom planner options and are not included in the filtered
+        // persisted ExecNodeConfig. Use the live planner configuration here; external-runtime
+        // metadata continues to come from the persisted exec-node fields below.
+        final ReadableConfig runtimeConfig = planner.getTableConfig();
+        final List<String> gpuRuntimeFunctionClasses =
+                CommonExecCalc.resolveGpuRuntimeFunctionClasses(runtimeConfig);
+        if (!gpuRuntimeFunctionClasses.isEmpty()) {
+            final Transformation<RowData> gpuResult =
+                    translateWithGpuRuntime(
+                            planner,
+                            config,
+                            inputTransform,
+                            inputRowType,
+                            outputRowType,
+                            gpuRuntimeFunctionClasses);
+            if (gpuResult != null) {
+                return gpuResult;
+            }
+        }
+
         final List<String> externalRuntimeFunctionClasses =
                 externalRuntimeFunctionClass != null && !externalRuntimeFunctionClass.isEmpty()
                         ? List.of(externalRuntimeFunctionClass)
@@ -469,6 +495,100 @@ public class StreamExecCalc extends CommonExecCalc implements StreamExecNode<Row
                         configuredParallelism,
                         parallelismConfigured);
         return calcTransform;
+    }
+
+    /**
+     * Mirrors {@code CommonExecCalc.translateWithRuntimeChain}'s gpu branch: rewrites {@link
+     * #projection}/{@link #condition} against {@code gpuRuntimeFunctionClasses} and, if matched,
+     * injects a single GPU runtime operator ahead of the codegen'd Calc. Returns {@code null} if
+     * nothing matched, so the caller falls through to the external-runtime/plain-Calc path.
+     */
+    private @Nullable Transformation<RowData> translateWithGpuRuntime(
+            PlannerBase planner,
+            ExecNodeConfig config,
+            Transformation<RowData> inputTransform,
+            RowType inputRowType,
+            RowType outputRowType,
+            List<String> gpuRuntimeFunctionClasses) {
+        final ExternalRuntimeScalarFunctionRewriter rewriter =
+                new ExternalRuntimeScalarFunctionRewriter(gpuRuntimeFunctionClasses, inputRowType, outputRowType);
+        final List<RexNode> rewrittenProjection = new ArrayList<>(projection.size());
+        for (int i = 0; i < projection.size(); i++) {
+            rewriter.setCurrentOutputFieldIndex(i);
+            rewrittenProjection.add(projection.get(i).accept(rewriter));
+        }
+        rewriter.setCurrentOutputFieldIndex(-1);
+        final @Nullable RexNode rewrittenCondition =
+                condition == null ? null : condition.accept(rewriter);
+
+        if (!rewriter.hasExternalRuntimeFunction()) {
+            return null;
+        }
+
+        String gpuRuntimeConf = rewriter.getExternalRuntimeConf();
+        if (gpuRuntimeConf.isEmpty()) {
+            gpuRuntimeConf =
+                    CommonExecCalc.resolveGpuRuntimeConf(
+                            planner.getTableConfig(), rewriter.getExternalRuntimeFunctionClass());
+        }
+        if (gpuRuntimeConf.isEmpty()) {
+            throw new TableException(
+                    "GPU runtime function requires a conf literal, table.exec.gpu-runtime.conf, "
+                            + "or table.exec.gpu-runtime.conf.<functionClass>.");
+        }
+        gpuRuntimeConf =
+                appendExternalRuntimeFunctionMetadata(
+                        gpuRuntimeConf,
+                        rewriter.getExternalRuntimeFunctionClass(),
+                        rewriter.getExternalRuntimeFunctionKind());
+        gpuRuntimeConf =
+                appendExternalRuntimeFunctionArgsMetadata(
+                        gpuRuntimeConf,
+                        rewriter.getExternalRuntimeArgFieldIndices(),
+                        rewriter.getExternalRuntimeArgFieldNames(),
+                        rewriter.getExternalRuntimeArgFieldTypes());
+        gpuRuntimeConf =
+                appendExternalRuntimeFunctionResultMetadata(
+                        gpuRuntimeConf,
+                        rewriter.getExternalRuntimeResultFieldIndices(),
+                        rewriter.getExternalRuntimeResultFieldNames(),
+                        rewriter.getExternalRuntimeResultFieldTypes(),
+                        rewriter.getExternalRuntimeResultUdfFieldTypes(),
+                        rewriter.getExternalRuntimeResultUdfFieldIndices());
+        LOG.info(
+                "GPU runtime rewrite injecting operator: functionClass={}, functionKind={}, resultFieldIndices={}",
+                rewriter.getExternalRuntimeFunctionClass(),
+                rewriter.getExternalRuntimeFunctionKind(),
+                rewriter.getExternalRuntimeResultFieldIndices());
+
+        final RowType gpuRuntimeOutputRowType =
+                applyResultTypes(
+                        inputRowType,
+                        rewriter.getExternalRuntimeResultFieldIndices(),
+                        rewriter.getExternalRuntimeResultFieldTypes(),
+                        planner.getFlinkContext().getClassLoader());
+        final Transformation<RowData> gpuRuntimeInputTransform =
+                createGpuRuntimeChain(inputTransform, gpuRuntimeConf, config, gpuRuntimeOutputRowType);
+
+        final CodeGeneratorContext ctx =
+                new CodeGeneratorContext(config, planner.getFlinkContext().getClassLoader())
+                        .setOperatorBaseClass(getOperatorBaseClass());
+        final CodeGenOperatorFactory<RowData> substituteStreamOperator =
+                CalcCodeGenerator.generateCalcOperator(
+                        ctx,
+                        gpuRuntimeInputTransform,
+                        (RowType) getOutputType(),
+                        JavaScalaConversionUtil.toScala(rewrittenProjection),
+                        JavaScalaConversionUtil.toScala(Optional.ofNullable(rewrittenCondition)),
+                        isRetainHeader(),
+                        getClass().getSimpleName());
+        return ExecNodeUtil.createOneInputTransformation(
+                gpuRuntimeInputTransform,
+                createTransformationMeta(CALC_TRANSFORMATION, config),
+                substituteStreamOperator,
+                InternalTypeInfo.of(getOutputType()),
+                gpuRuntimeInputTransform.getParallelism(),
+                false);
     }
 
     private static String appendExternalRuntimeField(

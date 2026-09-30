@@ -23,7 +23,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -43,24 +42,8 @@ class CapsysExecutionGraphPlacementTest {
                         + "Calc; taskmanager-3\n"
                         + "Sink; taskmanager-4\n");
 
-        final Map<String, String> placements =
+        final CapsysExecutionGraphPlacement.PlacementConfig placements =
                 CapsysExecutionGraphPlacement.readPlacements(schedulerCfg.toString());
-
-        assertThat(placements)
-                .containsEntry("Source", "taskmanager-2")
-                .containsEntry("WatermarkAssigner", "taskmanager-2")
-                .containsEntry("Calc", "taskmanager-3")
-                .containsEntry("Sink", "taskmanager-4");
-    }
-
-    @Test
-    void testFindTaskManagerAddressRequiresExactMatch() {
-        final Map<String, String> placements =
-                Map.of(
-                        "Source", "taskmanager-2",
-                        "WatermarkAssigner", "taskmanager-2",
-                        "Calc", "taskmanager-3",
-                        "Sink", "taskmanager-4");
 
         assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Source", placements))
                 .isEqualTo("taskmanager-2");
@@ -68,11 +51,74 @@ class CapsysExecutionGraphPlacementTest {
                         CapsysExecutionGraphPlacement.findTaskManagerAddress(
                                 "WatermarkAssigner", placements))
                 .isEqualTo("taskmanager-2");
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc", placements))
+                .isEqualTo("taskmanager-3");
         assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Sink", placements))
                 .isEqualTo("taskmanager-4");
+    }
+
+    @Test
+    void testFindTaskManagerAddressExactMatchWithOperatorId() throws Exception {
+        final Path schedulerCfg = tempDir.resolve("schedulercfg");
+        Files.writeString(schedulerCfg, "Calc[4]; taskmanager-2\n");
+        final CapsysExecutionGraphPlacement.PlacementConfig placements =
+                CapsysExecutionGraphPlacement.readPlacements(schedulerCfg.toString());
+
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[4]", placements))
+                .isEqualTo("taskmanager-2");
+        // A different id on the same operator name must not match.
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[5]", placements))
+                .isNull();
         assertThat(
                         CapsysExecutionGraphPlacement.findTaskManagerAddress(
                                 "Source: File Source", placements))
+                .isNull();
+    }
+
+    @Test
+    void testFindTaskManagerAddressPrefixMatchWithoutOperatorId() throws Exception {
+        final Path schedulerCfg = tempDir.resolve("schedulercfg");
+        Files.writeString(schedulerCfg, "Calc; taskmanager-3\n");
+        final CapsysExecutionGraphPlacement.PlacementConfig placements =
+                CapsysExecutionGraphPlacement.readPlacements(schedulerCfg.toString());
+
+        // Only the first Calc encountered consumes the single "Calc" entry.
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[3]", placements))
+                .isEqualTo("taskmanager-3");
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[4]", placements))
+                .isNull();
+    }
+
+    @Test
+    void testFindTaskManagerAddressPrefersExactMatchOverPrefixMatch() throws Exception {
+        final Path schedulerCfg = tempDir.resolve("schedulercfg");
+        Files.writeString(schedulerCfg, "Calc[4]; taskmanager-exact\n" + "Calc; taskmanager-pool\n");
+        final CapsysExecutionGraphPlacement.PlacementConfig placements =
+                CapsysExecutionGraphPlacement.readPlacements(schedulerCfg.toString());
+
+        // Calc[4] hits the exact entry and does not consume the pooled "Calc" entry.
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[4]", placements))
+                .isEqualTo("taskmanager-exact");
+        // The remaining, unclaimed Calc operator gets the pooled entry.
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[3]", placements))
+                .isEqualTo("taskmanager-pool");
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[5]", placements))
+                .isNull();
+    }
+
+    @Test
+    void testFindTaskManagerAddressHandsOutMultiplePrefixEntriesInOrder() throws Exception {
+        final Path schedulerCfg = tempDir.resolve("schedulercfg");
+        Files.writeString(
+                schedulerCfg, "Calc; taskmanager-first\n" + "Calc; taskmanager-second\n");
+        final CapsysExecutionGraphPlacement.PlacementConfig placements =
+                CapsysExecutionGraphPlacement.readPlacements(schedulerCfg.toString());
+
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[3]", placements))
+                .isEqualTo("taskmanager-first");
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[4]", placements))
+                .isEqualTo("taskmanager-second");
+        assertThat(CapsysExecutionGraphPlacement.findTaskManagerAddress("Calc[5]", placements))
                 .isNull();
     }
 }
