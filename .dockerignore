@@ -1,0 +1,15 @@
+# Exclude everything by default, then whitelist what Docker needs
+**
+
+# Entrypoint script
+!docker-entrypoint.sh
+
+# Flink distribution (real path behind the build-target symlink)
+!flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/bin/**
+!flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/lib/**
+!flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/opt/**
+!flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/plugins/**
+!flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/examples/**
+!flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/conf/**
+# Exclude config.yaml from conf — it is supplied externally
+flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT/conf/config.yaml
