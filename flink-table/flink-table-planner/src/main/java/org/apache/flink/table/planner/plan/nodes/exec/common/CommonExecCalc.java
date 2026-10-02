@@ -233,8 +233,16 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
 
         final List<RexNode> effectiveProjection =
                 hasRuntimeFunction ? rewrittenProjection : projection;
+        // A filter that is exactly the runtime function call has already been applied by the
+        // runtime (the POST operator only emits rows it reports as passing), so re-evaluating
+        // the UDF in the Calc would only add per-row work.
+        final boolean conditionHandledByRuntime =
+                hasRuntimeFunction
+                        && !gpu
+                        && condition != null
+                        && rewriter.isRuntimeCall(condition);
         final @Nullable RexNode effectiveCondition =
-                hasRuntimeFunction ? rewrittenCondition : condition;
+                conditionHandledByRuntime ? null : (hasRuntimeFunction ? rewrittenCondition : condition);
         final @Nullable String resolvedRuntimeConf;
         if (hasRuntimeFunction) {
             final String kindLabel = gpu ? "GPU" : "External";
@@ -1053,6 +1061,11 @@ public abstract class CommonExecCalc extends ExecNodeBase<RowData>
 
         public boolean hasExternalRuntimeFunction() {
             return externalRuntimeFunctionFound;
+        }
+
+        /** True if {@code node} is itself a call to the matched runtime function. */
+        public boolean isRuntimeCall(RexNode node) {
+            return node instanceof RexCall && matchTarget((RexCall) node) != null;
         }
 
         public String getExternalRuntimeConf() {

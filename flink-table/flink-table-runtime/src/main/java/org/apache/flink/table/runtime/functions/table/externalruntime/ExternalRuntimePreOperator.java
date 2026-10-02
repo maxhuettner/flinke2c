@@ -8,6 +8,7 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
+import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.LogicalType;
@@ -50,6 +51,9 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     private static final long ACK_RETRY_INTERVAL_NANOS = 100_000_000L;
     private static final long ACK_RETRY_SWEEP_SLEEP_NANOS = 10_000_000L;
     private static final int ACK_DRAIN_EVERY_ROWS = 64;
+    /** Max time a partially filled batch (fixed mode) waits before it is flushed to the runtime. */
+    private static final long FIXED_BATCH_LINGER_NANOS = 10_000_000L;
+    private static final long NO_TIMESTAMP = Long.MIN_VALUE;
     private static final long PENDING_ACK_NO_PROGRESS_TIMEOUT_MS = 30_000L;
     private static final int ACK_FRAME_LEN = 12;
     private static final int ACK_OP = -1;
@@ -88,6 +92,16 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     private transient long highestAckedRowId;
     private transient ListState<PendingBatchState> pendingBatchesState;
     private transient ListState<Long> nextRowIdState;
+
+    // Fixed mode: placeholders are held back until the batch carrying their row has been sent
+    private transient boolean holdPlaceholders;
+    private transient long[] heldTimestamps;
+    private transient byte[] heldKinds;
+    private transient int heldHead;
+    private transient int heldSize;
+    private transient long heldOldestAtNanos;
+    private transient boolean lingerTimerPending;
+    private transient StreamRecord<RowData> heldEmitRecord;
 
     public ExternalRuntimePreOperator(String conf, RowType rowType) {
         super(conf, rowType, null);
@@ -179,6 +193,22 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         this.configJson = buildConfigJson();
         final boolean autoParallelismEnabled = tcpConfig.isAutoParallelismEnabled();
         this.batchSize = configuredBatchSize;
+        this.holdPlaceholders = !autoParallelismEnabled;
+        if (holdPlaceholders) {
+            // At most batchSize - 1 unflushed rows per endpoint plus the row being appended.
+            final int capacity = (int) Math.min(Integer.MAX_VALUE - 8L, (long) endpoints.size() * batchSize + 16L);
+            this.heldTimestamps = new long[capacity];
+            this.heldKinds = new byte[capacity];
+            this.heldEmitRecord = new StreamRecord<>(null);
+        } else {
+            this.heldTimestamps = null;
+            this.heldKinds = null;
+            this.heldEmitRecord = null;
+        }
+        this.heldHead = 0;
+        this.heldSize = 0;
+        this.heldOldestAtNanos = 0L;
+        this.lingerTimerPending = false;
         this.endpointSendQueues = autoParallelismEnabled ? null : new ArrayList<>(endpoints.size());
         this.endpointQueuedBatchCounts = autoParallelismEnabled ? null : new AtomicIntegerArray(endpoints.size());
         this.sharedAutoSendQueue =
@@ -295,6 +325,122 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     }
 
     @Override
+    protected void processElementInternal(StreamRecord<RowData> element) throws Exception {
+        if (!holdPlaceholders) {
+            super.processElementInternal(element);
+            return;
+        }
+        final RowData inRow = element.getValue();
+        final RowKind kind = inRow.getRowKind();
+        appendRowToBinary(inRow);
+        holdPlaceholder(kind, element.hasTimestamp() ? element.getTimestamp() : NO_TIMESTAMP);
+        emitFlushedPlaceholders();
+        if (heldSize > 0 && !lingerTimerPending) {
+            scheduleLingerTimer(heldOldestAtNanos);
+        }
+    }
+
+    private void holdPlaceholder(RowKind kind, long timestamp) throws IOException {
+        if (heldSize == heldKinds.length) {
+            // Cannot happen with the sizing above; flush rather than overflow.
+            flushAllAndEmitPlaceholders();
+        }
+        if (heldSize == 0) {
+            heldOldestAtNanos = System.nanoTime();
+        }
+        int tail = heldHead + heldSize;
+        if (tail >= heldKinds.length) {
+            tail -= heldKinds.length;
+        }
+        heldKinds[tail] = kind.toByteValue();
+        heldTimestamps[tail] = timestamp;
+        heldSize++;
+    }
+
+    /** Emits held placeholders whose rows are no longer in an unflushed endpoint batch. */
+    private void emitFlushedPlaceholders() {
+        if (heldSize == 0) {
+            return;
+        }
+        long bound = nextRowId;
+        for (int i = 0; i < endpointStates.size(); i++) {
+            final EndpointState state = endpointStates.get(i);
+            if (state.batchCount > 0 && state.firstRowId < bound) {
+                bound = state.firstRowId;
+            }
+        }
+        final long firstHeldRowId = nextRowId - heldSize;
+        final long flushed = bound - firstHeldRowId;
+        if (flushed > 0) {
+            emitHeldPlaceholders((int) Math.min(flushed, heldSize));
+        }
+    }
+
+    private void emitHeldPlaceholders(int count) {
+        for (int i = 0; i < count; i++) {
+            final RowData placeholder = createPlaceholderRow(RowKind.fromByteValue(heldKinds[heldHead]));
+            final long timestamp = heldTimestamps[heldHead];
+            heldEmitRecord.replace(placeholder);
+            if (timestamp == NO_TIMESTAMP) {
+                heldEmitRecord.eraseTimestamp();
+            } else {
+                heldEmitRecord.setTimestamp(timestamp);
+            }
+            output.collect(heldEmitRecord);
+            if (++heldHead == heldKinds.length) {
+                heldHead = 0;
+            }
+        }
+        heldSize -= count;
+        if (heldSize == 0) {
+            heldHead = 0;
+        } else {
+            heldOldestAtNanos = System.nanoTime();
+        }
+    }
+
+    private void flushAllAndEmitPlaceholders() throws IOException {
+        final IOException error = tryFlushRemaining();
+        if (error != null) {
+            throw error;
+        }
+        emitHeldPlaceholders(heldSize);
+    }
+
+    private void scheduleLingerTimer(long oldestAtNanos) {
+        lingerTimerPending = true;
+        final long delayMillis =
+                Math.max(1L, (oldestAtNanos + FIXED_BATCH_LINGER_NANOS - System.nanoTime()) / 1_000_000L);
+        getProcessingTimeService()
+                .registerTimer(
+                        getProcessingTimeService().getCurrentProcessingTime() + delayMillis,
+                        time -> onLingerTimer());
+    }
+
+    private void onLingerTimer() throws Exception {
+        lingerTimerPending = false;
+        if (!holdPlaceholders || heldSize == 0 || endpointStates == null) {
+            return;
+        }
+        final long age = System.nanoTime() - heldOldestAtNanos;
+        if (age >= FIXED_BATCH_LINGER_NANOS) {
+            flushAllAndEmitPlaceholders();
+        } else {
+            scheduleLingerTimer(heldOldestAtNanos);
+        }
+    }
+
+    @Override
+    public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+        super.prepareSnapshotPreBarrier(checkpointId);
+        // Everything received before the barrier must be sent and its placeholder emitted before
+        // the barrier is forwarded, otherwise the placeholder would land in the next epoch.
+        if (holdPlaceholders && endpointStates != null) {
+            flushAllAndEmitPlaceholders();
+        }
+    }
+
+    @Override
     protected RowData processRow(RowData inRow) throws Exception {
         if (tcpConfig.isAutoParallelismEnabled()) {
             if (--ackDrainCountdown <= 0) {
@@ -311,6 +457,9 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     @Override
     public void endInput() throws Exception {
         final IOException error = tryFlushRemaining();
+        if (holdPlaceholders && error == null && heldKinds != null) {
+            emitHeldPlaceholders(heldSize);
+        }
         if (tcpConfig.isAutoParallelismEnabled()) {
             waitForPendingBatchAcknowledgements();
         }
@@ -552,6 +701,7 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         final EndpointState endpointState = endpointStates.get(endpointIndex);
         if (endpointState.batchCount == 0) {
             endpointState.firstBufferedAtNanos = nowNanos;
+            endpointState.firstRowId = nextRowId;
         }
         codec.writeFramedRow(endpointState.batchBuffer, row, payloadFieldIndicesArray, nextRowId);
         endpointState.batchCount++;
@@ -1314,6 +1464,13 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         }
         endpointStates = null;
         activeEndpointIndices = null;
+        heldTimestamps = null;
+        heldKinds = null;
+        heldEmitRecord = null;
+        heldHead = 0;
+        heldSize = 0;
+        lingerTimerPending = false;
+        holdPlaceholders = false;
         configJson = null;
         autoBatchBuffer = null;
         autoBatchCount = 0;
@@ -1355,6 +1512,8 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         private int batchCount;
         private long nextReconnectAtNanos;
         private long firstBufferedAtNanos;
+        /** Row id of the first row in the current (unflushed) batch; valid while batchCount > 0. */
+        private long firstRowId;
 
         private EndpointState(
                 ExternalRuntimeTcpConfig.ExternalRuntimeEndpoint endpoint, int initialBufferSize) {
