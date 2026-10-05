@@ -452,6 +452,9 @@ public final class ExternalRuntimeBinaryCodec {
                 final DecimalType dt = (DecimalType) targetType;
                 final int srcPrecision = writeSourcePrecision[fieldPos];
                 final int srcScale = writeSourceScale[fieldPos];
+                if (tryWriteDecimalBytesFast(row, sourceIndex, sourceRoot, dt.getScale(), srcPrecision, srcScale)) {
+                    return;
+                }
                 if (sourceRoot == LogicalTypeRoot.DECIMAL && srcScale == dt.getScale()) {
                     final DecimalData dec = row.getDecimal(sourceIndex, srcPrecision, srcScale);
                     byte[] bytes = dec.toUnscaledBytes();
@@ -1309,6 +1312,207 @@ public final class ExternalRuntimeBinaryCodec {
         }
     }
 
+    /**
+     * Writes a DECIMAL_UNSCALED_BYTES value with plain long arithmetic when the unscaled value
+     * fits in a long: integral sources are scaled up by a power of ten (overflow-checked) and
+     * compact decimals of equal scale are copied as is. The bytes written are exactly what
+     * {@link BigInteger#toByteArray()} would give (minimal two's complement), without allocating
+     * BigIntegers per row. Returns false if the generic BigInteger path is needed.
+     */
+    private boolean tryWriteDecimalBytesFast(
+            RowData row,
+            int pos,
+            LogicalTypeRoot sourceRoot,
+            int targetScale,
+            int sourcePrecision,
+            int sourceScale) {
+        long value;
+        int scaleUp;
+        switch (sourceRoot) {
+            case BIGINT:
+                value = row.getLong(pos);
+                scaleUp = targetScale;
+                break;
+            case INTEGER:
+            case DATE:
+            case TIME_WITHOUT_TIME_ZONE:
+                value = row.getInt(pos);
+                scaleUp = targetScale;
+                break;
+            case SMALLINT:
+                value = row.getShort(pos);
+                scaleUp = targetScale;
+                break;
+            case TINYINT:
+                value = row.getByte(pos);
+                scaleUp = targetScale;
+                break;
+            case DECIMAL: {
+                if (sourceScale != targetScale) {
+                    return false;
+                }
+                final DecimalData dec = row.getDecimal(pos, sourcePrecision, sourceScale);
+                if (!dec.isCompact()) {
+                    return false;
+                }
+                value = dec.toUnscaledLong();
+                scaleUp = 0;
+                break;
+            }
+            default:
+                return false;
+        }
+        if (scaleUp < 0 || scaleUp >= POW10.length) {
+            return false;
+        }
+        if (scaleUp > 0) {
+            final long factor = POW10[scaleUp];
+            final long hi = Math.multiplyHigh(value, factor);
+            final long lo = value * factor;
+            // Fits in a long iff the high word is just the sign extension of the low word.
+            if (hi != (lo >> 63)) {
+                return false;
+            }
+            value = lo;
+        }
+        outBuf.putMinimalTwosComplementPrefixed(value);
+        return true;
+    }
+
+    /**
+     * Decodes a DECIMAL_UNSCALED_BYTES field (big-endian two's complement) into a
+     * {@link DecimalData} without creating a BigInteger when the value fits in 8 bytes. Returns
+     * null if the value doesn't fit the target precision, like {@link DecimalData#fromBigDecimal}.
+     */
+    /**
+     * True if a field with this wire type and target type can be decoded straight into a
+     * {@code BinaryRowData} by {@link #decodeFieldsIntoBinary}. Anything else (binary columns,
+     * non-compact timestamps, narrow integers, ...) needs the generic row path.
+     */
+    static boolean supportsBinaryDecode(WireType wt, LogicalType target) {
+        if (target == null) {
+            return false;
+        }
+        final LogicalTypeRoot root = target.getTypeRoot();
+        switch (wt) {
+            case BOOL:
+                return root == LogicalTypeRoot.BOOLEAN;
+            case INT32:
+                return root == LogicalTypeRoot.INTEGER
+                        || root == LogicalTypeRoot.DATE
+                        || root == LogicalTypeRoot.TIME_WITHOUT_TIME_ZONE;
+            case INT64:
+                return root == LogicalTypeRoot.BIGINT;
+            case TIMESTAMP_MILLIS:
+                // Only compact timestamps (precision <= 3) are a plain long in the fixed part.
+                if (target instanceof TimestampType) {
+                    return ((TimestampType) target).getPrecision() <= 3;
+                }
+                if (target instanceof LocalZonedTimestampType) {
+                    return ((LocalZonedTimestampType) target).getPrecision() <= 3;
+                }
+                return false;
+            case FLOAT32:
+                return root == LogicalTypeRoot.FLOAT;
+            case FLOAT64:
+                return root == LogicalTypeRoot.DOUBLE;
+            case STRING:
+                return root == LogicalTypeRoot.CHAR || root == LogicalTypeRoot.VARCHAR;
+            case DECIMAL_UNSCALED_I64:
+            case DECIMAL_UNSCALED_BYTES:
+                return target instanceof DecimalType;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Decodes the null bitmap and fields of one row payload (starting right after __op and
+     * __rowId) directly into {@code writer}, producing the same values as the generic decode but
+     * without boxing, an intermediate {@code GenericRowData}, or the later conversion of that row
+     * to binary form by the serializer. All fields must satisfy {@link #supportsBinaryDecode}.
+     *
+     * @return the position after the last field
+     */
+    static int decodeFieldsIntoBinary(
+            byte[] buf, int pos, WireType[] wires, LogicalType[] targets, BinaryRowWriter writer) {
+        final int n = wires.length;
+        final int nullBitmapPos = pos;
+        pos += (n + 7) >>> 3;
+        writer.reset();
+        for (int i = 0; i < n; i++) {
+            if (isNullBitSet(buf, nullBitmapPos, i)) {
+                writer.setNullAt(i);
+                continue;
+            }
+            switch (wires[i]) {
+                case BOOL:
+                    writer.writeBoolean(i, buf[pos] != 0);
+                    pos += 1;
+                    break;
+                case INT32:
+                    writer.writeInt(i, readIntBE(buf, pos));
+                    pos += 4;
+                    break;
+                case INT64:
+                case TIMESTAMP_MILLIS: // compact timestamps are stored as epoch millis in the fixed part
+                    writer.writeLong(i, readLongBE(buf, pos));
+                    pos += 8;
+                    break;
+                case FLOAT32:
+                    writer.writeFloat(i, Float.intBitsToFloat(readIntBE(buf, pos)));
+                    pos += 4;
+                    break;
+                case FLOAT64:
+                    writer.writeDouble(i, Double.longBitsToDouble(readLongBE(buf, pos)));
+                    pos += 8;
+                    break;
+                case STRING: {
+                    final int len = readIntBE(buf, pos);
+                    writer.writeString(i, StringData.fromBytes(buf, pos + 4, len));
+                    pos += 4 + len;
+                    break;
+                }
+                case DECIMAL_UNSCALED_I64: {
+                    final DecimalType dt = (DecimalType) targets[i];
+                    writer.writeDecimal(
+                            i,
+                            DecimalData.fromUnscaledLong(readLongBE(buf, pos), dt.getPrecision(), dt.getScale()),
+                            dt.getPrecision());
+                    pos += 8;
+                    break;
+                }
+                case DECIMAL_UNSCALED_BYTES: {
+                    final DecimalType dt = (DecimalType) targets[i];
+                    final int len = readIntBE(buf, pos);
+                    writer.writeDecimal(
+                            i,
+                            decimalFromTwosComplement(buf, pos + 4, len, dt.getPrecision(), dt.getScale()),
+                            dt.getPrecision());
+                    pos += 4 + len;
+                    break;
+                }
+                default:
+                    throw new IllegalStateException("Unsupported wire type for binary decode: " + wires[i]);
+            }
+        }
+        writer.complete();
+        return pos;
+    }
+
+    static DecimalData decimalFromTwosComplement(byte[] buf, int off, int len, int precision, int scale) {
+        if (len >= 1 && len <= 8) {
+            long v = buf[off] < 0 ? -1L : 0L; // sign extend
+            for (int i = 0; i < len; i++) {
+                v = (v << 8) | (buf[off + i] & 0xFFL);
+            }
+            return DecimalData.fromBigDecimal(BigDecimal.valueOf(v, scale), precision, scale);
+        }
+        final byte[] bytes = new byte[len];
+        System.arraycopy(buf, off, bytes, 0, len);
+        return DecimalData.fromBigDecimal(new BigDecimal(new BigInteger(bytes), scale), precision, scale);
+    }
+
     private BigInteger toUnscaledBigInt(
             RowData row,
             int pos,
@@ -1614,6 +1818,21 @@ public final class ExternalRuntimeBinaryCodec {
             buf[pos++] = (byte) (v >>> 16);
             buf[pos++] = (byte) (v >>> 8);
             buf[pos++] = (byte) (v);
+        }
+
+        /** Writes the int32 length prefix and the minimal two's complement bytes of {@code v}. */
+        void putMinimalTwosComplementPrefixed(long v) {
+            // Bits needed incl. sign bit: 64 - leadingSignBits + 1, rounded up to whole bytes.
+            final int bits = 64 - Long.numberOfLeadingZeros(v >= 0 ? v : ~v) + 1;
+            final int n = (bits + 7) >>> 3;
+            ensureCapacity(4 + n);
+            buf[pos++] = (byte) (n >>> 24);
+            buf[pos++] = (byte) (n >>> 16);
+            buf[pos++] = (byte) (n >>> 8);
+            buf[pos++] = (byte) n;
+            for (int shift = (n - 1) * 8; shift >= 0; shift -= 8) {
+                buf[pos++] = (byte) (v >> shift);
+            }
         }
 
         void putLongBE(long v) {

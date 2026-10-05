@@ -94,6 +94,11 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
     private transient List<Thread> ackWriterThreads;
     private transient volatile boolean ackWritersRunning;
     private transient ExternalRuntimeAckTracker ackTracker;
+    // binary decode path: rows are written into a reused BinaryRowData
+    private transient boolean binaryDecode;
+    private transient org.apache.flink.table.data.binary.BinaryRowData binaryRow;
+    private transient org.apache.flink.table.data.writer.BinaryRowWriter binaryWriter;
+    private transient LogicalType[] resultTargetTypes;
     private transient Thread ackBroadcastThread;
     private transient volatile boolean ackBroadcastRunning;
 
@@ -272,6 +277,7 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
                 resultFieldTypes.toArray(new LogicalType[0]),
                 reuseObjects);
 
+        initBinaryDecode();
         if (reuseObjects) {
             this.reuseRow = new GenericRowData(resultFieldTypes.size());
             this.reuseStreamRecord = new StreamRecord<>(null);
@@ -1421,6 +1427,19 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         pos += 4;
         pos += 8; // skip __rowId
 
+        if (binaryDecode) {
+            pos = ExternalRuntimeBinaryCodec.decodeFieldsIntoBinary(
+                    buffer, pos, resultWireTypes, resultTargetTypes, binaryWriter);
+            binaryRow.setRowKind(ExternalRuntimeBinaryCodec.opToRowKind(op, fallbackKind));
+            if (reuseRecord != null) {
+                reuseRecord.replace(binaryRow, timestamp);
+                output.collect(reuseRecord);
+            } else {
+                output.collect(new StreamRecord<>(binaryRow, timestamp));
+            }
+            return pos;
+        }
+
         final int nFields = resultFieldTypes.size();
         final int nullBytes = (nFields + 7) >>> 3;
         final int nullBitmapPos = pos;
@@ -1508,15 +1527,15 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
             }
             case DECIMAL_UNSCALED_BYTES: {
                 final int decLen = readIntBE(buf, pos);
-                byte[] decBytes = new byte[decLen];
-                System.arraycopy(buf, pos + 4, decBytes, 0, decLen);
                 if (targetType instanceof org.apache.flink.table.types.logical.DecimalType) {
                     final org.apache.flink.table.types.logical.DecimalType dt = (org.apache.flink.table.types.logical.DecimalType) targetType;
-                    final java.math.BigInteger bi = new java.math.BigInteger(decBytes);
-                    final java.math.BigDecimal bd = new java.math.BigDecimal(bi, dt.getScale());
-                    outRow.setField(fieldIndex, org.apache.flink.table.data.DecimalData.fromBigDecimal(
-                            bd, dt.getPrecision(), dt.getScale()));
+                    outRow.setField(
+                            fieldIndex,
+                            ExternalRuntimeBinaryCodec.decimalFromTwosComplement(
+                                    buf, pos + 4, decLen, dt.getPrecision(), dt.getScale()));
                 } else {
+                    final byte[] decBytes = new byte[decLen];
+                    System.arraycopy(buf, pos + 4, decBytes, 0, decLen);
                     outRow.setField(fieldIndex, decBytes);
                 }
                 return pos + 4 + decLen;
@@ -1524,6 +1543,36 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
             default:
                 throw new IOException("Unsupported wire type: " + wt);
         }
+    }
+
+    /**
+     * Enables the binary decode path when object reuse is on and every result field has a type that
+     * {@link ExternalRuntimeBinaryCodec#supportsBinaryDecode} can write directly; otherwise the
+     * generic row path is used unchanged.
+     */
+    private void initBinaryDecode() {
+        binaryDecode = false;
+        binaryRow = null;
+        binaryWriter = null;
+        resultTargetTypes = null;
+        if (!reuseObjects) {
+            return; // a reused row is only safe when downstream may not retain emitted rows
+        }
+        final int n = resultFieldTypes.size();
+        if (n == 0 || resultWireTypes.length != n) {
+            return;
+        }
+        final LogicalType[] targets = resultFieldTypes.toArray(new LogicalType[0]);
+        for (int i = 0; i < n; i++) {
+            if (!ExternalRuntimeBinaryCodec.supportsBinaryDecode(resultWireTypes[i], targets[i])) {
+                return;
+            }
+        }
+        binaryRow = new org.apache.flink.table.data.binary.BinaryRowData(n);
+        binaryWriter = new org.apache.flink.table.data.writer.BinaryRowWriter(binaryRow);
+        resultTargetTypes = targets;
+        binaryDecode = true;
+        LOG.info("ExternalRuntimePostOperator decodes responses directly into binary rows ({} fields)", n);
     }
 
     private static boolean isNullBitSet(byte[] payload, int bitmapPos, int fieldIndex) {
@@ -1717,6 +1766,10 @@ public final class ExternalRuntimePostOperator extends ExternalRuntimeOperator {
         codec = null;
         reuseRow = null;
         reuseStreamRecord = null;
+        binaryDecode = false;
+        binaryRow = null;
+        binaryWriter = null;
+        resultTargetTypes = null;
         frameBuf = null;
         dynamicBlockBuffer = null;
         bufferedResults = null;

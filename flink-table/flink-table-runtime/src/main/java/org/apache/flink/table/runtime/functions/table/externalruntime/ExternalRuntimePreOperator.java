@@ -10,6 +10,7 @@ import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.GenericRowData;
+import org.apache.flink.table.runtime.typeutils.RowDataSerializer;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
@@ -92,6 +93,8 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
     private transient long highestAckedRowId;
     private transient ListState<PendingBatchState> pendingBatchesState;
     private transient ListState<Long> nextRowIdState;
+    private transient RowData[] binaryPlaceholders;
+    private transient RowDataSerializer placeholderSerializer;
 
     // Fixed mode: placeholders are held back until the batch carrying their row has been sent
     private transient boolean holdPlaceholders;
@@ -1587,7 +1590,27 @@ public final class ExternalRuntimePreOperator extends ExternalRuntimeOperator
         }
     }
 
+    /**
+     * Placeholders are all-null rows that only carry a row kind. BinaryRowData lets the serializer
+     * copy bytes directly.
+     */
     private RowData createPlaceholderRow(RowKind kind) {
+        final int kindIndex = kind.toByteValue();
+        if (binaryPlaceholders == null) {
+            binaryPlaceholders = new RowData[RowKind.values().length];
+            placeholderSerializer = new RowDataSerializer(inputRowType);
+        }
+        RowData placeholder = binaryPlaceholders[kindIndex];
+        if (placeholder == null) {
+            final GenericRowData generic = new GenericRowData(inputFieldCount);
+            generic.setRowKind(kind);
+            placeholder = placeholderSerializer.toBinaryRow(generic).copy();
+            binaryPlaceholders[kindIndex] = placeholder;
+        }
+        return placeholder;
+    }
+
+    private RowData createGenericPlaceholderRow(RowKind kind) {
         switch (kind) {
             case INSERT:
                 if (insertPlaceholder == null) {
