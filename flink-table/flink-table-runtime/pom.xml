@@ -15,7 +15,8 @@ KIND, either express or implied.  See the License for the
 specific language governing permissions and limitations
 under the License.
 -->
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
 
 	<modelVersion>4.0.0</modelVersion>
@@ -40,8 +41,8 @@ under the License.
 			chill ArraysAsListSerializer
 			-->--add-opens=java.base/java.util=ALL-UNNAMED <!--
 			kryo AtomicBoolean
-			-->--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
-		</surefire.module.config>
+			-->
+			--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED </surefire.module.config>
 	</properties>
 
 	<dependencies>
@@ -97,6 +98,13 @@ under the License.
 			<version>${flink.shaded.jsonpath.version}-${flink.shaded.version}</version>
 			<optional>${flink.markBundledAsOptional}</optional>
 		</dependency>
+
+		<dependency>
+			<groupId>it.unimi.dsi</groupId>
+			<artifactId>fastutil</artifactId>
+			<version>8.5.18</version> <!-- Prüfe auf die aktuellste Version -->
+		</dependency>
+
 
 		<!-- Test dependencies -->
 
@@ -156,7 +164,8 @@ under the License.
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-shade-plugin</artifactId>
 				<executions>
-					<!-- Include runtime specific dependencies, janino and json-path. Jackson is packaged by flink distribution -->
+					<!-- Include runtime specific dependencies, janino and json-path. Jackson is
+					packaged by flink distribution -->
 					<execution>
 						<id>shade-flink</id>
 						<phase>package</phase>
@@ -170,6 +179,7 @@ under the License.
 									<include>org.apache.flink:flink-shaded-jsonpath</include>
 									<include>org.codehaus.janino:*</include>
 									<include>org.apache.flink:flink-table-code-splitter</include>
+									<include>it.unimi.dsi:fastutil</include>
 								</includes>
 							</artifactSet>
 						</configuration>
@@ -195,23 +205,25 @@ under the License.
 								</goals>
 								<configuration>
 									<target>
-										<condition property="optional.classes" value="--classes '${generate.classes}'"
-												   else="">
-											<isset property="generate.classes"/>
+										<condition property="optional.classes"
+											value="--classes '${generate.classes}'"
+											else="">
+											<isset property="generate.classes" />
 										</condition>
 										<condition property="optional.prefixes"
-												   value="--prefixes '${generate.prefixes}'" else="">
-											<isset property="generate.prefixes"/>
+											value="--prefixes '${generate.prefixes}'" else="">
+											<isset property="generate.prefixes" />
 										</condition>
-										<java classname="org.apache.flink.test.migration.MigrationTestsSnapshotGenerator"
-											  fork="true" failonerror="true" dir="${project.basedir}">
-											<classpath refid="maven.test.classpath"/>
-											<arg value="--dir"/>
-											<arg line="${project.basedir}"/>
-											<arg value="--version"/>
-											<arg value="${generate.version}"/>
-											<arg line="${optional.classes}"/>
-											<arg line="${optional.prefixes}"/>
+										<java
+											classname="org.apache.flink.test.migration.MigrationTestsSnapshotGenerator"
+											fork="true" failonerror="true" dir="${project.basedir}">
+											<classpath refid="maven.test.classpath" />
+											<arg value="--dir" />
+											<arg line="${project.basedir}" />
+											<arg value="--version" />
+											<arg value="${generate.version}" />
+											<arg line="${optional.classes}" />
+											<arg line="${optional.prefixes}" />
 										</java>
 									</target>
 								</configuration>

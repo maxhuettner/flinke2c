@@ -1,0 +1,114 @@
+################################################################################
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+
+# =============================================================================
+# Common
+# =============================================================================
+parallelism:
+  default: 1
+
+io:
+  tmp:
+    dirs: /tmp
+
+
+pipeline.operator-chaining.enabled: false
+
+# =============================================================================
+# JobManager (Coordinator)
+# =============================================================================
+jobmanager:
+  bind-host: 0.0.0.0
+  rpc:
+    address: 10.10.2.181
+    port: 6123
+  memory:
+    process:
+      size: 8G
+
+# =============================================================================
+# TaskManager (only relevant if you also run a TM on this node)
+# =============================================================================
+taskmanager:
+  memory:
+    process:
+      size: 8G
+  # numberOfTaskSlots: 1
+
+# =============================================================================
+# REST
+# =============================================================================
+rest:
+  address: 0.0.0.0
+  bind-address: 0.0.0.0
+  port: 8081
+
+topology:
+  graphml:
+    path: /home/mhuttner/flink/build-target/conf/cloud.graphml
+
+# =============================================================================
+# JVM
+# =============================================================================
+env:
+  java:
+    opts:
+      all: >-
+        -verbose:gc -XX:NewRatio=3 -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:ParallelGCThreads=4 --add-opens=java.base/java.util=ALL-UNNAMED
+      jobmanager: >-
+        -Xloggc:$FLINK_LOG_DIR/jobmanager-gc.log
+        -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=2 -XX:GCLogFileSize=512M
+      taskmanager: >-
+        -Xloggc:$FLINK_LOG_DIR/taskmanager-gc.log
+        -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=2 -XX:GCLogFileSize=512M
+
+# =============================================================================
+# State & Checkpoint
+# =============================================================================
+state:
+  backend:
+    type: rocksdb
+    incremental: true
+    local-recovery: true
+  checkpoints:
+    dir: file:///mnt/labstore/mhuttner/checkpoint
+
+# RocksDB local dir is still commonly configured as a flat key.
+state.backend.rocksdb.localdir: /tmp
+
+execution:
+  checkpointing:
+    interval: 180000
+    mode: EXACTLY_ONCE
+    # disable final checkpoint to avoid test waiting for the last checkpoint complete
+    checkpoints-after-tasks-finish:
+      enabled: false
+
+# =============================================================================
+# Runtime Others (Table)
+# =============================================================================
+table:
+  exec:
+    mini-batch:
+      enabled: true
+      allow-latency: 2s
+      size: 50000
+  optimizer:
+    distinct-agg:
+      split:
+        enabled: true

@@ -264,13 +264,9 @@ object BridgingFunctionGenUtil {
     val functionCallCode =
       s"""
          |${externalOperands.map(_.code).mkString("\n")}
-         |if (${externalOperands.map(_.nullTerm).mkString(" || ")}) {
-         |  $DEFAULT_DELEGATING_FUTURE_TERM.createAsyncFuture($converterTerm).complete(null);
-         |} else {
-         |  $functionTerm.eval(
-         |    $DEFAULT_DELEGATING_FUTURE_TERM.createAsyncFuture($converterTerm),
-         |    ${externalOperands.map(_.resultTerm).mkString(", ")});
-         |}
+         |$functionTerm.eval(
+         |  $DEFAULT_DELEGATING_FUTURE_TERM.createAsyncFuture($converterTerm),
+         |  ${externalOperands.map(_.resultTerm).mkString(", ")});
          |""".stripMargin
 
     GeneratedExpression(NO_CODE, NEVER_NULL, functionCallCode, outputType)

@@ -20,7 +20,10 @@ package org.apache.flink.table.planner.delegation
 import org.apache.flink.api.common.RuntimeExecutionMode
 import org.apache.flink.api.dag.Transformation
 import org.apache.flink.configuration.ExecutionOptions
+import org.apache.flink.configuration.PipelineOptions
 import org.apache.flink.streaming.api.graph.StreamGraph
+import org.apache.flink.streaming.api.operators.ChainingStrategy
+import org.apache.flink.streaming.api.transformations.PhysicalTransformation
 import org.apache.flink.table.api._
 import org.apache.flink.table.catalog.{CatalogManager, FunctionCatalog}
 import org.apache.flink.table.delegation.{Executor, InternalPlan}
@@ -29,6 +32,7 @@ import org.apache.flink.table.operations.Operation
 import org.apache.flink.table.planner.plan.`trait`._
 import org.apache.flink.table.planner.plan.ExecNodeGraphInternalPlan
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeGraph
+import org.apache.flink.table.planner.plan.nodes.exec.common.CommonExecCalc
 import org.apache.flink.table.planner.plan.nodes.exec.processor.ExecNodeGraphProcessor
 import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecNode
 import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodePlanDumper
@@ -39,6 +43,7 @@ import org.apache.flink.table.planner.utils.DummyStreamExecutionEnvironment
 import _root_.scala.collection.JavaConversions._
 import org.apache.calcite.plan.{ConventionTraitDef, RelTrait, RelTraitDef}
 import org.apache.calcite.sql.SqlExplainLevel
+import org.slf4j.LoggerFactory
 
 import java.util
 
@@ -59,6 +64,7 @@ class StreamPlanner(
     catalogManager,
     isStreamingMode = true,
     classLoader) {
+  private val LOG = LoggerFactory.getLogger(classOf[StreamPlanner])
 
   override protected def getTraitDefs: Array[RelTraitDef[_ <: RelTrait]] = {
     Array(
@@ -86,7 +92,84 @@ class StreamPlanner(
             "This is a bug and should not happen. Please file an issue.")
     }
     afterTranslation()
-    transformations ++ planner.extraTransformations
+    val result = transformations ++ planner.extraTransformations
+    applyExternalRuntimeChainOnlyOverrides(result)
+    result
+  }
+
+  private def applyExternalRuntimeChainOnlyOverrides(
+      transformations: util.List[Transformation[_]]): Unit = {
+    if (!getTableConfig.get(CommonExecCalc.EXTERNAL_RUNTIME_CHAIN_ONLY_OPTION)) {
+      return
+    }
+    if (!getTableConfig.get(PipelineOptions.OPERATOR_CHAINING)) {
+      LOG.info(
+        "External runtime chain-only enabled; forcing pipeline.operator-chaining.enabled to true.")
+      getTableConfig.set(PipelineOptions.OPERATOR_CHAINING, Boolean.box(true))
+    }
+    val all = collectTransformations(transformations)
+    if (!all.exists(t => isExternalRuntimePre(t) || isExternalRuntimePost(t))) {
+      return
+    }
+    val upstreamOfPre = util.Collections.newSetFromMap(
+      new util.IdentityHashMap[Transformation[_], java.lang.Boolean]())
+    val downstreamOfPost = util.Collections.newSetFromMap(
+      new util.IdentityHashMap[Transformation[_], java.lang.Boolean]())
+    all.foreach { t =>
+      if (isExternalRuntimePre(t)) {
+        t.getInputs.foreach(upstreamOfPre.add)
+      }
+      if (hasExternalRuntimePostInput(t)) {
+        downstreamOfPost.add(t)
+      }
+    }
+    all.foreach {
+      case t: PhysicalTransformation[_] =>
+        if (isExternalRuntimePre(t)) {
+          t.setChainingStrategy(ChainingStrategy.ALWAYS)
+        } else if (isExternalRuntimePost(t)) {
+          t.setChainingStrategy(ChainingStrategy.HEAD)
+        } else if (upstreamOfPre.contains(t)) {
+          t.setChainingStrategy(ChainingStrategy.ALWAYS)
+        } else if (downstreamOfPost.contains(t)) {
+          t.setChainingStrategy(ChainingStrategy.ALWAYS)
+        } else {
+          t.setChainingStrategy(ChainingStrategy.NEVER)
+        }
+      case _ => ()
+    }
+  }
+
+  private def collectTransformations(
+      roots: util.List[Transformation[_]]): util.Set[Transformation[_]] = {
+    val visited = util.Collections.newSetFromMap(
+      new util.IdentityHashMap[Transformation[_], java.lang.Boolean]())
+    def visit(t: Transformation[_]): Unit = {
+      if (visited.add(t)) {
+        t.getInputs.foreach(visit)
+      }
+    }
+    roots.foreach(visit)
+    visited
+  }
+
+  private def hasExternalRuntimePostInput(transformation: Transformation[_]): Boolean = {
+    transformation.getInputs.exists(isExternalRuntimePost)
+  }
+
+  private def isExternalRuntimePre(transformation: Transformation[_]): Boolean = {
+    hasNameFragment(transformation, "ExternalRuntimePre")
+  }
+
+  private def isExternalRuntimePost(transformation: Transformation[_]): Boolean = {
+    hasNameFragment(transformation, "ExternalRuntimePost")
+  }
+
+  private def hasNameFragment(
+      transformation: Transformation[_],
+      fragment: String): Boolean = {
+    val name = transformation.getName
+    name != null && name.contains(fragment)
   }
 
   override def explain(
