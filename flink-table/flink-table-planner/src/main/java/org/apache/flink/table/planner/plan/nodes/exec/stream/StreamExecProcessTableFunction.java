@@ -167,7 +167,7 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
                 getInputEdges().stream()
                         .map(e -> (Transformation<RowData>) e.translateToPlan(planner))
                         .collect(Collectors.toList());
-
+        final RexCall udfCall = StreamPhysicalProcessTableFunction.toUdfCall(invocation);
         final List<Ord<StaticArgument>> providedInputArgs =
                 StreamPhysicalProcessTableFunction.getProvidedInputArgs(invocation);
         final List<RexNode> operands = invocation.getOperands();
@@ -188,7 +188,6 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
         final CodeGeneratorContext ctx =
                 new CodeGeneratorContext(config, planner.getFlinkContext().getClassLoader());
 
-        final RexCall udfCall = StreamPhysicalProcessTableFunction.toUdfCall(invocation);
         final GeneratedRunnerResult generated =
                 ProcessTableRunnerGenerator.generate(
                         ctx, udfCall, inputTimeColumns, inputChangelogModes, outputChangelogMode);
@@ -364,4 +363,5 @@ public class StreamExecProcessTableFunction extends ExecNodeBase<RowData>
         }
         return globalRetentionTime;
     }
+
 }

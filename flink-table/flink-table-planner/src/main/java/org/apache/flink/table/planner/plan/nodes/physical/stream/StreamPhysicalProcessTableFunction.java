@@ -36,6 +36,7 @@ import org.apache.flink.table.planner.plan.nodes.logical.FlinkLogicalTableFuncti
 import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
 import org.apache.flink.table.planner.utils.JavaScalaConversionUtil;
 import org.apache.flink.table.planner.utils.ShortcutUtils;
+import org.apache.flink.table.runtime.functions.table.ExternalRuntimeTableFunction;
 import org.apache.flink.table.types.inference.CallContext;
 import org.apache.flink.table.types.inference.StaticArgument;
 import org.apache.flink.table.types.inference.StaticArgumentTrait;
@@ -43,6 +44,9 @@ import org.apache.flink.table.types.inference.SystemTypeInference;
 import org.apache.flink.types.RowKind;
 
 import org.apache.flink.shaded.guava33.com.google.common.collect.ImmutableSet;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.calcite.linq4j.Ord;
 import org.apache.calcite.plan.RelOptCluster;
@@ -87,6 +91,9 @@ import static org.apache.flink.table.types.inference.SystemTypeInference.PROCESS
  */
 public class StreamPhysicalProcessTableFunction extends AbstractRelNode
         implements StreamPhysicalRel {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(StreamPhysicalProcessTableFunction.class);
 
     private final FlinkLogicalTableFunctionScan scan;
     private final @Nullable String uid;
@@ -152,6 +159,51 @@ public class StreamPhysicalProcessTableFunction extends AbstractRelNode
     public @Nullable RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         final double elementRate = 100.0d * getInputs().size();
         return planner.getCostFactory().makeCost(elementRate, elementRate, 0);
+    }
+
+    private static boolean isExternalRuntimeFunction(RexCall udfCall) {
+        final BridgingSqlFunction bridging = ShortcutUtils.unwrapBridgingSqlFunction(udfCall);
+        if (bridging == null) {
+            LOG.info("ExternalRuntime watermark check: bridging is null");
+            return false;
+        }
+        final String identifier =
+                bridging.getResolvedFunction()
+                        .getIdentifier()
+                        .map(FunctionIdentifier::getFunctionName)
+                        .orElse("<anonymous>");
+        final Object definition = bridging.getDefinition();
+        if (definition instanceof ExternalRuntimeTableFunction) {
+            LOG.info(
+                    "ExternalRuntime watermark check matched (instanceof): defClass={}, defCl={}, ident={}",
+                    definition.getClass().getName(),
+                    definition.getClass().getClassLoader(),
+                    identifier);
+            return true;
+        }
+        if (definition == null) {
+            LOG.info("ExternalRuntime watermark check: definition is null (ident={})", identifier);
+            return false;
+        }
+        final String defClassName = definition.getClass().getName();
+        if (ExternalRuntimeTableFunction.class.getName().equals(defClassName)) {
+            LOG.info(
+                    "ExternalRuntime watermark check matched (name): defClass={}, defCl={}, runtimeCl={}, ident={}",
+                    defClassName,
+                    definition.getClass().getClassLoader(),
+                    ExternalRuntimeTableFunction.class.getClassLoader(),
+                    identifier);
+            return true;
+        }
+        if (defClassName.endsWith("ExternalRuntimeTableFunction")) {
+            LOG.info(
+                    "ExternalRuntime watermark check not matched: defClass={}, defCl={}, runtimeCl={}, ident={}",
+                    defClassName,
+                    definition.getClass().getClassLoader(),
+                    ExternalRuntimeTableFunction.class.getClassLoader(),
+                    identifier);
+        }
+        return false;
     }
 
     @Override

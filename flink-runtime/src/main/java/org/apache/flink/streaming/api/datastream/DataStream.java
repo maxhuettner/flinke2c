@@ -59,8 +59,13 @@ import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperatorFactory;
 import org.apache.flink.streaming.api.operators.ProcessOperator;
 import org.apache.flink.streaming.api.operators.SimpleOperatorFactory;
+import org.apache.flink.streaming.api.operators.StreamBenchmarkOperator;
+import org.apache.flink.streaming.api.operators.StreamCEPlessFilterOperator;
+import org.apache.flink.streaming.api.operators.StreamCEPlessOperator;
 import org.apache.flink.streaming.api.operators.StreamFilter;
 import org.apache.flink.streaming.api.operators.StreamFlatMap;
+import org.apache.flink.streaming.api.operators.StreamForwardOperator;
+import org.apache.flink.streaming.api.operators.StreamKMeansOperator;
 import org.apache.flink.streaming.api.operators.StreamMap;
 import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
 import org.apache.flink.streaming.api.operators.collect.ClientAndIterator;
@@ -362,6 +367,62 @@ public class DataStream<T> {
      */
     public DataStream<T> forward() {
         return setConnectionType(new ForwardPartitioner<T>());
+    }
+
+    /**
+     * Offloads processing of this stream to a CEPless-managed operator. Needs a node manager at
+     * {@code NODE_MANAGER_HOST} and {@code DB_TYPE}/{@code REDIS_HOST}/{@code INFINISPAN_HOST} set.
+     *
+     * @param operatorName name under which the operator is registered with the node manager
+     * @return the data stream constructed
+     */
+    @Experimental
+    public SingleOutputStreamOperator<T> serverless(String operatorName) {
+        return transform(operatorName, getType(), new StreamCEPlessOperator<>(operatorName));
+    }
+
+    /**
+     * Offloads a filter predicate to a CEPless-managed operator. Elements are kept if the operator
+     * responds {@code "true"}, otherwise dropped.
+     *
+     * @param operatorName name under which the operator is registered with the node manager
+     * @return the data stream constructed
+     */
+    @Experimental
+    public SingleOutputStreamOperator<T> serverlessFilter(String operatorName) {
+        return transform(operatorName, getType(), new StreamCEPlessFilterOperator<>(operatorName));
+    }
+
+    /**
+     * Runs k-means locally on this stream (baseline for offloading benchmarks).
+     *
+     * @return the data stream constructed
+     */
+    @Experimental
+    public SingleOutputStreamOperator<T> kMeans() {
+        return transform("k-means", getType(), new StreamKMeansOperator<>());
+    }
+
+    /**
+     * Logs per-event latency and per-second throughput to {@code eval.csv} / {@code throughput.csv}.
+     *
+     * @param eventRate expected input event rate, recorded alongside each measurement
+     * @return the data stream constructed
+     */
+    @Experimental
+    public SingleOutputStreamOperator<T> benchmark(int eventRate) {
+        return transform("Benchmark", getType(), new StreamBenchmarkOperator<>(eventRate));
+    }
+
+    /**
+     * Adds a no-op pass-through operator (baseline for offloading benchmarks). Unlike {@link
+     * #forward()} this adds an actual operator to the graph.
+     *
+     * @return the data stream constructed
+     */
+    @Experimental
+    public SingleOutputStreamOperator<T> forwardOperator() {
+        return transform("Forward", getType(), new StreamForwardOperator<>(null));
     }
 
     /**

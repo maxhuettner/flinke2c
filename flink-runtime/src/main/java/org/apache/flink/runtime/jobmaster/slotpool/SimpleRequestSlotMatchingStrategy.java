@@ -81,9 +81,17 @@ public enum SimpleRequestSlotMatchingStrategy implements RequestSlotMatchingStra
 
             for (Iterator<PhysicalSlot> slotIterator = availableSlots.iterator(); slotIterator.hasNext(); ) {
                 PhysicalSlot slot = slotIterator.next();
-                final String slotAddress = slot.getTaskManagerLocation().getHostname();
+                final String slotHostName = slot.getTaskManagerLocation().getHostname();
+                final String slotFqdnHostName = slot.getTaskManagerLocation().getFQDNHostname();
+                final String slotIpAddress = slot.getTaskManagerLocation().address().getHostAddress();
 
-                if (prioritizeByAddress && (taskManagerAddress == null || !slotAddress.contains(taskManagerAddress))) {
+                if (prioritizeByAddress
+                        && (taskManagerAddress == null
+                                || !isAddressMatching(
+                                        taskManagerAddress,
+                                        slotHostName,
+                                        slotFqdnHostName,
+                                        slotIpAddress))) {
                     log.debug(
                             "Skipping slot {} because it does not match the task manager address {}",
                             slot,
@@ -102,6 +110,15 @@ public enum SimpleRequestSlotMatchingStrategy implements RequestSlotMatchingStra
                 }
             }
         }
+    }
+
+    private static boolean isAddressMatching(
+            String requiredAddress, String slotHostName, String slotFqdnHostName, String slotIpAddress) {
+        return requiredAddress.equals(slotHostName)
+                || requiredAddress.equals(slotFqdnHostName)
+                || requiredAddress.equals(slotIpAddress)
+                || slotHostName.contains(requiredAddress)
+                || slotFqdnHostName.contains(requiredAddress);
     }
 
     @Override

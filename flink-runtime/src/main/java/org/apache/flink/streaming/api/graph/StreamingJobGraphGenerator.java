@@ -31,6 +31,7 @@ import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ExecutionOptions;
 import org.apache.flink.configuration.IllegalConfigurationException;
+import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.core.memory.ManagedMemoryUseCase;
 import org.apache.flink.runtime.OperatorIDPair;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
@@ -1908,6 +1909,10 @@ public class StreamingJobGraphGenerator {
 
     private static void setSlotSharing(JobVertexBuildContext jobVertexBuildContext) {
         StreamGraph streamGraph = jobVertexBuildContext.getStreamGraph();
+        final boolean disableSlotSharing =
+                streamGraph
+                        .getJobConfiguration()
+                        .get(PipelineOptions.DISABLE_ADAPTIVE_SLOT_SHARING);
         final Map<String, SlotSharingGroup> specifiedSlotSharingGroups = new HashMap<>();
         final Map<JobVertexID, SlotSharingGroup> vertexRegionSlotSharingGroups =
                 buildVertexRegionSlotSharingGroups(jobVertexBuildContext);
@@ -1923,9 +1928,17 @@ public class StreamingJobGraphGenerator {
 
             final SlotSharingGroup effectiveSlotSharingGroup;
             if (slotSharingGroupKey.equals(StreamGraphGenerator.DEFAULT_SLOT_SHARING_GROUP)) {
-                // fallback to the region slot sharing group by default
-                effectiveSlotSharingGroup =
-                        checkNotNull(vertexRegionSlotSharingGroups.get(vertex.getID()));
+                if (disableSlotSharing) {
+                    effectiveSlotSharingGroup = new SlotSharingGroup();
+                    streamGraph
+                            .getSlotSharingGroupResource(
+                                    StreamGraphGenerator.DEFAULT_SLOT_SHARING_GROUP)
+                            .ifPresent(effectiveSlotSharingGroup::setResourceProfile);
+                } else {
+                    // fallback to the region slot sharing group by default
+                    effectiveSlotSharingGroup =
+                            checkNotNull(vertexRegionSlotSharingGroups.get(vertex.getID()));
+                }
             } else {
                 checkState(
                         !jobVertexBuildContext.hasHybridResultPartition(),
