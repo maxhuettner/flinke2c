@@ -328,4 +328,17 @@ public class PipelineOptions {
                                     + "while still using watermark alignment, set this parameter to true. "
                                     + "The default value is false. Note: This parameter may be "
                                     + "removed in future releases.");
+
+    public static final ConfigOption<Boolean> DISABLE_ADAPTIVE_SLOT_SHARING =
+            key("pipeline.disable-adaptive-slot-sharing")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDeprecatedKeys("disable_adaptive_slot_sharing")
+                    .withDescription(
+                            "If true, every job vertex without an explicit slot sharing group gets "
+                                    + "its own slot sharing group, i.e. slot sharing is disabled. "
+                                    + "By default the adaptive scheduler allocates slots per slot "
+                                    + "sharing group, so with sharing enabled a whole pipeline of "
+                                    + "parallelism N only needs N slots and ends up on a single "
+                                    + "TaskManager.");
 }
